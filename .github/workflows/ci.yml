@@ -17,7 +17,7 @@ jobs:
         node: [22, 24]
     services:
       rabbitmq:
-        image: rabbitmq:4-management-alpine
+        image: rabbitmq:4.2-management-alpine
         env:
           RABBITMQ_DEFAULT_USER: admin
           RABBITMQ_DEFAULT_PASS: admin
@@ -50,7 +50,7 @@ jobs:
 
       - name: Install delayed message plugin on the broker
         run: |
-          docker cp rabbitmq_delayed_message_exchange-4.0.2.ez ${{ job.services.rabbitmq.id }}:/plugins/
+          docker cp rabbitmq_delayed_message_exchange-4.2.0.ez ${{ job.services.rabbitmq.id }}:/plugins/
           docker exec ${{ job.services.rabbitmq.id }} rabbitmq-plugins enable rabbitmq_delayed_message_exchange
 
       - name: Integration tests (real broker, includes reconnection)

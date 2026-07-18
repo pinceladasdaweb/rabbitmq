@@ -2,19 +2,19 @@ services:
   rabbitmq:
     container_name: rabbitmq
     hostname: rabbitmq
-    image: 'rabbitmq:4.0.2-management-alpine'
+    image: 'rabbitmq:4.2-management-alpine'
     restart: always
     ports:
-      - '${RABBITMQ_AMQP_PORT}:5672'
-      - '${RABBITMQ_ADMIN_PORT}:15672'
+      - '${RABBITMQ_AMQP_PORT:-5672}:5672'
+      - '${RABBITMQ_ADMIN_PORT:-15672}:15672'
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq/
       - rabbitmq_log:/var/log/rabbitmq/
-      - ./rabbitmq_delayed_message_exchange-4.0.2.ez:/opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-4.0.2.ez:ro
+      - ./rabbitmq_delayed_message_exchange-4.2.0.ez:/opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-4.2.0.ez:ro
       - ./.docker/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     environment:
-      RABBITMQ_DEFAULT_USER: ${RMQ_USERNAME}
-      RABBITMQ_DEFAULT_PASS: ${RMQ_PASSWORD}
+      RABBITMQ_DEFAULT_USER: ${RMQ_USERNAME:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RMQ_PASSWORD:-admin}
 
 volumes:
   rabbitmq_log:

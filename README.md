@@ -161,13 +161,13 @@ Both suites also run on every push and pull request via GitHub Actions (`.github
 
 The RabbitMQ Delayed Message Plugin is required for using message scheduling features (`publishDelayed()`).
 
-**Using the project's docker-compose (recommended):** nothing to do. The compose file mounts the plugin (`rabbitmq_delayed_message_exchange-4.0.2.ez`) and the `.docker/enabled_plugins` file into the container, so the plugin is active on every `docker compose up` — including fresh container recreations. In CI, the workflow installs the plugin on the service container before running the integration tests.
+**Using the project's docker-compose (recommended):** nothing to do. The compose file mounts the plugin (`rabbitmq_delayed_message_exchange-4.2.0.ez`) and the `.docker/enabled_plugins` file into the container, so the plugin is active on every `docker compose up` — including fresh container recreations. In CI, the workflow installs the plugin on the service container before running the integration tests.
 
 **On brokers you manage yourself**, install it manually:
 
 1. Copy the plugin file to the container:
 ```bash
-docker cp rabbitmq_delayed_message_exchange-4.0.2.ez rabbitmq:/plugins
+docker cp rabbitmq_delayed_message_exchange-4.2.0.ez rabbitmq:/plugins
 ```
 
 2. Enable the plugin:
