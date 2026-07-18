@@ -336,19 +336,21 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 
 ### Logging Options
 
-- **logger** `{object}`: Custom logger implementation.
-  - Methods:
-    - **info** `{function}`: Information level logging.
-    - **error** `{function}`: Error level logging.
-    - **warn** `{function}`: Warning level logging.
-  - Example:
+- **logger** `{object}`: Custom logger implementation. **Recommended for production** — inject your application's logger so the library writes to the same stream, format and destinations as the rest of your app.
+  - Required methods: **error**, **warn**, **info**. Optional: **debug** (used for hot-path messages such as per-message publish confirmations).
+  - Any pino, winston or bunyan instance satisfies this interface directly:
     ```javascript
-    {
-      info: (msg) => console.log(msg),
-      error: (msg) => console.error(msg),
-      warn: (msg) => console.warn(msg)
-    }
+    import pino from 'pino'
+
+    const rabbitMQ = new RabbitMQ({
+      // ...
+      logger: pino({ name: 'rabbitmq' })
+    })
     ```
+- **Default behavior (no logger injected)**: the library ships a minimal, dependency-free console logger — timestamped, leveled (`error`/`warn`/`info`/`debug`) and controlled by the `LOG_LEVEL` environment variable (default: `info`). It keeps the out-of-the-box experience visible without pulling any logging dependency into your project.
+  ```text
+  2026-07-18T14:02:11.407Z [info] Successfully connected to RabbitMQ cluster node: localhost:5672
+  ```
 
 ### Usage Example
 
