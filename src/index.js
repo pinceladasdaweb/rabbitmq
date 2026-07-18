@@ -1,0 +1,548 @@
+import Logger from './utils/logger.js'
+import { EventEmitter } from 'node:events'
+import _NodeCache from '@cacheable/node-cache'
+import Topology from './messaging/topology.js'
+import Publisher from './messaging/publisher.js'
+import RateLimiter from './resilience/rate-limiter.js'
+import ChannelPool from './connection/channel-pool.js'
+import MessageCodec from './messaging/message-codec.js'
+import RabbitMQConnection from './connection/connection.js'
+import CircuitBreaker from './resilience/circuit-breaker.js'
+import ConsumerManager from './consumers/consumer-manager.js'
+
+const NodeCache = _NodeCache.default || _NodeCache
+
+class RabbitMQ extends EventEmitter {
+  #connection
+  #logger
+  #exchange
+  #channelPool
+  #channelPoolSize
+  #codec
+  #circuitBreaker
+  #cache
+  #useCache
+  #rateLimiter
+  #publisher
+  #consumers
+  #topology
+  #shutdownHandlersInstalled
+  #connectPromise
+
+  constructor (options = {}) {
+    super()
+
+    this.#logger = options.logger || Logger
+    this.#exchange = options.exchange || {}
+    this.#channelPool = null
+    this.#channelPoolSize = options.channelPoolSize || 10
+    this.#useCache = options.useCache || false
+    this.#shutdownHandlersInstalled = false
+    this.#connectPromise = null
+
+    this.#codec = new MessageCodec({
+      serializer: options.serializer,
+      deserializer: options.deserializer,
+      useCompression: options.useCompression,
+      compressionThreshold: options.compressionThreshold,
+      logger: this.#logger
+    })
+
+    this.#circuitBreaker = new CircuitBreaker(options.circuitBreaker)
+    this.#circuitBreaker.on('stateChanged', (state) => {
+      this.emit('circuitBreakerStateChanged', state)
+    })
+
+    if (this.#useCache) {
+      this.#cache = new NodeCache({
+        stdTTL: options.cacheTTL || 60,
+        checkperiod: options.cacheCheckPeriod || 120,
+        ...options.cacheOptions
+      })
+    }
+
+    if (options.rateLimiter) {
+      this.#rateLimiter = new RateLimiter({
+        ...options.rateLimiter,
+        logger: this.#logger
+      })
+
+      this.#setupRateLimiterEvents()
+    }
+
+    this.#connection = new RabbitMQConnection({
+      username: options.username || process.env.RABBITMQ_USER,
+      password: options.password || process.env.RABBITMQ_PASS,
+      protocol: options.protocol,
+      vhost: options.vhost,
+      endpoints: Array.isArray(options.endpoints) ? options.endpoints : [options.endpoint || process.env.RABBITMQ_ENDPOINT],
+      connectionName: options.connectionName || 'default_connection',
+      reconnectInterval: options.reconnectInterval,
+      maxReconnectInterval: options.maxReconnectInterval,
+      maxReconnectAttempts: options.maxReconnectAttempts
+    }, this.#logger)
+
+    this.#connection.on('connected', () => this.emit('connected'))
+    this.#connection.on('reconnected', this.#handleReconnection.bind(this))
+    this.#connection.on('disconnected', this.#handleDisconnection.bind(this))
+    this.#connection.on('reconnectFailed', () => this.emit('reconnectFailed'))
+
+    const context = {
+      logger: this.#logger,
+      codec: this.#codec,
+      circuitBreaker: this.#circuitBreaker,
+      rateLimiter: this.#rateLimiter,
+      maxPriority: options.maxPriority || 10,
+      prefetchCount: options.prefetchCount ?? 10,
+      deadLetterExchange: options.deadLetterExchange || 'dlx',
+      delayExchange: options.delayExchange || 'delayed',
+      getExchange: () => this.#exchange,
+      getChannel: () => this.getChannel(),
+      getChannelPool: () => this.#channelPool,
+      getQueueNameByConsumerTag: (consumerTag) => this.#consumers?.findQueueNameByTag(consumerTag) ?? null,
+      emit: (event, payload) => this.emit(event, payload)
+    }
+
+    this.#publisher = new Publisher(context)
+    this.#consumers = new ConsumerManager(context)
+    this.#topology = new Topology(context)
+  }
+
+  #setupRateLimiterEvents () {
+    this.#rateLimiter.on('limited', ({ key, strategy }) => {
+      this.#logger.warn(`Rate limit exceeded for ${key} using ${strategy} strategy`)
+      this.emit('rateLimited', { key, strategy })
+    })
+
+    this.#rateLimiter.on('blocked', ({ key, remainingTime }) => {
+      this.#logger.warn(`Key ${key} is blocked. Remaining time: ${remainingTime}ms`)
+      this.emit('rateBlocked', { key, remainingTime })
+    })
+  }
+
+  enableGracefulShutdown ({ signals = ['SIGINT', 'SIGTERM'], exitProcess = true } = {}) {
+    if (this.#shutdownHandlersInstalled) return
+
+    this.#shutdownHandlersInstalled = true
+
+    const gracefulShutdown = async (signal) => {
+      this.#logger.info(`Received ${signal}. Starting graceful shutdown...`)
+
+      try {
+        await this.disconnect()
+        this.#logger.info('Disconnected from RabbitMQ successfully.')
+
+        if (exitProcess) process.exit(0)
+      } catch (error) {
+        this.#logger.error(`Error during graceful shutdown: ${error.message}`)
+
+        if (exitProcess) process.exit(1)
+      }
+    }
+
+    for (const signal of signals) {
+      process.once(signal, () => gracefulShutdown(signal))
+    }
+  }
+
+  setupGracefulShutdown () {
+    this.#logger.warn('setupGracefulShutdown() is deprecated. Use enableGracefulShutdown() instead.')
+    this.enableGracefulShutdown()
+  }
+
+  async #handleReconnection () {
+    try {
+      await this.#setupChannelPool()
+      await this.#topology.ensureExchange()
+      await this.#consumers.recreateAll()
+
+      // Failures accumulated against the previous connection say nothing
+      // about the fresh one — do not keep publishing blocked after recovery.
+      this.#circuitBreaker.reset()
+
+      this.emit('reconnected')
+    } catch (error) {
+      this.#logger.error(`Failed to restore state after reconnection: ${error.message}`)
+      this.emit('reconnectError', error)
+    }
+  }
+
+  #handleDisconnection () {
+    if (this.#channelPool) {
+      // Marks the pool as closed so channel-replacement retry loops stop;
+      // closing dead channels is best-effort.
+      const staleChannelPool = this.#channelPool
+
+      this.#channelPool = null
+      staleChannelPool.close().catch(() => {})
+    }
+
+    this.emit('disconnected')
+  }
+
+  async #setupChannelPool () {
+    const connection = this.#connection.getConnection()
+
+    if (!connection) {
+      throw new Error('No active connection to RabbitMQ')
+    }
+
+    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize)
+    await this.#channelPool.initialize()
+  }
+
+  // Concurrent connect() callers share a single in-flight attempt: two
+  // parallel setups would each build a channel pool and leak the loser's
+  // channels on the broker.
+  async connect (options = {}) {
+    if (!this.#connectPromise) {
+      this.#connectPromise = this.#doConnect(options).finally(() => {
+        this.#connectPromise = null
+      })
+    }
+
+    return this.#connectPromise
+  }
+
+  async #doConnect (options) {
+    const connection = await this.#connection.connect()
+
+    if (connection) {
+      if (!this.#channelPool) {
+        await this.#setupChannelPool()
+        await this.#topology.ensureExchange()
+      }
+
+      return connection
+    }
+
+    if (!options.waitForConnection) {
+      return null
+    }
+
+    // All endpoints failed and reconnection keeps running in the background:
+    // wait for the next successful cycle (or for reconnection to give up).
+    return new Promise((resolve, reject) => {
+      let timer = null
+
+      const cleanup = () => {
+        this.off('reconnected', onReconnected)
+        this.off('reconnectFailed', onReconnectFailed)
+        this.off('reconnectError', onReconnectError)
+
+        if (timer) clearTimeout(timer)
+      }
+
+      const onReconnected = () => {
+        cleanup()
+        resolve(this.#connection.getConnection())
+      }
+
+      const onReconnectFailed = () => {
+        cleanup()
+        reject(new Error('Unable to connect: all reconnection attempts failed'))
+      }
+
+      // Without this, a reconnect whose post-connection setup fails would
+      // leave the waitForConnection promise hanging forever ('reconnected'
+      // never fires and no further reconnect cycle runs).
+      const onReconnectError = (error) => {
+        cleanup()
+        reject(new Error(`Connected, but failed to restore state: ${error.message}`))
+      }
+
+      this.on('reconnected', onReconnected)
+      this.on('reconnectFailed', onReconnectFailed)
+      this.on('reconnectError', onReconnectError)
+
+      if (options.timeout > 0) {
+        timer = setTimeout(() => {
+          cleanup()
+          reject(new Error(`Timed out after ${options.timeout}ms waiting for connection`))
+        }, options.timeout)
+      }
+    })
+  }
+
+  async disconnect () {
+    try {
+      await this.#consumers.disposeAll()
+
+      if (this.#rateLimiter) {
+        this.#rateLimiter.dispose()
+      }
+
+      if (this.#cache && typeof this.#cache.close === 'function') {
+        this.#cache.close()
+      }
+
+      if (this.#channelPool) {
+        await this.#channelPool.close()
+        this.#channelPool = null
+      }
+
+      this.#logger.info('Disconnecting from RabbitMQ...')
+
+      await this.#connection.disconnect()
+
+      this.emit('disconnected')
+    } catch (error) {
+      // No message-substring filtering here: it used to swallow genuine
+      // broker errors whose text happened to contain 'Channel closed'.
+      // Expected channel-teardown noise is already silenced in ChannelPool.
+      this.#logger.warn(`Error during disconnection: ${error.message}`)
+
+      try {
+        await this.#connection.disconnect()
+      } catch (disconnectError) {
+        this.#logger.warn(`Error during final disconnection attempt: ${disconnectError.message}`)
+      }
+    }
+  }
+
+  async getChannel () {
+    if (!this.#channelPool) {
+      throw new Error('Not connected to RabbitMQ. Connection establishing/recovery in progress.')
+    }
+
+    return this.#channelPool.getChannel()
+  }
+
+  getClusterStatus () {
+    return {
+      connectedTo: this.#connection.getCurrentEndpoint(),
+      allEndpoints: this.#connection.getAllEndpoints(),
+      connectionState: this.#connection.getConnectionState()
+    }
+  }
+
+  setExchange (name, type = 'direct', options = {}) {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new Error('Exchange name must be a non-empty string')
+    }
+
+    if (typeof type !== 'string' || !['direct', 'topic', 'fanout', 'headers'].includes(type)) {
+      throw new Error('Invalid exchange type. Must be one of: direct, topic, fanout, headers')
+    }
+
+    this.#exchange = { name, type, options }
+    this.#logger.info(`Exchange set to ${name} (${type})`)
+  }
+
+  // --- Publishing (delegated to Publisher) ---
+
+  async publish (routingKey, message, options = {}) {
+    return this.#publisher.publish(routingKey, message, options)
+  }
+
+  async publishBatch (routingKey, messages, options = {}) {
+    return this.#publisher.publishBatch(routingKey, messages, options)
+  }
+
+  async publishAsync (routingKey, message, options = {}) {
+    return this.#publisher.publishAsync(routingKey, message, options)
+  }
+
+  async publishAsyncBatch (routingKey, messages, options = {}) {
+    return this.#publisher.publishAsyncBatch(routingKey, messages, options)
+  }
+
+  async publishDelayed (routingKey, message, delayMs, options = {}) {
+    return this.#publisher.publishDelayed(routingKey, message, delayMs, options)
+  }
+
+  async publishWithCache (routingKey, messageGenerator, options = {}) {
+    this.#publisher.validateRoutingKey(routingKey, this.#exchange)
+
+    const cacheKey = this.#cacheKey(routingKey)
+
+    if (this.#useCache) {
+      const cachedMessage = this.#cache.get(cacheKey)
+
+      if (cachedMessage !== undefined) {
+        this.#logger.info(`Cache hit for key: ${cacheKey}`)
+
+        return cachedMessage
+      }
+    }
+
+    const message = typeof messageGenerator === 'function' ? await messageGenerator() : messageGenerator
+
+    await this.publish(routingKey, message, {
+      ...options,
+      rateLimitKey: options.rateLimitKey || `cached:${routingKey}`,
+      headers: {
+        ...options.headers,
+        'x-cached': true
+      }
+    })
+
+    if (this.#useCache) {
+      const ttl = options.cacheTTL || this.#cache.options?.stdTTL
+
+      this.#cache.set(cacheKey, message, ttl)
+      this.#logger.info(`Cached message for key: ${cacheKey}, TTL: ${ttl}s`)
+    }
+
+    return message
+  }
+
+  // --- Consumption (delegated to ConsumerManager) ---
+
+  async subscribe (queueName, callback, options = {}) {
+    return this.#consumers.subscribe(queueName, callback, options)
+  }
+
+  async subscribeWithOptimizedPrefetch (queueName, callback, options = {}) {
+    return this.#consumers.subscribeWithOptimizedPrefetch(queueName, callback, options)
+  }
+
+  async subscribeParallel (queueName, processorFile, options = {}) {
+    return this.#consumers.subscribeParallel(queueName, processorFile, options)
+  }
+
+  async subscribeSequential (queueName, callback, options = {}) {
+    return this.#consumers.subscribeSequential(queueName, callback, options)
+  }
+
+  async unsubscribe (consumerTag) {
+    return this.#consumers.unsubscribe(consumerTag)
+  }
+
+  async acknowledgeMessage (message) {
+    return this.#consumers.ackMessage(message)
+  }
+
+  async negativeAcknowledgeMessage (message, options = {}) {
+    return this.#consumers.nackMessage(message, options)
+  }
+
+  // --- Topology: exchanges, queues, DLQ and delay (delegated to Topology) ---
+
+  async setupDeadLetterExchange () {
+    return this.#topology.setupDeadLetterExchange()
+  }
+
+  async createQueue (queueName, options = {}) {
+    return this.#topology.createQueue(queueName, options)
+  }
+
+  async moveToDeadLetter (message, reason) {
+    return this.#topology.moveToDeadLetter(message, reason)
+  }
+
+  async processDeadLetterQueue (originalQueueName, processor, options = {}) {
+    const deadLetterQueueName = `${originalQueueName}_dlq`
+
+    const consumer = await this.subscribe(deadLetterQueueName, async (message) => {
+      try {
+        await processor(message)
+      } catch (error) {
+        this.#logger.error(`Error processing dead letter message: ${error.message}`)
+      }
+    }, options)
+
+    this.#logger.info(`Started processing dead letter queue: ${deadLetterQueueName}`)
+
+    return consumer
+  }
+
+  async setupDelayExchange (options = {}) {
+    return this.#topology.setupDelayExchange(options)
+  }
+
+  async setupDelayPlugin () {
+    return this.#topology.setupDelayPlugin()
+  }
+
+  async isDelayPluginEnabled () {
+    return this.#topology.isDelayPluginEnabled()
+  }
+
+  // --- Configuration and observability ---
+
+  setCompression (useCompression) {
+    this.#codec.useCompression = useCompression
+    this.#logger.info(`Message compression ${useCompression ? 'enabled' : 'disabled'}`)
+  }
+
+  setCompressionThreshold (threshold) {
+    if (typeof threshold !== 'number' || threshold < 0) {
+      throw new Error('Compression threshold must be a non-negative number')
+    }
+
+    this.#codec.compressionThreshold = threshold
+    this.#logger.info(`Compression threshold set to ${threshold} bytes`)
+  }
+
+  setSerializer (serializer) {
+    if (typeof serializer !== 'function') {
+      throw new Error('Serializer must be a function')
+    }
+
+    this.#codec.serializer = serializer
+    this.#logger.info('Custom serializer set')
+  }
+
+  setDeserializer (deserializer) {
+    if (typeof deserializer !== 'function') {
+      throw new Error('Deserializer must be a function')
+    }
+
+    this.#codec.deserializer = deserializer
+    this.#logger.info('Custom deserializer set')
+  }
+
+  getCircuitBreakerState () {
+    return this.#circuitBreaker.getState()
+  }
+
+  #requireRateLimiter () {
+    if (!this.#rateLimiter) {
+      throw new Error('Rate limiter is not enabled')
+    }
+
+    return this.#rateLimiter
+  }
+
+  #requireCache () {
+    if (!this.#useCache) {
+      throw new Error('Cache is not enabled')
+    }
+
+    return this.#cache
+  }
+
+  #cacheKey (routingKey) {
+    return `${this.#exchange.name}:${routingKey}`
+  }
+
+  getRateLimitStatus (key) {
+    return this.#requireRateLimiter().getStatus(key)
+  }
+
+  resetRateLimit (key) {
+    this.#requireRateLimiter().reset(key)
+  }
+
+  blockRateLimit (key, duration) {
+    return this.#requireRateLimiter().blockKey(key, duration)
+  }
+
+  async getFromCache (routingKey) {
+    return this.#requireCache().get(this.#cacheKey(routingKey))
+  }
+
+  invalidateCache (routingKey) {
+    this.#requireCache().del(this.#cacheKey(routingKey))
+    this.#logger.info(`Cache invalidated for key: ${this.#cacheKey(routingKey)}`)
+  }
+
+  clearCache () {
+    this.#requireCache().flushAll()
+    this.#logger.info('Entire cache cleared')
+  }
+}
+
+export { RabbitMQ }
+export default RabbitMQ

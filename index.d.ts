@@ -1,0 +1,232 @@
+/// <reference types="node" />
+
+import { EventEmitter } from 'node:events'
+
+export interface LoggerLike {
+  info: (message: string, ...args: unknown[]) => void
+  warn: (message: string, ...args: unknown[]) => void
+  error: (message: string, ...args: unknown[]) => void
+  debug?: (message: string, ...args: unknown[]) => void
+}
+
+export interface ExchangeOptions {
+  name: string
+  type?: 'direct' | 'topic' | 'fanout' | 'headers'
+  options?: Record<string, unknown>
+}
+
+export interface CircuitBreakerOptions {
+  failureThreshold?: number
+  successThreshold?: number
+  timeout?: number
+}
+
+export interface CircuitBreakerState {
+  state: 'CLOSED' | 'OPEN' | 'HALF-OPEN'
+  failureCount: number
+  successCount: number
+  nextAttempt: number
+}
+
+export type RateLimiterStrategy = 'token-bucket' | 'leaky-bucket' | 'fixed-window' | 'sliding-window'
+
+export interface RateLimiterOptions {
+  windowMs?: number
+  maxRequests?: number
+  strategy?: RateLimiterStrategy
+  burstable?: boolean
+  burstLimit?: number
+  queueLimit?: number
+}
+
+export interface RateLimitStatus {
+  strategy: RateLimiterStrategy
+  remainingTokens: number
+  isBlocked: boolean
+  windowMs: number
+  maxRequests: number
+  burstable: boolean
+  currentTime: number
+}
+
+export interface RabbitMQOptions {
+  username?: string
+  password?: string
+  protocol?: 'amqp' | 'amqps'
+  vhost?: string
+  endpoint?: string
+  endpoints?: string[]
+  connectionName?: string
+  reconnectInterval?: number
+  maxReconnectInterval?: number
+  maxReconnectAttempts?: number
+  exchange?: ExchangeOptions
+  prefetchCount?: number
+  channelPoolSize?: number
+  useCompression?: boolean
+  compressionThreshold?: number
+  serializer?: (message: unknown) => string
+  deserializer?: (message: string) => unknown
+  circuitBreaker?: CircuitBreakerOptions
+  maxPriority?: number
+  deadLetterExchange?: string
+  delayExchange?: string
+  useCache?: boolean
+  cacheTTL?: number
+  cacheCheckPeriod?: number
+  cacheOptions?: Record<string, unknown>
+  rateLimiter?: RateLimiterOptions
+  logger?: LoggerLike
+}
+
+export interface PublishOptions {
+  persistent?: boolean
+  priority?: number
+  messageId?: string
+  headers?: Record<string, unknown>
+  maxRetries?: number
+  retryDelay?: number
+  rateLimitKey?: string
+  rateLimitCost?: number
+  cacheTTL?: number
+  [key: string]: unknown
+}
+
+export interface SubscribeOptions {
+  noAck?: boolean
+  prefetchCount?: number
+  [key: string]: unknown
+}
+
+export interface OptimizedPrefetchOptions extends SubscribeOptions {
+  initialPrefetch?: number
+  maxPrefetch?: number
+  minPrefetch?: number
+  optimizationInterval?: number
+  increaseFactor?: number
+  decreaseFactor?: number
+}
+
+export interface ParallelSubscribeOptions extends SubscribeOptions {
+  workerCount?: number
+  prefetch?: number
+  maxRespawns?: number
+}
+
+export interface ConnectOptions {
+  waitForConnection?: boolean
+  timeout?: number
+}
+
+export interface DelayExchangeOptions {
+  type?: 'direct' | 'topic' | 'fanout' | 'headers'
+  exchangeOptions?: Record<string, unknown>
+}
+
+export interface SequentialSubscribeOptions extends SubscribeOptions {
+  staleTimeout?: number
+}
+
+export interface ConsumeMessageFields {
+  consumerTag: string
+  deliveryTag: number
+  redelivered: boolean
+  exchange: string
+  routingKey: string
+}
+
+export interface ConsumeMessageProperties {
+  contentType?: string
+  contentEncoding?: string
+  headers?: Record<string, unknown>
+  deliveryMode?: number
+  priority?: number
+  correlationId?: string
+  replyTo?: string
+  expiration?: string
+  messageId?: string
+  timestamp?: number
+  type?: string
+  userId?: string
+  appId?: string
+  [key: string]: unknown
+}
+
+export interface ConsumeMessage {
+  content: Buffer
+  fields: ConsumeMessageFields
+  properties: ConsumeMessageProperties
+}
+
+export interface Consumer {
+  consumerTag: string
+}
+
+export interface ClusterStatus {
+  connectedTo: string
+  allEndpoints: string[]
+  connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'disconnecting' | 'failed'
+}
+
+export interface GracefulShutdownOptions {
+  signals?: NodeJS.Signals[]
+  exitProcess?: boolean
+}
+
+export type MessageCallback = (content: unknown, message: ConsumeMessage) => void | Promise<void>
+
+export declare class RabbitMQ extends EventEmitter {
+  constructor (options?: RabbitMQOptions)
+
+  connect (options?: ConnectOptions): Promise<unknown | null>
+  disconnect (): Promise<void>
+  getChannel (): Promise<unknown>
+  getClusterStatus (): ClusterStatus
+  enableGracefulShutdown (options?: GracefulShutdownOptions): void
+  /** @deprecated Use enableGracefulShutdown() instead. */
+  setupGracefulShutdown (): void
+
+  setExchange (name: string, type?: 'direct' | 'topic' | 'fanout' | 'headers', options?: Record<string, unknown>): void
+
+  publish (routingKey: string, message: unknown, options?: PublishOptions): Promise<void>
+  publishBatch (routingKey: string, messages: unknown[], options?: PublishOptions): Promise<void>
+  publishAsync (routingKey: string, message: unknown, options?: PublishOptions): Promise<void>
+  publishAsyncBatch (routingKey: string, messages: unknown[], options?: PublishOptions): Promise<void>
+  publishWithCache (routingKey: string, messageGenerator: unknown | (() => unknown | Promise<unknown>), options?: PublishOptions): Promise<unknown>
+  publishDelayed (routingKey: string, message: unknown, delayMs: number, options?: PublishOptions): Promise<void>
+
+  subscribe (queueName: string, callback: MessageCallback, options?: SubscribeOptions): Promise<Consumer>
+  subscribeWithOptimizedPrefetch (queueName: string, callback: MessageCallback, options?: OptimizedPrefetchOptions): Promise<Consumer>
+  subscribeParallel (queueName: string, processorFile: string, options?: ParallelSubscribeOptions): Promise<Consumer>
+  subscribeSequential (queueName: string, callback: MessageCallback, options?: SequentialSubscribeOptions): Promise<Consumer>
+  unsubscribe (consumerTag: string): Promise<boolean>
+
+  acknowledgeMessage (message: ConsumeMessage): Promise<void>
+  negativeAcknowledgeMessage (message: ConsumeMessage, options?: { requeue?: boolean }): Promise<void>
+
+  setCompression (useCompression: boolean): void
+  setCompressionThreshold (threshold: number): void
+  setSerializer (serializer: (message: unknown) => string): void
+  setDeserializer (deserializer: (message: string) => unknown): void
+
+  getCircuitBreakerState (): CircuitBreakerState
+
+  setupDeadLetterExchange (): Promise<void>
+  createQueue (queueName: string, options?: Record<string, unknown>): Promise<void>
+  moveToDeadLetter (message: ConsumeMessage, reason?: string): Promise<void>
+  processDeadLetterQueue (originalQueueName: string, processor: (content: unknown) => void | Promise<void>, options?: SubscribeOptions): Promise<Consumer>
+
+  setupDelayPlugin (): Promise<void>
+  setupDelayExchange (options?: DelayExchangeOptions): Promise<void>
+  isDelayPluginEnabled (): Promise<boolean>
+
+  getRateLimitStatus (key: string): RateLimitStatus
+  resetRateLimit (key: string): void
+  blockRateLimit (key: string, duration?: number): void
+
+  getFromCache (routingKey: string): Promise<unknown>
+  invalidateCache (routingKey: string): void
+  clearCache (): void
+}
+
+export default RabbitMQ

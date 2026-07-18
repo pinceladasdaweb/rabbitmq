@@ -1,0 +1,1109 @@
+# RabbitMQ
+
+A robust and elegant abstraction for RabbitMQ in Node.js, featuring advanced capabilities such as circuit breaker, intelligent retries, automatic compression, and parallel processing.
+
+## Features
+
+- **Robust Connection Management**: Smart handling of connections with automatic reconnection, backoff strategy, and cluster support.
+- **Advanced Channel Management**: Efficient channel pooling with dedicated channels for critical operations.
+- **Circuit Breaker Pattern**: Built-in circuit breaker to prevent cascading failures and manage system overload.
+- **Rate Limiter**: Flexible rate limiting strategies with token bucket, leaky bucket, fixed window and sliding window implementations.
+- **Intelligent Retry Mechanism**: Configurable retry strategies with exponential backoff and customizable attempts.
+- **Message Compression**: Automatic compression for large messages with configurable thresholds.
+- **Dead Letter Exchange**: Built-in DLQ support for failed message handling and reprocessing capabilities.
+- **Parallel Processing**: Multi-threading support through worker threads for CPU-intensive tasks.
+- **Delayed Message Support**: Native integration with RabbitMQ delayed message exchange plugin.
+- **Flexible Consumer Patterns**: Support for different consumption patterns including optimized prefetch and parallel processing.
+- **Caching Mechanism**: Optional message caching with TTL support for improved performance.
+
+## Advantages
+
+- **Enhanced Reliability**: Sophisticated connection and channel management ensures application stability during RabbitMQ unavailability.
+- **Developer-Friendly**: Clean and intuitive API design makes complex RabbitMQ operations straightforward.
+- **Production-Ready**: Built-in support for common enterprise patterns and failure scenarios.
+- **Performance Optimized**: Smart resource management with features like channel pooling and message compression.
+- **Flexible Configuration**: Highly configurable with sensible defaults for quick start and fine-tuning capabilities.
+- **Automatic Recovery**: Self-healing capabilities with intelligent reconnection and channel recovery.
+- **Comprehensive Monitoring**: Built-in events and status reporting for better observability.
+- **Type-Safe**: Written in JavaScript with proper error handling and parameter validation.
+- **Memory Efficient**: Careful resource management with proper cleanup and memory optimization.
+- **Scale-Ready**: Designed for high-throughput scenarios with parallel processing capabilities.
+
+## Understanding RabbitMQ
+
+RabbitMQ is a robust message broker that implements the Advanced Message Queuing Protocol (AMQP). It enables applications to communicate asynchronously by acting as an intermediary for messages, supporting multiple messaging patterns including point-to-point, publish/subscribe, and request/reply.
+
+### What is RabbitMQ?
+
+RabbitMQ acts as a post office for your applications. It accepts, stores, and forwards binary messages between producers (applications that send messages) and consumers (applications that process messages). This decoupling allows for more resilient and scalable systems.
+
+### What are Exchanges?
+
+An exchange is like a post office's sorting facility. When a producer sends a message to RabbitMQ, it sends it to an exchange. The exchange is responsible for routing messages to the appropriate queues based on routing rules called "bindings".
+
+#### Types of Exchanges
+
+1. **Direct Exchange**
+   - Routes messages based on an exact match of the routing key
+   - Perfect for direct, point-to-point communication
+   - Example: Sending logs of a specific severity to their respective handlers
+
+2. **Topic Exchange**
+   - Routes messages based on routing key patterns using wildcards
+   - Ideal for multicast routing and complex routing scenarios
+   - Example: Routing messages based on categories like "users.*.deleted" or "order.#"
+
+3. **Fanout Exchange**
+   - Broadcasts messages to all bound queues
+   - Ignores routing keys entirely
+   - Perfect for broadcast messaging
+   - Example: Broadcasting real-time updates to multiple subscribers
+
+4. **Headers Exchange**
+   - Routes based on message header attributes instead of routing keys
+   - Allows for complex routing based on multiple criteria
+   - Example: Routing based on message type, content-type, or other custom headers
+
+### What are Queues?
+
+Queues are where messages live until they're consumed. Think of them as buffers or mailboxes that hold messages in a first-in-first-out (FIFO) manner. They have several important characteristics and variations:
+
+#### Types of Queues
+
+1. **Standard Queues**
+   - Basic FIFO queues
+   - Messages are consumed in the order they arrive
+   - Support multiple consumers (round-robin distribution)
+
+2. **Priority Queues**
+   - Messages can have priority levels
+   - Higher priority messages are delivered first
+   - Useful for handling urgent messages
+
+3. **Dead Letter Queues (DLQ)**
+   - Special queues for messages that can't be delivered
+   - Used for handling failed processing attempts
+   - Important for error handling and monitoring
+
+4. **Delayed Queues**
+   - Support message delivery with a delay
+   - Messages become available after a specified time
+   - Useful for scheduling and retries
+
+### Queue Properties
+
+- **Durability**: Queues can be durable (survive broker restarts) or transient
+- **Auto-delete**: Queues can be automatically deleted when no longer needed
+- **Exclusivity**: Queues can be exclusive to one connection
+- **Arguments**: Custom queue parameters for features like message TTL, max length, etc.
+
+### Message Flow Example
+
+```plaintext
+Producer -> Exchange -> [Routing] -> Queue -> Consumer
+                          |
+                     Binding Rules
+```
+
+This message flow ensures:
+- Reliable delivery
+- Message persistence when needed
+- Flexible routing options
+- Scalable processing
+
+## Local Development
+
+### Environment Variables
+
+The project includes an `.env.example` file with all required environment variables. To set up your local environment:
+
+1. Create your `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+2. Load the environment variables into your shell:
+
+```bash
+set -a; source .env; set +a
+```
+
+The `.env` file contains these default configurations:
+
+```env
+RMQ_USERNAME=admin
+RMQ_PASSWORD=admin
+RABBITMQ_AMQP_PORT=5672
+RABBITMQ_ADMIN_PORT=15672
+```
+
+You can adjust these values in your `.env` file according to your needs.
+
+### Running Tests
+
+Unit tests run without any external dependency:
+
+```bash
+npm test
+```
+
+Integration tests exercise the library against a real broker — including a forced connection drop to verify automatic recovery of the channel pool and consumers. Start RabbitMQ first, then enable them via environment variable:
+
+```bash
+docker compose up -d
+npm run test:integration
+```
+
+Both suites also run on every push and pull request via GitHub Actions (`.github/workflows/ci.yml`), with RabbitMQ provisioned as a service container.
+
+### Installing Delayed Message Plugin
+
+The RabbitMQ Delayed Message Plugin is required for using message scheduling features (`publishDelayed()`).
+
+**Using the project's docker-compose (recommended):** nothing to do. The compose file mounts the plugin (`rabbitmq_delayed_message_exchange-4.0.2.ez`) and the `.docker/enabled_plugins` file into the container, so the plugin is active on every `docker compose up` — including fresh container recreations. In CI, the workflow installs the plugin on the service container before running the integration tests.
+
+**On brokers you manage yourself**, install it manually:
+
+1. Copy the plugin file to the container:
+```bash
+docker cp rabbitmq_delayed_message_exchange-4.0.2.ez rabbitmq:/plugins
+```
+
+2. Enable the plugin:
+```bash
+docker exec -it rabbitmq rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+The delayed message plugin allows you to:
+- Schedule messages for future delivery
+- Set precise delays for message processing
+- Implement deferred tasks and scheduled jobs
+
+You can verify the plugin installation through the RabbitMQ Management UI under the "Admin > Plugins" section.
+
+### Common Issues
+
+1. **Port conflicts**: If ports 5672 or 15672 are already in use, adjust the port mappings in your `.env` file.
+2. **Permission denied**: Ensure your user has permissions to execute Docker commands.
+3. **Container not starting**: Check logs with `docker-compose logs rabbitmq`
+
+## Installation
+
+### Package manager
+
+Using npm:
+
+```bash
+npm install @pinceladasdaweb/rabbitmq
+```
+
+Using yarn:
+
+```bash
+yarn add @pinceladasdaweb/rabbitmq
+```
+
+Using pnpm:
+
+```bash
+pnpm add @pinceladasdaweb/rabbitmq
+```
+
+Once the package is installed, you can import the library using `import` or `require` approach:
+
+```bash
+import RabbitMQ from '@pinceladasdaweb/rabbitmq'
+```
+
+Or if you use require for importing:
+
+```bash
+const { RabbitMQ } = require('@pinceladasdaweb/rabbitmq')
+```
+
+## Constructor Options
+
+The `RabbitMQ` constructor accepts an options object with the following parameters:
+
+### Connection Options
+
+- **username** `{string}` *(required)*: RabbitMQ server username.
+  - Example: `'admin'`
+- **password** `{string}` *(required)*: RabbitMQ server password.
+  - Example: `'admin'`
+- **endpoints** `{array}` *(required)*: Array of RabbitMQ server hostnames.
+  - Example: `['localhost:5672']`
+- **protocol** `{string}`: Connection protocol (`'amqp'` or `'amqps'` for TLS).
+  - Default: `'amqp'`
+  - Example: `'amqps'`
+- **vhost** `{string}`: Virtual host to connect to.
+  - Default: server default (`/`)
+  - Example: `'my-vhost'`
+- **connectionName** `{string}`: Identifier for the connection.
+  - Default: `'default_connection'`
+  - Example: `'my-app-connection'`
+
+### Reconnection Options
+
+- **reconnectInterval** `{number}`: Initial interval between reconnection attempts in milliseconds.
+  - Default: `1000`
+  - Example: `2000`
+- **maxReconnectInterval** `{number}`: Maximum interval between reconnection attempts in milliseconds.
+  - Default: `15000`
+  - Example: `30000`
+- **maxReconnectAttempts** `{number}`: Maximum number of reconnection attempts.
+  - Default: `Infinity`
+  - Example: `10`
+
+### Exchange Options
+
+- **exchange** `{object}`: Configuration for the default exchange.
+  - Properties:
+    - **name** `{string}`: Exchange name.
+      - Example: `'my-exchange'`
+    - **type** `{string}`: Exchange type ('direct', 'topic', 'fanout', 'headers').
+      - Example: `'direct'`
+    - **options** `{object}`: Additional exchange options.
+      - Example: `{ durable: true }`
+- **deadLetterExchange** `{string}`: Name of the dead letter exchange used by `createQueue()` and `moveToDeadLetter()`.
+  - Default: `'dlx'`
+- **delayExchange** `{string}`: Name of the delay exchange used by `setupDelayExchange()` and `publishDelayed()`.
+  - Default: `'delayed'`
+
+### Channel Options
+
+- **channelPoolSize** `{number}`: Number of channels to maintain in the pool.
+  - Default: `10`
+  - Example: `5`
+- **prefetchCount** `{number}`: Number of messages to prefetch.
+  - Default: `10`
+  - Example: `1`
+
+### Message Options
+
+- **useCompression** `{boolean}`: Enable message compression.
+  - Default: `false`
+  - Example: `true`
+- **compressionThreshold** `{number}`: Minimum message size in bytes for compression.
+  - Default: `1000`
+  - Example: `2048`
+- **serializer** `{function}`: Custom function for message serialization.
+  - Default: `JSON.stringify`
+- **deserializer** `{function}`: Custom function for message deserialization.
+  - Default: `JSON.parse`
+
+### Cache Options
+
+- **useCache** `{boolean}`: Enable message caching.
+  - Default: `false`
+- **cacheTTL** `{number}`: Time to live for cached messages in seconds.
+  - Default: `60`
+  - Example: `120`
+- **cacheCheckPeriod** `{number}`: Cache cleanup interval in seconds.
+  - Default: `120`
+  - Example: `240`
+
+### Rate Limiter Options
+
+- **rateLimiter** `{object}`: Rate limiter configuration.
+  - Properties:
+    - **windowMs** `{number}`: Time window in milliseconds.
+      - Default: `60000`
+    - **maxRequests** `{number}`: Maximum requests in window.
+      - Default: `100`
+    - **strategy** `{string}`: Rate limiting strategy ('token-bucket', 'leaky-bucket', 'fixed-window', 'sliding-window').
+      - Default: `'token-bucket'`
+      - All strategies track limits **per rate-limit key** (the routing key by default, or `options.rateLimitKey`).
+      - `'leaky-bucket'` smooths bursts instead of rejecting: accepted requests are delayed proportionally to the queue occupancy of that key, and only rejected once the occupancy exceeds `queueLimit`.
+    - **queueLimit** `{number}`: Maximum queue occupancy for the leaky-bucket strategy.
+      - Default: `1000`
+    - **burstable** `{boolean}`: Allow request bursting.
+      - Default: `false`
+    - **burstLimit** `{number}`: Maximum burst size.
+      - Default: `maxRequests * 1.5`
+
+### Circuit Breaker Options
+
+- **circuitBreaker** `{object}`: Circuit breaker configuration.
+  - Properties:
+    - **failureThreshold** `{number}`: Number of failures before opening.
+      - Default: `5`
+    - **successThreshold** `{number}`: Successes needed to close.
+      - Default: `2`
+    - **timeout** `{number}`: Time in milliseconds before retry.
+      - Default: `60000`
+
+### Logging Options
+
+- **logger** `{object}`: Custom logger implementation.
+  - Methods:
+    - **info** `{function}`: Information level logging.
+    - **error** `{function}`: Error level logging.
+    - **warn** `{function}`: Warning level logging.
+  - Example:
+    ```javascript
+    {
+      info: (msg) => console.log(msg),
+      error: (msg) => console.error(msg),
+      warn: (msg) => console.warn(msg)
+    }
+    ```
+
+### Usage Example
+
+```javascript
+const rabbitMQ = new RabbitMQ({
+  username: 'admin',
+  password: 'admin',
+  endpoints: ['localhost:5672'],
+  connectionName: 'my-app',
+  exchange: {
+    name: 'main-exchange',
+    type: 'direct'
+  },
+  channelPoolSize: 5,
+  useCompression: true,
+  rateLimiter: {
+    windowMs: 60000,
+    maxRequests: 1000
+  }
+})
+```
+
+### Publish and Consumer example
+
+#### Basic Connection
+
+```javascript
+const { RabbitMQ } = require('@pinceladasdaweb/rabbitmq')
+
+const rabbitMQ = new RabbitMQ({
+  username: 'admin',
+  password: 'admin',
+  endpoints: ['localhost:5672'],
+  exchange: {
+    name: 'my-exchange',
+    type: 'direct'
+  }
+})
+
+await rabbitMQ.connect()
+```
+
+#### Simple Publisher
+
+```javascript
+const publishMessage = async () => {
+  try {
+    const message = {
+      id: 1,
+      content: 'Hello World',
+      timestamp: Date.now()
+    }
+
+    await rabbitMQ.publish('my-route', message)
+    console.log('Message published successfully')
+  } catch (error) {
+    console.error('Error publishing message:', error.message)
+  } finally {
+    await rabbitMQ.disconnect()
+  }
+}
+```
+
+#### Simple Consumer
+
+```javascript
+const startConsumer = async () => {
+  try {
+    const queueName = 'my-queue'
+    
+    // Get a channel and set up the queue
+    const channel = await rabbitMQ.getChannel()
+    await channel.assertQueue(queueName, { durable: true })
+    await channel.bindQueue(queueName, 'my-exchange', 'my-route')
+
+    // Start consuming messages
+    await rabbitMQ.subscribe(queueName, async (content, message) => {
+      try {
+        console.log('Processing message:', content)
+        // Process your message here
+        
+        // Explicitly acknowledge successful processing
+        await rabbitMQ.acknowledgeMessage(message)
+        console.log('Message processed successfully')
+      } catch (error) {
+        // Explicitly reject failed messages
+        // requeue: true - message will be requeued
+        // requeue: false - message will be discarded or sent to DLQ if configured
+        await rabbitMQ.negativeAcknowledgeMessage(message, { requeue: false })
+        console.error('Failed to process message:', error)
+      }
+    }, {
+      noAck: false  // Enable manual acknowledgment
+    })
+
+    console.log('Consumer started')
+  } catch (error) {
+    console.error('Error starting consumer:', error.message)
+  }
+}
+```
+
+### Publish and Consumer example with DLQ
+
+#### Basic Connection
+
+```javascript
+const { RabbitMQ } = require('@pinceladasdaweb/rabbitmq')
+
+const rabbitMQ = new RabbitMQ({
+  username: 'admin',
+  password: 'admin',
+  endpoints: ['localhost:5672'],
+  exchange: {
+    name: 'my-exchange',
+    type: 'direct'
+  },
+  deadLetterExchange: 'dlx', // Configure DLX name
+  channelPoolSize: 5
+})
+
+// Setup connection events
+rabbitMQ.on('connected', () => {
+  const status = rabbitMQ.getClusterStatus()
+  console.log('📬 Connected successfully to RabbitMQ!')
+  console.log('Cluster status:', status)
+})
+
+rabbitMQ.on('disconnected', () => {
+  console.log('❌ Disconnected from RabbitMQ')
+})
+
+rabbitMQ.on('reconnected', () => {
+  console.log('🔄 Reconnected to RabbitMQ')
+})
+
+rabbitMQ.on('reconnectFailed', () => {
+  console.log('💔 Failed to reconnect after all attempts')
+})
+
+await rabbitMQ.connect()
+```
+
+#### Publisher with DLQ
+
+```javascript
+const publish = async () => {
+  try {
+    // Setup DLX
+    await rabbitMQ.setupDeadLetterExchange()
+
+    // Create queue with DLQ configuration
+    const queueName = 'my-queue'
+
+    await rabbitMQ.createQueue(queueName, {
+      durable: true,
+      arguments: {
+        'x-dead-letter-exchange': 'dlx',
+        'x-dead-letter-routing-key': `${queueName}_dlq`
+      }
+    })
+
+    // Publish message
+    const message = {
+      id: 1,
+      content: 'Test message',
+      timestamp: Date.now()
+    }
+
+    await rabbitMQ.publish('my-route', message)
+    console.log('Message published successfully')
+    
+    await rabbitMQ.disconnect()
+  } catch (error) {
+    console.error('Error:', error.message)
+    await rabbitMQ.disconnect()
+  }
+}
+```
+
+#### Consumer with DLQ
+
+```javascript
+const startConsumer = async () => {
+  try {
+    const queueName = 'my-queue'
+    const maxRetries = 3
+    
+    // Get a channel and set up the queue
+    const channel = await rabbitMQ.getChannel()
+
+    await rabbitMQ.subscribe(queueName, async (content, message) => {
+      try {
+        console.log('Processing message:', content)
+        
+        // Simulate processing that might fail
+        if (Math.random() < 0.5) {
+          throw new Error('Processing failed')
+        }
+        
+        await rabbitMQ.acknowledgeMessage(message)
+        console.log('Message processed successfully')
+      } catch (error) {
+        const retryCount = (message.properties.headers['x-retry-count'] || 0) + 1
+        
+        if (retryCount <= maxRetries) {
+          // Add retry count and requeue
+          message.properties.headers['x-retry-count'] = retryCount
+          await rabbitMQ.negativeAcknowledgeMessage(message, { requeue: true })
+          console.log(`Retry attempt ${retryCount}/${maxRetries}`)
+        } else {
+          // Move to DLQ after max retries
+          await rabbitMQ.moveToDeadLetter(
+            message,
+            `Failed after ${maxRetries} attempts: ${error.message}`
+          )
+          console.log('Message moved to DLQ')
+        }
+      }
+    }, {
+      noAck: false
+    })
+
+    console.log('Consumer started')
+  } catch (error) {
+    console.error('Error:', error.message)
+    await rabbitMQ.disconnect()
+  }
+}
+```
+
+These examples demonstrate:
+- DLQ configuration and usage
+- Connection event handling
+- Retry mechanism with max attempts
+- Error handling and message flow control
+
+These examples show the minimum setup required to start working with the library. For more advanced features, the [examples](examples) folder contains a runnable demo for every capability.
+
+All examples share their connection settings through [examples/config.mjs](examples/config.mjs), which reads credentials and endpoint from environment variables (`RABBITMQ_USER`/`RMQ_USERNAME`, `RABBITMQ_PASS`/`RMQ_PASSWORD`, `RABBITMQ_ENDPOINT`) and falls back to the docker-compose defaults (`admin`/`admin` @ `localhost:5672`) — so each example only declares what is specific to it (`connectionName`, `exchange`, features):
+
+| # | Example | What it demonstrates |
+|---|---------|----------------------|
+| 1 | [connection](examples/1%20-%20connection) | Connection lifecycle, reconnection with backoff, connection events |
+| 2 | [standard-publication](examples/2%20-%20standard-publication) | Basic publish with confirms and a simple consumer |
+| 3 | [batch-publication](examples/3%20-%20batch-publication) | Publishing multiple messages at once with `publishBatch()` |
+| 4 | [async-publication](examples/4%20-%20async-publication) | Fire-and-forget publishing with `publishAsync()` |
+| 5 | [async-batch-publication](examples/5%20-%20async-batch-publication) | Fire-and-forget batches with `publishAsyncBatch()` |
+| 6 | [publish-with-cache](examples/6%20-%20publish-with-cache) | Publish deduplication with `publishWithCache()` and TTL |
+| 7 | [priority-publication](examples/7%20-%20priority-publication) | Priority queues and message priority |
+| 8 | [delay-publication](examples/8%20-%20delay-publication) | Scheduled delivery with `setupDelayExchange()` + `publishDelayed()` |
+| 9 | [transaction-publication](examples/9%20-%20transaction-publication) | All-or-nothing batches with confirms, retry and compensation events |
+| 10 | [selective-compression-publication](examples/10%20-%20selective-compression-publication) | Automatic gzip compression above a size threshold |
+| 11 | [circuit-breaker-publication](examples/11%20-%20circuit-breaker-publication) | Circuit breaker states and the `circuitBreakerStateChanged` event |
+| 12 | [retry-publication](examples/12%20-%20retry-publication) | Retry with exponential backoff (`maxRetries`/`retryDelay`) |
+| 13 | [dead-letter-queues](examples/13%20-%20dead-letter-queues) | DLQ topology built manually with raw channels |
+| 14 | [serializer-publication](examples/14%20-%20serializer-publication) | Custom serializer/deserializer (XML via xml2js) |
+| 15 | [flexible-routing](examples/15%20-%20flexible-routing) | Topic exchanges and routing patterns |
+| 16 | [optimized-prefetch](examples/16%20-%20optimized-prefetch) | Adaptive prefetch with `subscribeWithOptimizedPrefetch()` |
+| 17 | [subscribe-parallel](examples/17%20-%20subscribe-parallel) | CPU-bound processing on worker threads with `subscribeParallel()` |
+| 18 | [round-robin-consumers](examples/18%20-%20round-robin-consumers) | Competing consumers on the same queue |
+| 19 | [sequential-producer](examples/19%20-%20sequential-producer) | Ordered processing with `subscribeSequential()` and `depends-on` |
+| 20 | [rate-limit-publication](examples/20%20-%20rate-limit-publication) | Rate limiting strategies, status and events |
+| 21 | [consumer-management](examples/21%20-%20consumer-management) | `unsubscribe()`, consumer lifecycle events, `enableGracefulShutdown()`, `connect({ waitForConnection })` |
+| 22 | [native-dead-letter](examples/22%20-%20native-dead-letter) | Built-in DLQ support: `createQueue()`, `moveToDeadLetter()`, `processDeadLetterQueue()` |
+
+## Available Methods
+
+### Connection Management
+
+- **connect(options?)** `{Promise<Object|null>}`
+  - Establishes connection with RabbitMQ server.
+  - Initializes channel pool and ensures exchange setup.
+  - If every endpoint fails, reconnection keeps running in the background. By default `connect()` returns `null` in that case; pass `waitForConnection: true` to make the promise resolve only when the connection is finally established (or reject when reconnection gives up / the optional `timeout` in ms expires).
+  - Example:
+    ```javascript
+    await rabbitMQ.connect()
+
+    // Or block until connected, with a 30s cap:
+    await rabbitMQ.connect({ waitForConnection: true, timeout: 30000 })
+    ```
+
+- **disconnect()** `{Promise<void>}`
+  - Gracefully closes all channels and connection.
+  - Terminates parallel processing workers and cleans up resources, timers and event listeners.
+  - Example:
+    ```javascript
+    await rabbitMQ.disconnect()
+    ```
+
+- **enableGracefulShutdown(options?)** `{void}`
+  - Opt-in helper that registers `SIGINT`/`SIGTERM` handlers which call `disconnect()` and exit the process.
+  - The library never registers process-level handlers on its own — your application stays in control of its lifecycle. Call this method (or handle signals yourself) if you want automatic shutdown.
+  - Parameters:
+    - **options.signals** `{Array<string>}`: Signals to handle. Default: `['SIGINT', 'SIGTERM']`
+    - **options.exitProcess** `{boolean}`: Whether to call `process.exit()` after disconnecting. Default: `true`
+  - Example:
+    ```javascript
+    rabbitMQ.enableGracefulShutdown()
+    ```
+
+- **getClusterStatus()** `{Object}`
+  - Returns current cluster connection status.
+  - Returns:
+    ```javascript
+    {
+      connectedTo: 'localhost:5672',
+      allEndpoints: ['localhost:5672'],
+      connectionState: 'connected'
+    }
+    ```
+
+### Message Publishing
+
+- **publish(routingKey, message, options?)** `{Promise<void>}`
+  - Publishes a message to the configured exchange.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key for message delivery
+    - **message** `{any}`: Message content
+    - **options** `{Object}`: Optional publishing options
+  - Example:
+    ```javascript
+    await rabbitMQ.publish('user.created', { id: 1, name: 'John' })
+    ```
+
+- **publishBatch(routingKey, messages, options?)** `{Promise<void>}`
+  - Publishes multiple messages in a single operation.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key for messages
+    - **messages** `{Array<any>}`: Array of messages
+    - **options** `{Object}`: Optional publishing options
+  - Example:
+    ```javascript
+    await rabbitMQ.publishBatch('logs', [log1, log2, log3])
+    ```
+
+- **publishAsync(routingKey, message, options?)** `{Promise<void>}`
+  - Publishes message asynchronously without waiting for confirmation.
+  - Uses same parameters as publish().
+  - Example:
+    ```javascript
+    await rabbitMQ.publishAsync('metrics', metricData)
+    ```
+
+- **publishAsyncBatch(routingKey, messages, options?)** `{Promise<void>}`
+  - Publishes multiple messages asynchronously without waiting for confirmation.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key for messages
+    - **messages** `{Array<any>}`: Array of messages to publish
+    - **options** `{Object}`: Optional publishing options
+  - Example:
+    ```javascript
+    const messages = [message1, message2, message3]
+    await rabbitMQ.publishAsyncBatch('logs', messages, {
+      headers: { 'x-async-batch': true }
+    })
+    ```
+
+- **publishWithCache(routingKey, messageGenerator, options?)** `{Promise<any>}`
+  - Publish deduplication: on cache **miss** it generates, publishes and caches the message; on cache **hit** it returns the cached message **without publishing anything**.
+  - Use it when repeated calls within the TTL should result in a single publication (e.g. periodic snapshots). It is not a read cache for consumers.
+  - Requires `useCache: true` in the constructor. Use `invalidateCache(routingKey)` to force the next call to publish again.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key
+    - **messageGenerator** `{Function|any}`: Message or function to generate the message (only invoked on cache miss)
+    - **options** `{Object}`: Publishing and cache options (`cacheTTL` overrides the default TTL)
+  - Example:
+    ```javascript
+    await rabbitMQ.publishWithCache('my-route', 
+      () => generateMessage(),
+      { cacheTTL: 60 }
+    )
+    ```
+
+- **publishDelayed(routingKey, message, delayMs, options?)** `{Promise<void>}`
+  - Publishes a message that the broker only routes after `delayMs` milliseconds, using the delay exchange (see `setupDelayExchange()`).
+  - Requires the `rabbitmq_delayed_message_exchange` plugin on the broker (see [Installing Delayed Message Plugin](#installing-delayed-message-plugin)) and queues bound to the delay exchange.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key
+    - **message** `{any}`: Message content
+    - **delayMs** `{number}`: Delay in milliseconds (non-negative)
+    - **options** `{Object}`: Optional publishing options
+  - Example:
+    ```javascript
+    await rabbitMQ.setupDelayExchange()
+
+    const channel = await rabbitMQ.getChannel()
+    await channel.bindQueue('my-queue', 'delayed', 'my-route')
+
+    await rabbitMQ.publishDelayed('my-route', { remind: true }, 5000)
+    ```
+
+### Message Consumption
+
+- **subscribe(queueName, callback, options?)** `{Promise<Object>}`
+  - Basic message consumption with automatic acknowledgment.
+  - Parameters:
+    - **queueName** `{string}`: Queue to consume from
+    - **callback** `{Function}`: Message handling function
+    - **options** `{Object}`: Consumption options
+  - Returns the consumer object — keep its `consumerTag` if you plan to call `unsubscribe()` later.
+  - Example:
+    ```javascript
+    await rabbitMQ.subscribe('my-queue', async (message) => {
+      console.log(message)
+    })
+    ```
+
+- **unsubscribe(consumerTag)** `{Promise<boolean>}`
+  - Cancels an active consumer without disconnecting. Stops delivery, releases the consumer's resources (worker threads for `subscribeParallel`, internal state for `subscribeSequential`) and removes it from automatic recreation on reconnect.
+  - Returns `true` when a consumer with that tag was found and cancelled, `false` otherwise.
+  - Example:
+    ```javascript
+    const consumer = await rabbitMQ.subscribe('my-queue', handler)
+
+    // later...
+    await rabbitMQ.unsubscribe(consumer.consumerTag)
+    ```
+
+- **subscribeWithOptimizedPrefetch(queueName, callback, options?)** `{Promise<Object>}`
+  - Advanced consumption with automatic prefetch optimization.
+  - Adjusts prefetch count based on processing performance.
+  - Parameters:
+    - **queueName** `{string}`: Queue to consume from
+    - **callback** `{Function}`: Message handling function
+    - **options** `{Object}`: Additional options including:
+      - **initialPrefetch** `{number}`: Starting prefetch count (default: 10)
+      - **maxPrefetch** `{number}`: Maximum prefetch limit (default: 1000)
+      - **optimizationInterval** `{number}`: Adjustment interval in ms
+  - Example:
+    ```javascript
+    await rabbitMQ.subscribeWithOptimizedPrefetch('heavy-queue', 
+      async (message) => {
+        await processMessage(message)
+      },
+      { initialPrefetch: 5, maxPrefetch: 100 }
+    )
+    ```
+
+- **subscribeParallel(queueName, processorFile, options?)** `{Promise<Object>}`
+  - Parallel message processing using worker threads.
+  - Parameters:
+    - **queueName** `{string}`: Queue to consume from
+    - **processorFile** `{string}`: Path to worker processor file. File must export a message processor that:
+      - Receives message via worker thread message event
+      - Returns { success: true/false } to indicate processing result
+      - Can access workerData.workerId for identification
+    - **options** `{Object}`: Options including:
+      - **workerCount** `{number}`: Number of workers (default: CPU cores)
+      - **prefetch** `{number}`: Prefetch per worker
+  - Example:
+    ```javascript
+    // processor.js
+    const { parentPort, workerData } = require('worker_threads')
+    parentPort.on('message', async (message) => {
+      try {
+        // Process message
+        parentPort.postMessage({ success: true })
+      } catch (error) {
+        parentPort.postMessage({ success: false, error: error.message })
+      }
+    })
+
+    // consumer.js
+    await rabbitMQ.subscribeParallel('cpu-intensive-queue', 
+      './processor.js',
+      { workerCount: 4 }
+    )
+    ```
+
+- **subscribeSequential(queueName, callback, options?)** `{Promise<Object>}`
+  - Sequential message processing with dependency handling.
+  - Ensures messages are processed in order based on dependencies.
+  - Parameters:
+    - **queueName** `{string}`: Queue to consume from
+    - **callback** `{Function}`: Message handling function
+    - **options** `{Object}`: Consumption options
+  - Message Dependency Format:
+    - Messages must include messageId in properties
+    - Dependencies specified in headers['depends-on']
+  - Notes:
+    - Messages are acknowledged only after they are actually processed. Messages parked waiting for a dependency stay unacknowledged.
+    - Dependency reordering requires `prefetchCount` greater than `1` (default is `1`, which is strictly sequential). Use e.g. `{ prefetchCount: 5 }` so dependent messages can be buffered while their dependency is being processed.
+  - Example:
+    ```javascript
+    // Publishing with dependencies
+    await rabbitMQ.publish('route', message1, {
+      messageId: 'msg-1'
+    })
+    await rabbitMQ.publish('route', message2, {
+      messageId: 'msg-2',
+      headers: {
+        'depends-on': 'msg-1'  // Will process after msg-1
+      }
+    })
+
+    // Consumer
+    await rabbitMQ.subscribeSequential('sequential-queue', 
+      async (message) => {
+        await processInOrder(message)
+      },
+      { prefetchCount: 5 }
+    )
+    ```
+
+### Message Handling
+
+- **acknowledgeMessage(message)** `{Promise<void>}`
+  - Explicitly acknowledges a message.
+  - Parameters:
+    - **message** `{Object}`: Message to acknowledge
+  - Example:
+    ```javascript
+    await rabbitMQ.acknowledgeMessage(message)
+    ```
+
+- **negativeAcknowledgeMessage(message, options?)** `{Promise<void>}`
+  - Rejects a message with optional requeue.
+  - Parameters:
+    - **message** `{Object}`: Message to reject
+    - **options** `{Object}`: Options including:
+      - **requeue** `{boolean}`: Whether to requeue the message
+  - Example:
+    ```javascript
+    await rabbitMQ.negativeAcknowledgeMessage(message, { requeue: true })
+    ```
+
+### Queue Management
+
+- **createQueue(queueName, options?)** `{Promise<void>}`
+  - Creates a queue with optional dead letter setup.
+  - Parameters:
+    - **queueName** `{string}`: Name of the queue
+    - **options** `{Object}`: Queue options
+  - Example:
+    ```javascript
+    await rabbitMQ.createQueue('my-queue', { 
+      durable: true,
+      maxPriority: 10 
+    })
+    ```
+
+### Exchange Management
+
+- **setExchange(name, type?, options?)** `{void}`
+  - Switches which exchange subsequent publishes target. Synchronous — it only updates the in-memory configuration.
+  - ⚠️ It does **not** assert the exchange on the broker: publishing to an exchange that does not exist fails with a channel-level 404. Make sure the exchange exists (assert it via `getChannel()` + `assertExchange`, or configure it in the constructor so `connect()` asserts it).
+  - Parameters:
+    - **name** `{string}`: Exchange name
+    - **type** `{string}`: Exchange type
+    - **options** `{Object}`: Exchange options
+  - Example:
+    ```javascript
+    rabbitMQ.setExchange('new-exchange', 'topic', { durable: true })
+    ```
+
+### Dead Letter Management
+
+- **setupDeadLetterExchange()** `{Promise<void>}`
+  - Sets up the dead letter exchange configuration.
+  - Example:
+    ```javascript
+    await rabbitMQ.setupDeadLetterExchange()
+    ```
+
+- **moveToDeadLetter(message, reason?)** `{Promise<void>}`
+  - Copies a message to the dead letter queue with tracking headers (`x-death-reason`, `x-death-time`, `x-original-exchange`, `x-original-routing-key`). The original message must still be acknowledged (the automatic ack from `subscribe` covers this when the callback returns normally).
+  - The target DLQ is resolved from the **source queue** of the delivering consumer (`<queueName>_dlq`, matching `createQueue()`), falling back to the routing-key convention (`<routingKey>_dlq`) for messages that were not consumed through this instance.
+  - The message is published with `mandatory: true`: if the resolved DLQ routing has no binding on the DLX, the promise **rejects** instead of silently dropping the message. See [examples/22 - native-dead-letter](examples/22%20-%20native-dead-letter).
+  - Parameters:
+    - **message** `{Object}`: Message to move
+    - **reason** `{string}`: Reason for moving to DLQ
+  - Example:
+    ```javascript
+    await rabbitMQ.moveToDeadLetter(message, 'Message processing failed')
+    ```
+
+- **processDeadLetterQueue(originalQueueName, processor, options?)** `{Promise<void>}`
+  - Processes messages from a dead letter queue.
+  - Parameters:
+    - **originalQueueName** `{string}`: Original queue name
+    - **processor** `{Function}`: Processing function
+    - **options** `{Object}`: Consumer options
+  - Example:
+    ```javascript
+    await rabbitMQ.processDeadLetterQueue('my-queue', async (message) => {
+      // Process dead letter message
+    })
+    ```
+
+### Cache Management
+
+- **getFromCache(routingKey)** `{Promise<any>}`
+  - Retrieves a message from cache.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key of the cached message
+  - Example:
+    ```javascript
+    const cachedMessage = await rabbitMQ.getFromCache('my-route')
+    ```
+
+- **invalidateCache(routingKey)** `{void}`
+  - Invalidates cache for a specific routing key.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key to invalidate
+  - Example:
+    ```javascript
+    rabbitMQ.invalidateCache('my-route')
+    ```
+
+- **clearCache()** `{void}`
+  - Clears all cached messages.
+  - Example:
+    ```javascript
+    rabbitMQ.clearCache()
+    ```
+
+### Rate Limiter Management
+
+- **getRateLimitStatus(key)** `{Object}`
+  - Returns rate limit status for a key.
+  - Example:
+    ```javascript
+    const status = rabbitMQ.getRateLimitStatus('my-route')
+    ```
+
+- **resetRateLimit(key)** `{void}`
+  - Resets rate limit counters for a specific key.
+  - Parameters:
+    - **key** `{string}`: Rate limit key to reset
+  - Example:
+    ```javascript
+    rabbitMQ.resetRateLimit('my-route')
+    ```
+
+- **blockRateLimit(key, duration)** `{Promise<void>}`
+  - Blocks a key for a specified duration.
+  - Parameters:
+    - **key** `{string}`: Key to block
+    - **duration** `{number}`: Duration in milliseconds
+  - Example:
+    ```javascript
+    await rabbitMQ.blockRateLimit('my-route', 5000)
+    ```
+
+### System Configuration
+
+- **setCompression(useCompression)** `{void}`
+  - Enables/disables message compression.
+  - Parameters:
+    - **useCompression** `{boolean}`: Whether to use compression
+  - Example:
+    ```javascript
+    rabbitMQ.setCompression(true)
+    ```
+
+- **setCompressionThreshold(threshold)** `{void}`
+  - Sets minimum message size for compression.
+  - Parameters:
+    - **threshold** `{number}`: Size in bytes
+  - Example:
+    ```javascript
+    rabbitMQ.setCompressionThreshold(1000)
+    ```
+
+### Delay Message Support
+
+- **setupDelayPlugin()** `{Promise<void>}`
+  - Sets up and verifies the delay plugin configuration.
+  - Requires rabbitmq_delayed_message_exchange plugin to be installed on the RabbitMQ server.
+  - Check plugin installation with: `rabbitmq-plugins list`
+  - Enable plugin with: `rabbitmq-plugins enable rabbitmq_delayed_message_exchange`
+  - Example:
+    ```javascript
+    try {
+      await rabbitMQ.setupDelayPlugin()
+      console.log('Delay plugin is ready')
+    } catch (error) {
+      console.error('Delay plugin not available:', error.message)
+      // Handle case where plugin is not installed
+    }
+    ```
+
+- **isDelayPluginEnabled()** `{Promise<boolean>}`
+  - Checks if the delay plugin is enabled and available.
+  - Example:
+    ```javascript
+    const enabled = await rabbitMQ.isDelayPluginEnabled()
+    ```
+
+- **setupDelayExchange(options?)** `{Promise<void>}`
+  - Asserts the delay exchange (type `x-delayed-message`) used by `publishDelayed()`.
+  - The exchange name comes from the `delayExchange` constructor option (default: `'delayed'`).
+  - Parameters:
+    - **options.type** `{string}`: Routing behavior after the delay (`'direct'`, `'topic'`, `'fanout'`, `'headers'`). Defaults to the configured exchange type.
+    - **options.exchangeOptions** `{Object}`: Additional exchange options.
+  - Example:
+    ```javascript
+    await rabbitMQ.setupDelayExchange()
+    ```
+
+### Events
+
+The `RabbitMQ` instance is an `EventEmitter`. All emitted events:
+
+| Event | Payload | When it fires |
+|-------|---------|---------------|
+| `connected` | — | Connection established (initial connect and every successful reconnect) |
+| `disconnected` | — | Connection lost or closed |
+| `reconnected` | — | Reconnection finished **and** internal state restored (channel pool, exchange, consumers) |
+| `reconnectFailed` | — | Reconnection gave up after `maxReconnectAttempts` |
+| `reconnectError` | `Error` | Reconnected, but restoring internal state failed |
+| `consumerCancelled` | `{ queueName, consumerTag }` | The broker cancelled a consumer (e.g. queue deleted); automatic recovery starts |
+| `consumerRecovered` | `{ queueName, consumerTag }` | A broker-cancelled consumer was recreated successfully |
+| `consumerLost` | `{ queueName }` | Recovery attempts were exhausted and the consumer was removed |
+| `circuitBreakerStateChanged` | `'CLOSED' \| 'OPEN' \| 'HALF-OPEN'` | Every circuit breaker state transition |
+| `rateLimited` | `{ key, strategy }` | A publish was rejected by the rate limiter |
+| `rateBlocked` | `{ key, remainingTime }` | A publish hit a key blocked via `blockRateLimit()` |
+
+Example:
+
+```javascript
+rabbitMQ.on('consumerLost', ({ queueName }) => {
+  alertOps(`Consumer for ${queueName} could not be recovered`)
+})
+
+rabbitMQ.on('circuitBreakerStateChanged', (state) => {
+  metrics.gauge('rabbitmq.circuit_breaker', state === 'CLOSED' ? 0 : 1)
+})
+```
+
+See [examples/21 - consumer-management](examples/21%20-%20consumer-management) and [examples/11 - circuit-breaker-publication](examples/11%20-%20circuit-breaker-publication) for runnable demos.
+
+### Monitoring and Control
+
+- **getCircuitBreakerState()** `{Object}`
+  - Returns current circuit breaker status.
+  - Example:
+    ```javascript
+    const state = rabbitMQ.getCircuitBreakerState()
+    ```
+
+## Contributing
+
+**Use issues for everything**
+
+- For a small change, just send a PR.
+- For bigger changes open an issue for discussion before sending a PR.
+- PR should have:
+  - Documentation
+  - Example (If it makes sense)
+- You can also contribute by:
+  - Reporting issues
+  - Suggesting new features or enhancements
+  - Improve/fix documentation
+
+## Author
+- Pedro Rogério - [Github](https://github.com/pinceladasdaweb)

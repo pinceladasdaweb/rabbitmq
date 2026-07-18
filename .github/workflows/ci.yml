@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - development
+  pull_request:
+
+jobs:
+  test:
+    name: Lint, test & build (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: admin
+          RABBITMQ_DEFAULT_PASS: admin
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Lint
+        run: npx standard src/ tests/
+
+      - name: Type declarations check
+        run: npm run check:types
+
+      - name: Unit tests (with coverage)
+        run: npm run test:coverage
+
+      - name: Install delayed message plugin on the broker
+        run: |
+          docker cp rabbitmq_delayed_message_exchange-4.0.2.ez ${{ job.services.rabbitmq.id }}:/plugins/
+          docker exec ${{ job.services.rabbitmq.id }} rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+
+      - name: Integration tests (real broker, includes reconnection)
+        run: npm run test:integration
+
+      - name: Build
+        run: npm run build
