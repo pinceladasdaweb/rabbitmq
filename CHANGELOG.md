@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.1.1 (2026-07-23)
+
+* ci: migrate npm publishing to OIDC trusted publishing by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/d23cb0acf6c52a340be0b24a2a9278848abf11bf)
+
+
 ## 1.1.0 (2026-07-18)
 
 * feat: replace default pino logger with a dependency-free console logger by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/469b24d727f647602c43e0e3945c29c08a67109f)
