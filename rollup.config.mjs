@@ -21,6 +21,6 @@ export default {
     commonjs(),
     json()
   ],
-  external: ['@cacheable/node-cache', 'amqplib', 'pino', 'pino-pretty']
+  external: ['@cacheable/node-cache', 'amqplib']
 }
 
