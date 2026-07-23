@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.1.2 (2026-07-23)
+
+* chore: remove stale pino externals from rollup config by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/ce1572755aaf279086f84613f5ae02f0fb2e6bfa)
+
+
 ## 1.1.1 (2026-07-23)
 
 * ci: migrate npm publishing to OIDC trusted publishing by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/d23cb0acf6c52a340be0b24a2a9278848abf11bf)
