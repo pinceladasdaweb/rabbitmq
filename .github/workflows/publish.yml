@@ -5,6 +5,9 @@ on:
       - main
 permissions:
   contents: write
+  # Required for OIDC trusted publishing: npm exchanges the workflow's
+  # identity token for a short-lived credential — no NPM_TOKEN secret.
+  id-token: write
 # Serialize releases: concurrent pushes to main must not race each other
 # through version bump / publish / tag push.
 concurrency:
@@ -20,8 +23,14 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing (OIDC) requires npm >= 11.5.1; the runner's
+      # bundled npm may lag behind, so upgrade explicitly.
+      - name: Update npm for trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
       - name: Configure git
         run: |
           git config --global user.name "Github Actions"
@@ -107,11 +116,12 @@ jobs:
           fi
 
           echo -e "${changelog_content}${existing_changelog}" > CHANGELOG.md
+      # Authentication happens via OIDC trusted publishing (id-token: write
+      # + the trusted publisher configured on npmjs.com) — no token secret.
+      # Provenance attestation is generated automatically.
       - name: Publish package to npm
         run: |
           npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
       - name: Create and push tag
         run: |
           NEW_VERSION=$(node -p "require('./package.json').version")
