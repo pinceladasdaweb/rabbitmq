@@ -142,6 +142,14 @@ You can adjust these values in your `.env` file according to your needs.
 
 ### Running Tests
 
+After cloning, enable the repo's git hooks once (lint and commit message checks):
+
+```bash
+npm run hooks
+```
+
+The published package declares **zero lifecycle scripts**, so installing it never triggers npm's `allow-scripts` approval prompt.
+
 Unit tests run without any external dependency:
 
 ```bash
