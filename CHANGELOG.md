@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 1.2.0 (2026-07-26)
+
+* refactor: run publisher resilience on breakwater by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/71ec1edf44e675059c1a1087626d151121bb9c70)
+* ci: create a GitHub release with changelog notes on publish by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/a9e33dac1c775c03767a92792806152a1c2eccab)
+
+
 ## 1.1.3 (2026-07-24)
 
 * fix: friction-free install and dual-mode type declarations by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bccdb4028aff9e2546bb2bab51e9ce785b24c72d)
