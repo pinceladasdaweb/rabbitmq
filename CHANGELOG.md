@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.1.3 (2026-07-24)
+
+* fix: friction-free install and dual-mode type declarations by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bccdb4028aff9e2546bb2bab51e9ce785b24c72d)
+
+
 ## 1.1.2 (2026-07-23)
 
 * chore: remove stale pino externals from rollup config by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/ce1572755aaf279086f84613f5ae02f0fb2e6bfa)
