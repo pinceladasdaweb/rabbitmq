@@ -1,4 +1,4 @@
-import { setTimeout as sleep } from 'node:timers/promises'
+import { compose, exponential, isRetryExhaustedError, retry } from 'breakwater'
 
 class Publisher {
   constructor (context) {
@@ -110,23 +110,35 @@ class Publisher {
     }
   }
 
-  async retryOperation (operation, maxRetries = 3, delay = 1000) {
+  // Builds the per-call resilience pipeline: retry sits OUTSIDE the breaker,
+  // so every attempt feeds the breaker's stats individually and an open
+  // circuit stops the retry cycle immediately (CircuitOpenError is not
+  // retryable) instead of sleeping through backoff against a dead broker.
+  publishPolicy (options = {}) {
     // The operation must run at least once: maxRetries <= 0 would otherwise
-    // skip the loop entirely and resolve without ever publishing.
-    const attempts = Math.max(1, maxRetries)
+    // resolve without ever publishing.
+    const attempts = Math.max(1, options.maxRetries ?? 3)
+    const initial = options.retryDelay ?? 1000
 
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await operation()
-      } catch (error) {
-        if (attempt === attempts) {
-          throw error
-        }
+    const retryPolicy = retry({
+      attempts,
+      backoff: exponential({ initial, factor: 2, max: Infinity, jitter: 'none' })
+    })
 
-        this.logger.warn(`Operation failed, retrying (${attempt}/${attempts}): ${error.message}`)
+    retryPolicy.on('retry', ({ attempt, error }) => {
+      this.logger.warn(`Operation failed, retrying (${attempt}/${attempts}): ${error.message}`)
+    })
 
-        await sleep(delay * Math.pow(2, attempt - 1))
-      }
+    return compose(retryPolicy, this.circuitBreaker.policy)
+  }
+
+  // Callers of this library receive the last real error, not the retry
+  // envelope breakwater throws when every attempt failed.
+  async runProtected (policy, operation) {
+    try {
+      return await policy.execute(operation)
+    } catch (error) {
+      throw isRetryExhaustedError(error) ? error.cause : error
     }
   }
 
@@ -135,18 +147,16 @@ class Publisher {
 
     await this.preflight(exchange, routingKey, options, routingKey, options.rateLimitCost ?? 1)
 
-    return this.circuitBreaker.execute(async () => {
-      const publishOperation = async () => {
-        const channel = await this.getChannel()
-        const { content, compressed } = await this.codec.encode(message)
+    const publishOperation = async () => {
+      const channel = await this.getChannel()
+      const { content, compressed } = await this.codec.encode(message)
 
-        await this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
+      await this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
 
-        this.logger.debug?.('Message published and confirmed')
-      }
+      this.logger.debug?.('Message published and confirmed')
+    }
 
-      return this.retryOperation(publishOperation, options.maxRetries, options.retryDelay)
-    })
+    return this.runProtected(this.publishPolicy(options), publishOperation)
   }
 
   async publishBatch (routingKey, messages, options = {}) {
@@ -158,20 +168,18 @@ class Publisher {
 
     await this.preflight(exchange, routingKey, options, routingKey, messages.length * (options.rateLimitCost ?? 1))
 
-    return this.circuitBreaker.execute(async () => {
-      const batchOperation = async () => {
-        const channel = await this.getChannel()
-        const preparedMessages = await Promise.all(messages.map(message => this.codec.encode(message)))
+    const batchOperation = async () => {
+      const channel = await this.getChannel()
+      const preparedMessages = await Promise.all(messages.map(message => this.codec.encode(message)))
 
-        await Promise.all(preparedMessages.map(({ content, compressed }) =>
-          this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
-        ))
+      await Promise.all(preparedMessages.map(({ content, compressed }) =>
+        this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
+      ))
 
-        this.logger.info(`Batch of ${messages.length} messages published to ${routingKey}`)
-      }
+      this.logger.info(`Batch of ${messages.length} messages published to ${routingKey}`)
+    }
 
-      return this.retryOperation(batchOperation, options.maxRetries, options.retryDelay)
-    })
+    return this.runProtected(this.publishPolicy(options), batchOperation)
   }
 
   async publishAsync (routingKey, message, options = {}) {
@@ -233,18 +241,16 @@ class Publisher {
 
     await this.preflight(exchange, routingKey, options, `delayed:${routingKey}`, options.rateLimitCost ?? 1)
 
-    return this.circuitBreaker.execute(async () => {
-      const publishOperation = async () => {
-        const channel = await this.getChannel()
-        const { content, compressed } = await this.codec.encode(message)
+    const publishOperation = async () => {
+      const channel = await this.getChannel()
+      const { content, compressed } = await this.codec.encode(message)
 
-        await this.publishOnChannel(channel, this.delayExchange, routingKey, content, this.buildOptions(options, compressed, { 'x-delay': delayMs }))
+      await this.publishOnChannel(channel, this.delayExchange, routingKey, content, this.buildOptions(options, compressed, { 'x-delay': delayMs }))
 
-        this.logger.debug?.(`Delayed message published (${delayMs}ms) and confirmed`)
-      }
+      this.logger.debug?.(`Delayed message published (${delayMs}ms) and confirmed`)
+    }
 
-      return this.retryOperation(publishOperation, options.maxRetries, options.retryDelay)
-    })
+    return this.runProtected(this.publishPolicy(options), publishOperation)
   }
 }
 
