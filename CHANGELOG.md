@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.2.1 (2026-07-29)
+
+* chore(deps): upgrade packages by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/3c7e7241e62b3521bea1ce38e3be0b3c85cee6f7)
+
+
 ## 1.2.0 (2026-07-26)
 
 * refactor: run publisher resilience on breakwater by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/71ec1edf44e675059c1a1087626d151121bb9c70)
