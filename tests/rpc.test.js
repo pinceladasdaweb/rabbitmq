@@ -11,6 +11,20 @@ const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Node 22's test runner cancels a test whose only pending work is an unref'd
+// timer ('Promise resolution is still pending but the event loop has already
+// resolved') — and the RPC timeout timer is deliberately unref'd. A ref'd
+// interval holds the loop open while a purely timeout-driven assertion runs.
+const withLiveEventLoop = async (run) => {
+  const keepAlive = setInterval(() => {}, 50)
+
+  try {
+    return await run()
+  } finally {
+    clearInterval(keepAlive)
+  }
+}
+
 const waitFor = async (predicate, timeoutMs = 2000, label = 'condition') => {
   const start = Date.now()
 
@@ -141,10 +155,10 @@ describe('Rpc request()', () => {
   test('rejects with RPC_TIMEOUT when no reply arrives in time', async () => {
     const harness = createHarness()
 
-    await assert.rejects(
+    await withLiveEventLoop(() => assert.rejects(
       () => harness.rpc.request('users.get', { id: 1 }, { timeout: 50 }),
       (error) => error.code === 'RPC_TIMEOUT'
-    )
+    ))
   })
 
   test('a reply with an unknown correlationId is discarded without settling others', async () => {
@@ -275,10 +289,10 @@ describe('Rpc request()', () => {
 
     harness.replyChannel.neverConfirm = true
 
-    await assert.rejects(
+    await withLiveEventLoop(() => assert.rejects(
       () => harness.rpc.request('users.get', { id: 1 }, { timeout: 50 }),
       (error) => error.code === 'RPC_TIMEOUT'
-    )
+    ))
   })
 
   test('a publish failure arriving after the request settled is logged, not thrown', async () => {
