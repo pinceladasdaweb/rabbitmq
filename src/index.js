@@ -1,3 +1,4 @@
+import Rpc from './messaging/rpc.js'
 import Logger from './utils/logger.js'
 import { EventEmitter } from 'node:events'
 import _NodeCache from '@cacheable/node-cache'
@@ -26,6 +27,7 @@ class RabbitMQ extends EventEmitter {
   #publisher
   #consumers
   #topology
+  #rpc
   #shutdownHandlersInstalled
   #connectPromise
 
@@ -106,6 +108,7 @@ class RabbitMQ extends EventEmitter {
     this.#publisher = new Publisher(context)
     this.#consumers = new ConsumerManager(context)
     this.#topology = new Topology(context)
+    this.#rpc = new Rpc(context, { publisher: this.#publisher, consumers: this.#consumers })
   }
 
   #setupRateLimiterEvents () {
@@ -168,6 +171,10 @@ class RabbitMQ extends EventEmitter {
   }
 
   #handleDisconnection () {
+    // Direct reply-to routes died with the connection: settle in-flight RPC
+    // requests now instead of leaving them to hit their timeouts.
+    this.#rpc.handleConnectionLoss()
+
     if (this.#channelPool) {
       // Marks the pool as closed so channel-replacement retry loops stop;
       // closing dead channels is best-effort.
@@ -266,6 +273,8 @@ class RabbitMQ extends EventEmitter {
 
   async disconnect () {
     try {
+      this.#rpc.handleConnectionLoss('client disconnected')
+
       await this.#consumers.disposeAll()
 
       if (this.#rateLimiter) {
@@ -385,6 +394,16 @@ class RabbitMQ extends EventEmitter {
     }
 
     return message
+  }
+
+  // --- Request/response (RPC) over direct reply-to (delegated to Rpc) ---
+
+  async request (routingKey, message, options = {}) {
+    return this.#rpc.request(routingKey, message, options)
+  }
+
+  async respond (queueName, handler, options = {}) {
+    return this.#rpc.respond(queueName, handler, options)
   }
 
   // --- Consumption (delegated to ConsumerManager) ---

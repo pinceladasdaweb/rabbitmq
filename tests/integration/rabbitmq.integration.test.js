@@ -447,6 +447,171 @@ describe('RabbitMQ integration', { skip: !RUN_INTEGRATION && 'set RABBITMQ_INTEG
     await assert.rejects(() => rabbitMQ.moveToDeadLetter(fakeMessage, 'unroutable test'), /no binding/)
   })
 
+  test('RPC request/response happy path over direct reply-to', async () => {
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.assertQueue('integration-rpc', { durable: false, autoDelete: false })
+    await channel.bindQueue('integration-rpc', EXCHANGE, 'integration-rpc-route')
+
+    const consumer = await rabbitMQ.respond('integration-rpc', async (content) => {
+      return { doubled: content.value * 2 }
+    })
+
+    const response = await rabbitMQ.request('integration-rpc-route', { value: 21 }, { timeout: 10000 })
+
+    assert.deepEqual(response, { doubled: 42 })
+
+    // Concurrent requests must each get their own correlated reply.
+    const responses = await Promise.all([
+      rabbitMQ.request('integration-rpc-route', { value: 1 }, { timeout: 10000 }),
+      rabbitMQ.request('integration-rpc-route', { value: 2 }, { timeout: 10000 }),
+      rabbitMQ.request('integration-rpc-route', { value: 3 }, { timeout: 10000 })
+    ])
+
+    assert.deepEqual(responses, [{ doubled: 2 }, { doubled: 4 }, { doubled: 6 }])
+
+    await rabbitMQ.unsubscribe(consumer.consumerTag)
+
+    const channelAfter = await rabbitMQ.getChannel()
+    await channelAfter.deleteQueue('integration-rpc')
+  })
+
+  test('RPC request rejects with RPC_TIMEOUT when nobody responds', async () => {
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.assertQueue('integration-rpc-void', { durable: false, autoDelete: false })
+    await channel.bindQueue('integration-rpc-void', EXCHANGE, 'integration-rpc-void-route')
+
+    await assert.rejects(
+      () => rabbitMQ.request('integration-rpc-void-route', { ping: true }, { timeout: 1000 }),
+      (error) => error.code === 'RPC_TIMEOUT'
+    )
+
+    const channelAfter = await rabbitMQ.getChannel()
+    await channelAfter.deleteQueue('integration-rpc-void')
+  })
+
+  test('RPC request to an unbound routing key fails fast with RPC_UNROUTABLE', async () => {
+    const startedAt = Date.now()
+
+    await assert.rejects(
+      () => rabbitMQ.request('integration-rpc-nowhere', { ping: true }, { timeout: 15000 }),
+      (error) => error.code === 'RPC_UNROUTABLE'
+    )
+
+    assert.ok(Date.now() - startedAt < 5000, 'unroutable requests must not burn the timeout')
+  })
+
+  test('RPC responder crash surfaces as RPC_RESPONDER_ERROR with replyOnError', async () => {
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.assertQueue('integration-rpc-crash', { durable: false, autoDelete: false })
+    await channel.bindQueue('integration-rpc-crash', EXCHANGE, 'integration-rpc-crash-route')
+
+    const consumer = await rabbitMQ.respond('integration-rpc-crash', async () => {
+      throw new Error('responder exploded')
+    }, { replyOnError: true })
+
+    await assert.rejects(
+      () => rabbitMQ.request('integration-rpc-crash-route', { boom: true }, { timeout: 10000 }),
+      (error) => error.code === 'RPC_RESPONDER_ERROR' && /responder exploded/.test(error.message)
+    )
+
+    await rabbitMQ.unsubscribe(consumer.consumerTag)
+
+    const channelAfter = await rabbitMQ.getChannel()
+    await channelAfter.deleteQueue('integration-rpc-crash')
+  })
+
+  test('RPC responder crash without replyOnError dead-letters the request', async () => {
+    // The queue comes from createQueue() so it is already wired to the DLX:
+    // the poison-message policy (nack, no requeue) must apply to RPC too.
+    await rabbitMQ.createQueue('integration-rpc-poison')
+
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.bindQueue('integration-rpc-poison', EXCHANGE, 'integration-rpc-poison-route')
+    await channel.purgeQueue('integration-rpc-poison_dlq')
+
+    const consumer = await rabbitMQ.respond('integration-rpc-poison', async () => {
+      throw new Error('unrecoverable')
+    })
+
+    await assert.rejects(
+      () => rabbitMQ.request('integration-rpc-poison-route', { poison: true }, { timeout: 2000 }),
+      (error) => error.code === 'RPC_TIMEOUT'
+    )
+
+    await waitFor(async () => {
+      const dlq = await channel.checkQueue('integration-rpc-poison_dlq')
+
+      return dlq.messageCount >= 1
+    }, 10000, 'poison RPC request dead-lettered')
+
+    await rabbitMQ.unsubscribe(consumer.consumerTag)
+
+    const channelAfter = await rabbitMQ.getChannel()
+    await channelAfter.deleteQueue('integration-rpc-poison')
+    await channelAfter.deleteQueue('integration-rpc-poison_dlq')
+  })
+
+  test('in-flight RPC requests reject with RPC_CONNECTION_LOST on a forced connection drop', async () => {
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.assertQueue('integration-rpc-slow', { durable: false, autoDelete: false })
+    await channel.bindQueue('integration-rpc-slow', EXCHANGE, 'integration-rpc-slow-route')
+
+    // Slow enough that the connection is killed while the request is in
+    // flight, waiting for its reply.
+    const consumer = await rabbitMQ.respond('integration-rpc-slow', async () => {
+      await sleep(8000)
+
+      return { late: true }
+    })
+
+    const reconnected = new Promise(resolve => rabbitMQ.once('reconnected', resolve))
+
+    // The outcome handler is attached BEFORE the drop: the rejection fires
+    // while the test is still orchestrating the kill, and an unobserved
+    // rejection would fail the test as unhandled.
+    const outcome = rabbitMQ.request('integration-rpc-slow-route', { ping: 1 }, { timeout: 30000 })
+      .then(() => { throw new Error('request must not resolve across a connection drop') }, (error) => error)
+
+    // Give the request time to be published and picked up before the kill.
+    await sleep(500)
+    await forceCloseAllConnections('integration-test')
+
+    const error = await outcome
+
+    assert.equal(error.code, 'RPC_CONNECTION_LOST')
+
+    await Promise.race([
+      reconnected,
+      sleep(30000).then(() => { throw new Error('timeout waiting for reconnection after RPC drop') })
+    ])
+
+    await rabbitMQ.unsubscribe(consumer.consumerTag)
+
+    // The reply consumer is recreated lazily: a fresh request after the
+    // reconnection must work end to end again.
+    const channelAfter = await rabbitMQ.getChannel()
+
+    await channelAfter.assertQueue('integration-rpc-after', { durable: false, autoDelete: false })
+    await channelAfter.bindQueue('integration-rpc-after', EXCHANGE, 'integration-rpc-after-route')
+
+    const echoConsumer = await rabbitMQ.respond('integration-rpc-after', async (content) => content)
+
+    const response = await rabbitMQ.request('integration-rpc-after-route', { recovered: true }, { timeout: 10000 })
+
+    assert.deepEqual(response, { recovered: true })
+
+    await rabbitMQ.unsubscribe(echoConsumer.consumerTag)
+
+    const cleanupChannel = await rabbitMQ.getChannel()
+    await cleanupChannel.deleteQueue('integration-rpc-slow')
+    await cleanupChannel.deleteQueue('integration-rpc-after')
+  })
+
   test('resumes automatic reconnection after an explicit disconnect() + connect() cycle', async () => {
     // Regression: disconnect() used to permanently disable reconnection for
     // the instance because #isShuttingDown was never reset by connect().
