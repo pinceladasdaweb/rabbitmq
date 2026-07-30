@@ -98,9 +98,18 @@ export interface SubscribeOptions {
   [key: string]: unknown
 }
 
+/** Values of `error.code` on errors rejected by request(). */
+export type RpcErrorCode = 'RPC_TIMEOUT' | 'RPC_CONNECTION_LOST' | 'RPC_RESPONDER_ERROR' | 'RPC_UNROUTABLE'
+
 export interface RequestOptions extends PublishOptions {
   /** Milliseconds to wait for the reply before rejecting with code 'RPC_TIMEOUT'. Default: 30000. */
   timeout?: number
+  /**
+   * Publish attempts for the request. Unlike other publish methods (default 3),
+   * request() defaults to 1: republishing a request whose confirm was lost can
+   * execute the responder twice. Opt in explicitly if that is acceptable.
+   */
+  maxRetries?: number
 }
 
 export interface RespondOptions extends SubscribeOptions {

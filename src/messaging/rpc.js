@@ -19,6 +19,7 @@ class Rpc {
     this.pendingRequests = new Map()
     this.replyChannel = null
     this.replySetupPromise = null
+    this.connectionEpoch = 0
   }
 
   #rpcError (code, message) {
@@ -46,6 +47,10 @@ class Rpc {
   // whether to retry. The reply consumer itself is recreated lazily by the
   // next request().
   handleConnectionLoss (reason = 'connection to RabbitMQ lost') {
+    // The epoch fences reply-consumer setups that are still in flight: a
+    // setup that started against the dying connection must not install its
+    // channel after this sweep already declared the world dead.
+    this.connectionEpoch++
     this.replyChannel = null
     this.rejectAllPending(reason)
   }
@@ -88,6 +93,7 @@ class Rpc {
       throw new Error('Not connected to RabbitMQ. Connection establishing/recovery in progress.')
     }
 
+    const epoch = this.connectionEpoch
     const channel = await channelPool.getDedicatedChannel('rpc-reply')
 
     await channel.consume(DIRECT_REPLY_QUEUE, (msg) => {
@@ -100,9 +106,25 @@ class Rpc {
       this.#handleReply(msg)
     }, { noAck: true })
 
+    // Requests publish with mandatory: an unroutable request (nothing bound
+    // to the routing key) comes back as a basic.return and fails fast here
+    // instead of burning the caller's full timeout.
+    channel.on('return', (msg) => {
+      this.#settlePending(msg?.properties?.correlationId, (pending) => {
+        pending.reject(this.#rpcError('RPC_UNROUTABLE', `RPC request to ${msg.fields?.routingKey} could not be routed to any queue`))
+      })
+    })
+
     channel.on('close', () => {
       this.#invalidateReplyChannel(channel, 'reply channel closed')
     })
+
+    // The connection turned over while this setup was in flight: this
+    // channel belongs to the dead connection and must not be installed —
+    // future requests would publish into a channel already being torn down.
+    if (epoch !== this.connectionEpoch) {
+      throw this.#rpcError('RPC_CONNECTION_LOST', 'RPC request aborted: connection lost during reply consumer setup')
+    }
 
     this.replyChannel = channel
 
@@ -156,13 +178,17 @@ class Rpc {
     const { content, compressed } = await this.codec.encode(message)
 
     // Requests default to transient with a per-message TTL matching the
-    // requester's timeout: a request nobody picked up in time has no business
-    // being processed after its caller already gave up.
+    // requester's timeout, plus a deadline header for the responder-side
+    // staleness guard (TTL only covers time spent queued — not requests
+    // already sitting in a responder's prefetch buffer). Both defaults are
+    // overridable. mandatory pairs with the reply channel's 'return' handler
+    // to fail unroutable requests fast.
     const publishOptions = this.publisher.buildOptions({
       persistent: false,
       expiration: String(Math.ceil(timeout)),
+      mandatory: true,
       ...options
-    }, compressed)
+    }, compressed, { 'x-rpc-deadline': Date.now() + timeout })
 
     publishOptions.correlationId = correlationId
     publishOptions.replyTo = DIRECT_REPLY_QUEUE
@@ -180,16 +206,28 @@ class Rpc {
       this.pendingRequests.set(correlationId, { resolve, reject, timer })
     })
 
-    try {
-      // The request MUST go out on the same channel that consumes the direct
-      // reply-to pseudo-queue — that is what scopes the reply route back to
-      // this consumer.
-      await this.circuitBreaker.execute(() =>
-        this.publisher.publishOnChannel(channel, exchange.name, routingKey, content, publishOptions)
-      )
-    } catch (error) {
-      this.#settlePending(correlationId, (pending) => pending.reject(error))
-    }
+    // The publish is deliberately NOT awaited: the response promise is the
+    // single settlement authority, returned to the caller immediately so a
+    // timeout or connection-loss rejection always has a handler attached
+    // (never an unhandled rejection) and a confirm the broker never answers
+    // cannot block the timeout escape route. Publish failures settle the
+    // pending like any other outcome.
+    //
+    // The request goes out on the same channel that consumes the direct
+    // reply-to pseudo-queue — that is what scopes the reply route back to
+    // this consumer. Retries default to a single attempt: republishing a
+    // request whose confirm was lost could execute the responder twice.
+    const policy = this.publisher.publishPolicy({ ...options, maxRetries: options.maxRetries ?? 1 })
+
+    this.publisher.runProtected(policy, () =>
+      this.publisher.publishOnChannel(channel, exchange.name, routingKey, content, publishOptions)
+    ).catch((error) => {
+      const settled = this.#settlePending(correlationId, (pending) => pending.reject(error))
+
+      if (!settled) {
+        this.logger.warn(`RPC publish to ${routingKey} failed after the request already settled: ${error.message}`)
+      }
+    })
 
     return responsePromise
   }
@@ -203,6 +241,18 @@ class Rpc {
 
     return this.consumers.subscribe(queueName, async (content, message) => {
       const { replyTo, correlationId } = message.properties
+
+      // Staleness guard: the requester already gave up — its reply route
+      // would discard the answer anyway. Dropping (ack, no handler run)
+      // covers what the per-message TTL cannot: requests that outlived the
+      // timeout inside this responder's prefetch buffer.
+      const deadline = Number(message.properties.headers?.['x-rpc-deadline'])
+
+      if (deadline && Date.now() > deadline) {
+        this.logger.debug?.(`Dropping stale RPC request on queue ${queueName} (deadline exceeded by ${Date.now() - deadline}ms)`)
+
+        return
+      }
 
       if (!replyTo) {
         // Not an RPC message: process it normally, there is nowhere to reply.
@@ -229,7 +279,23 @@ class Rpc {
         return
       }
 
-      await this.#publishReply(replyTo, correlationId, result)
+      // The handler already succeeded: a reply-transport failure must NOT
+      // dead-letter the request — a DLQ replay would re-run committed side
+      // effects. Fall back to an error envelope so the requester fails fast
+      // (e.g. the result was not serializable); if even the envelope cannot
+      // be published, the requester's timeout takes over and the request is
+      // acked as processed.
+      try {
+        await this.#publishReply(replyTo, correlationId, result)
+      } catch (error) {
+        this.logger.error(`Failed to publish RPC reply on queue ${queueName}: ${error.message}`)
+
+        try {
+          await this.#publishReply(replyTo, correlationId, { message: `Failed to publish RPC reply: ${error.message}` }, { 'x-rpc-error': true })
+        } catch (envelopeError) {
+          this.logger.error(`Failed to publish RPC error envelope on queue ${queueName}: ${envelopeError.message}`)
+        }
+      }
     }, subscribeOptions)
   }
 

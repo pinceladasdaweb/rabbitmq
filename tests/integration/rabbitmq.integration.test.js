@@ -491,6 +491,17 @@ describe('RabbitMQ integration', { skip: !RUN_INTEGRATION && 'set RABBITMQ_INTEG
     await channelAfter.deleteQueue('integration-rpc-void')
   })
 
+  test('RPC request to an unbound routing key fails fast with RPC_UNROUTABLE', async () => {
+    const startedAt = Date.now()
+
+    await assert.rejects(
+      () => rabbitMQ.request('integration-rpc-nowhere', { ping: true }, { timeout: 15000 }),
+      (error) => error.code === 'RPC_UNROUTABLE'
+    )
+
+    assert.ok(Date.now() - startedAt < 5000, 'unroutable requests must not burn the timeout')
+  })
+
   test('RPC responder crash surfaces as RPC_RESPONDER_ERROR with replyOnError', async () => {
     const channel = await rabbitMQ.getChannel()
 

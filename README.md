@@ -872,12 +872,13 @@ Distributed request/response built on RabbitMQ's [direct reply-to](https://www.r
 
 - **request(routingKey, message, options?)** `{Promise<unknown>}`
   - Publishes a request through the configured exchange and resolves with whatever the responder's handler returned.
-  - Goes through the same pipeline as every publish: validation, fail-fast connection probe, per-key rate limiting (`rpc:<routingKey>` by default) and the circuit breaker.
-  - Requests are transient by default and carry a per-message TTL equal to the timeout — a request nobody picked up in time is not processed after the caller already gave up.
+  - Goes through the same pipeline as every publish: validation, fail-fast connection probe, per-key rate limiting (`rpc:<routingKey>` by default) and the circuit breaker. One difference: `maxRetries` defaults to **1** (single publish attempt) instead of 3 — republishing a request whose confirm was lost can execute the responder twice. Opt into retries explicitly if that is acceptable.
+  - By default requests are transient and carry a per-message TTL equal to the timeout (both overridable via `persistent`/`expiration`). Note: on queues configured with a dead letter exchange (e.g. created via `createQueue()`), requests that expire while queued are dead-lettered with reason `expired`, per AMQP semantics — filter for that if you reprocess the DLQ.
   - The returned promise **never hangs**. It settles on:
     - the correlated reply (resolve),
     - timeout — rejects with `error.code = 'RPC_TIMEOUT'`,
     - a responder error envelope — rejects with `error.code = 'RPC_RESPONDER_ERROR'`,
+    - an unroutable request (nothing bound to the routing key) — requests are published with `mandatory` by default, so the broker's `basic.return` rejects immediately with `error.code = 'RPC_UNROUTABLE'` instead of burning the full timeout,
     - connection/channel loss — rejects with `error.code = 'RPC_CONNECTION_LOST'`. Direct reply-to routes are connection-scoped and cannot survive a reconnect, so in-flight requests fail fast and the caller decides whether to retry. The reply consumer is recreated lazily by the next `request()`.
   - Parameters:
     - **routingKey** `{string}`: Routing key for the request
@@ -898,10 +899,12 @@ Distributed request/response built on RabbitMQ's [direct reply-to](https://www.r
 
 - **respond(queueName, handler, options?)** `{Promise<Object>}`
   - Subscribes to the queue and publishes each handler's return value back to the requester's private reply route, correlating automatically. Returning `undefined` still settles the requester (as `null`).
+  - Stale requests are dropped without running the handler: every request carries a deadline header, and a request that outlived its requester's timeout (e.g. sitting in the prefetch buffer) is acknowledged and discarded — its reply route would ignore the answer anyway. Assumes reasonably synchronized clocks (NTP).
   - Messages without a `replyTo` property are processed normally and logged — nothing to reply to.
   - Error handling follows the poison-message policy:
     - default: a handler crash nacks the request to the DLQ (no hot requeue loops) and the requester surfaces the failure through its timeout;
     - `{ replyOnError: true }`: the error is published back as a structured envelope and the requester rejects immediately with `RPC_RESPONDER_ERROR`.
+  - A reply-transport failure after a **successful** handler never dead-letters the request (a DLQ replay would re-run committed side effects): the responder falls back to an error envelope (e.g. when the result is not serializable, the requester fails fast with `RPC_RESPONDER_ERROR`), and if even that cannot be published the request is acked and the requester's timeout takes over.
   - Responders are regular consumers: they are recreated automatically after a reconnection.
   - Parameters:
     - **queueName** `{string}`: Queue holding the requests (bind it to the exchange yourself)

@@ -26,6 +26,8 @@ class ChannelPool {
     const channel = await this.connection.createConfirmChannel()
 
     channel.on('error', (error) => {
+      if (this.closed) return
+
       this.logger.error(`Channel ${index} encountered an error: ${error.message}`)
     })
 
@@ -77,7 +79,10 @@ class ChannelPool {
     const channel = await this.connection.createConfirmChannel()
 
     channel.on('error', (error) => {
-      this.logger.error(`Dedicated channel ${id} encountered an error: ${error.message}`)
+      if (!this.closed) {
+        this.logger.error(`Dedicated channel ${id} encountered an error: ${error.message}`)
+      }
+
       this.dedicatedChannels.delete(id)
     })
 
@@ -106,12 +111,15 @@ class ChannelPool {
     throw new Error('No usable channels available in the pool')
   }
 
+  // Listeners are deliberately NOT stripped before closing: amqplib's own
+  // internal 'close' listener is what fails still-unconfirmed publish
+  // callbacks — removing it would leave in-flight confirm promises pending
+  // forever. The pool's own listeners already no-op once `closed` is set,
+  // and external listeners (e.g. the RPC reply channel's) NEED the event.
   async #closeChannel (channel) {
     if (!channel || typeof channel.close !== 'function') return
 
     try {
-      channel.removeAllListeners('error')
-      channel.removeAllListeners('close')
       await channel.close()
     } catch (error) {
       // Teardown errors are expected when the connection is already gone.

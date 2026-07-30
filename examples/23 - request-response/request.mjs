@@ -8,7 +8,8 @@ import { baseConfig } from '../config.mjs'
 //   handler returned. No reply queues to declare, no correlation bookkeeping.
 //
 //   Every request has an escape route — it settles on reply, on timeout
-//   (error.code = 'RPC_TIMEOUT') or on connection loss
+//   (error.code = 'RPC_TIMEOUT'), on an unroutable routing key
+//   (error.code = 'RPC_UNROUTABLE') or on connection loss
 //   (error.code = 'RPC_CONNECTION_LOST'). It never hangs.
 //
 // Run the responder first:  node 'examples/23 - request-response/responder.mjs'
@@ -50,11 +51,27 @@ async function main () {
       console.log(`   💥 Rejected as expected: [${error.code}] ${error.message}`)
     }
 
-    // 4. Timeout: nobody consumes this routing key, so the request expires
-    //    with RPC_TIMEOUT after 2 seconds instead of hanging forever.
-    console.log('\n🚀 Requesting a route nobody answers (2s timeout)...')
+    // 4. Unroutable: no queue is bound to this routing key. Requests are
+    //    published with mandatory, so the broker returns it and the request
+    //    fails fast with RPC_UNROUTABLE — no timeout burned on a typo.
+    console.log('\n🚀 Requesting a route with nothing bound to it...')
     try {
-      await rabbitMQ.request('rpc.nobody.home', { ping: true }, { timeout: 2000 })
+      await rabbitMQ.request('rpc.nobody.home', { ping: true }, { timeout: 5000 })
+    } catch (error) {
+      console.log(`   🚫 Rejected as expected: [${error.code}] ${error.message}`)
+    }
+
+    // 5. Timeout: the queue exists (routable) but nobody consumes it, so the
+    //    request expires with RPC_TIMEOUT after 2 seconds instead of hanging.
+    console.log('\n🚀 Requesting a bound route nobody answers (2s timeout)...')
+
+    const channel = await rabbitMQ.getChannel()
+
+    await channel.assertQueue('rpc-limbo', { durable: false, autoDelete: true })
+    await channel.bindQueue('rpc-limbo', rabbitConfig.exchange.name, 'rpc.limbo')
+
+    try {
+      await rabbitMQ.request('rpc.limbo', { ping: true }, { timeout: 2000 })
     } catch (error) {
       console.log(`   ⏰ Rejected as expected: [${error.code}] ${error.message}`)
     }
