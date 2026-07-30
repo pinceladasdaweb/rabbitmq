@@ -98,6 +98,21 @@ export interface SubscribeOptions {
   [key: string]: unknown
 }
 
+export interface RequestOptions extends PublishOptions {
+  /** Milliseconds to wait for the reply before rejecting with code 'RPC_TIMEOUT'. Default: 30000. */
+  timeout?: number
+}
+
+export interface RespondOptions extends SubscribeOptions {
+  /**
+   * When true, a handler crash is published back to the requester as a
+   * structured error (the request rejects with code 'RPC_RESPONDER_ERROR').
+   * When false (default), the request is nacked to the DLQ and the requester
+   * surfaces the failure through its timeout.
+   */
+  replyOnError?: boolean
+}
+
 export interface OptimizedPrefetchOptions extends SubscribeOptions {
   initialPrefetch?: number
   maxPrefetch?: number
@@ -175,6 +190,8 @@ export interface GracefulShutdownOptions {
 
 export type MessageCallback = (content: unknown, message: ConsumeMessage) => void | Promise<void>
 
+export type RpcHandler = (content: unknown, message: ConsumeMessage) => unknown | Promise<unknown>
+
 export declare class RabbitMQ extends EventEmitter {
   constructor (options?: RabbitMQOptions)
 
@@ -194,6 +211,9 @@ export declare class RabbitMQ extends EventEmitter {
   publishAsyncBatch (routingKey: string, messages: unknown[], options?: PublishOptions): Promise<void>
   publishWithCache (routingKey: string, messageGenerator: unknown | (() => unknown | Promise<unknown>), options?: PublishOptions): Promise<unknown>
   publishDelayed (routingKey: string, message: unknown, delayMs: number, options?: PublishOptions): Promise<void>
+
+  request (routingKey: string, message: unknown, options?: RequestOptions): Promise<unknown>
+  respond (queueName: string, handler: RpcHandler, options?: RespondOptions): Promise<Consumer>
 
   subscribe (queueName: string, callback: MessageCallback, options?: SubscribeOptions): Promise<Consumer>
   subscribeWithOptimizedPrefetch (queueName: string, callback: MessageCallback, options?: OptimizedPrefetchOptions): Promise<Consumer>

@@ -11,6 +11,7 @@ A robust and elegant abstraction for RabbitMQ in Node.js, featuring advanced cap
 - **Intelligent Retry Mechanism**: Configurable retry strategies with exponential backoff and customizable attempts.
 - **Message Compression**: Automatic compression for large messages with configurable thresholds.
 - **Dead Letter Exchange**: Built-in DLQ support for failed message handling and reprocessing capabilities.
+- **Request/Response (RPC)**: Distributed RPC over RabbitMQ's direct reply-to — no reply queues to declare, no correlation bookkeeping, timeouts that never hang.
 - **Parallel Processing**: Multi-threading support through worker threads for CPU-intensive tasks.
 - **Delayed Message Support**: Native integration with RabbitMQ delayed message exchange plugin.
 - **Flexible Consumer Patterns**: Support for different consumption patterns including optimized prefetch and parallel processing.
@@ -624,6 +625,7 @@ All examples share their connection settings through [examples/config.mjs](examp
 | 20 | [rate-limit-publication](examples/20%20-%20rate-limit-publication) | Rate limiting strategies, status and events |
 | 21 | [consumer-management](examples/21%20-%20consumer-management) | `unsubscribe()`, consumer lifecycle events, `enableGracefulShutdown()`, `connect({ waitForConnection })` |
 | 22 | [native-dead-letter](examples/22%20-%20native-dead-letter) | Built-in DLQ support: `createQueue()`, `moveToDeadLetter()`, `processDeadLetterQueue()` |
+| 23 | [request-response](examples/23%20-%20request-response) | Distributed RPC over direct reply-to: `request()`, `respond()`, timeouts and error envelopes |
 
 ## Available Methods
 
@@ -863,6 +865,57 @@ All examples share their connection settings through [examples/config.mjs](examp
       { prefetchCount: 5 }
     )
     ```
+
+### Request/Response (RPC)
+
+Distributed request/response built on RabbitMQ's [direct reply-to](https://www.rabbitmq.com/docs/direct-reply-to) (`amq.rabbitmq.reply-to`): the requester consumes a private pseudo-queue on a dedicated channel, so there are no reply queues to declare, nothing to clean up, and correlation is handled internally with `crypto.randomUUID()`.
+
+- **request(routingKey, message, options?)** `{Promise<unknown>}`
+  - Publishes a request through the configured exchange and resolves with whatever the responder's handler returned.
+  - Goes through the same pipeline as every publish: validation, fail-fast connection probe, per-key rate limiting (`rpc:<routingKey>` by default) and the circuit breaker.
+  - Requests are transient by default and carry a per-message TTL equal to the timeout — a request nobody picked up in time is not processed after the caller already gave up.
+  - The returned promise **never hangs**. It settles on:
+    - the correlated reply (resolve),
+    - timeout — rejects with `error.code = 'RPC_TIMEOUT'`,
+    - a responder error envelope — rejects with `error.code = 'RPC_RESPONDER_ERROR'`,
+    - connection/channel loss — rejects with `error.code = 'RPC_CONNECTION_LOST'`. Direct reply-to routes are connection-scoped and cannot survive a reconnect, so in-flight requests fail fast and the caller decides whether to retry. The reply consumer is recreated lazily by the next `request()`.
+  - Parameters:
+    - **routingKey** `{string}`: Routing key for the request
+    - **message** `{unknown}`: Request payload
+    - **options** `{Object}`: All publish options, plus:
+      - **timeout** `{number}`: Milliseconds to wait for the reply (default: 30000)
+  - Example:
+    ```javascript
+    try {
+      const user = await rabbitMQ.request('rpc.users.get', { id: 42 }, { timeout: 5000 })
+      console.log(user.name)
+    } catch (error) {
+      if (error.code === 'RPC_TIMEOUT') {
+        // nobody answered in time
+      }
+    }
+    ```
+
+- **respond(queueName, handler, options?)** `{Promise<Object>}`
+  - Subscribes to the queue and publishes each handler's return value back to the requester's private reply route, correlating automatically. Returning `undefined` still settles the requester (as `null`).
+  - Messages without a `replyTo` property are processed normally and logged — nothing to reply to.
+  - Error handling follows the poison-message policy:
+    - default: a handler crash nacks the request to the DLQ (no hot requeue loops) and the requester surfaces the failure through its timeout;
+    - `{ replyOnError: true }`: the error is published back as a structured envelope and the requester rejects immediately with `RPC_RESPONDER_ERROR`.
+  - Responders are regular consumers: they are recreated automatically after a reconnection.
+  - Parameters:
+    - **queueName** `{string}`: Queue holding the requests (bind it to the exchange yourself)
+    - **handler** `{Function}`: `(content, message) => result` — the return value is the reply
+    - **options** `{Object}`: All subscribe options, plus:
+      - **replyOnError** `{boolean}`: Send handler errors back to the requester (default: false)
+  - Example:
+    ```javascript
+    await rabbitMQ.respond('rpc-users', async (content) => {
+      return await getUser(content.id)
+    }, { replyOnError: true })
+    ```
+
+See [`examples/23 - request-response`](examples/23%20-%20request-response) for a complete runnable requester/responder pair.
 
 ### Message Handling
 
