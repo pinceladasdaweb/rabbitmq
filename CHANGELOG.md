@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 1.3.0 (2026-07-30)
+
+* feat(minor): request/response (RPC) support over direct reply-to by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/93c2c2889dfd52fe7c0b4756883ae7ed630050ad)
+* fix(minor): harden RPC after adversarial review by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/0c9302e8c20e353422964320beffda0dd6fbfff3)
+* fix: hold the event loop open in timeout-only RPC unit tests by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/ab018f2fb1b14592cb742b9cc0b0a5892f63833a)
+
+
 ## 1.2.1 (2026-07-29)
 
 * chore(deps): upgrade packages by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/3c7e7241e62b3521bea1ce38e3be0b3c85cee6f7)
