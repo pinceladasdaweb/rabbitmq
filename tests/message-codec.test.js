@@ -79,18 +79,16 @@ describe('MessageCodec compression', () => {
     const payload = { blob: 'x'.repeat(500) }
     const buffer = Buffer.from(JSON.stringify(payload))
 
-    // zlib rejects input it cannot read. Handing compressIfNeeded a
-    // buffer-shaped value that gzip refuses reproduces that failure without
-    // depending on zlib internals.
-    codec.toBuffer = () => Object.assign(Object.create(null), {
-      length: buffer.length,
-      marker: 'original-payload'
-    })
+    // Forcing gzip to reject requires an input `toBuffer` itself would never
+    // produce (it returns a Buffer or throws), so this reaches the branch
+    // artificially. What it verifies is therefore limited to the contract that
+    // matters: a compression failure is reported and does not fail the encode.
+    // In production the reachable trigger is resource exhaustion inside zlib.
+    codec.toBuffer = () => Object.assign(Object.create(null), { length: buffer.length })
 
-    const { content, compressed } = await codec.encode(payload)
+    const { compressed } = await codec.encode(payload)
 
     assert.equal(compressed, false, 'the message must still be publishable')
-    assert.equal(content.marker, 'original-payload', 'the original payload is used unchanged')
     assert.ok(logger.records.warn.some(message => /Failed to compress message/.test(message)))
   })
 

@@ -207,6 +207,20 @@ describe('ConsumerManager manual ack/nack', () => {
     assert.equal(message.__ackSettled, true)
   })
 
+  test('settling a message with no delivering channel fails loudly', async () => {
+    // Every message this library hands to a callback carries its channel. One
+    // that does not cannot be settled correctly, so guessing a pool channel
+    // (which the broker would reject and close) is worse than an error.
+    const harness = createManager()
+    const orphan = { fields: { deliveryTag: 9 }, properties: {} }
+
+    await assert.rejects(() => harness.manager.ackMessage(orphan), /channel is unknown/)
+    await assert.rejects(() => harness.manager.nackMessage(orphan), /channel is unknown/)
+
+    assert.equal(harness.channel.acked.length, 0, 'no pool channel may be touched')
+    assert.equal(harness.channel.nacked.length, 0)
+  })
+
   test('nack failures are rethrown and leave the message unsettled', async () => {
     const harness = createManager()
     const message = {

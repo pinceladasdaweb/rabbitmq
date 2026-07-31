@@ -287,13 +287,40 @@ describe('RabbitMQConnection disconnect', () => {
 
     await connection.connect()
 
-    // amqplib emits 'error' before 'close' on a failing socket; the error
-    // handler must only report, since 'close' owns the recovery decision.
+    // amqplib always follows a connection 'error' with 'close', so the error
+    // handler must only report: 'close' owns the recovery decision. The
+    // load-bearing assertion is therefore "no redial", not the transient state.
     dialer.connections[0].emit('error', new Error('socket hiccup'))
 
     assert.ok(logger.records.error.some(message => /Connection error: socket hiccup/.test(message)))
-    assert.equal(connection.getConnectionState(), 'connected', 'error alone must not change state')
-    assert.equal(dialer.dials, 1, 'error alone must not trigger a redial')
+
+    // Recovery is scheduled on a timer, so asserting right after the emit would
+    // pass even if the handler had started one. Wait past the backoff window
+    // (reconnectInterval 10ms, maxReconnectInterval 20ms) before concluding.
+    await sleep(80)
+
+    assert.equal(dialer.dials, 1, 'the error handler must not start recovery on its own')
+    assert.equal(connection.getConnectionState(), 'connected')
+  })
+
+  test('the real error-then-close sequence reconnects exactly once', async (t) => {
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer)
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    const reconnected = new Promise(resolve => connection.once('reconnected', resolve))
+
+    // This is the ordering amqplib actually produces on a failing socket.
+    dialer.connections[0].emit('error', new Error('ECONNRESET'))
+    dialer.connections[0].emit('close')
+
+    await reconnected
+
+    assert.equal(connection.getConnectionState(), 'connected')
+    assert.equal(dialer.dials, 2, 'error + close together must produce one redial, not two')
   })
 
   test('a close() that throws still leaves the instance cleanly disconnected', async (t) => {

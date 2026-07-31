@@ -201,13 +201,13 @@ describe('RateLimiter', () => {
       limiter.blockKey('blocked-key', 10)
 
       assert.equal(limiter.buckets.size, 1)
-      assert.equal(limiter.blocked.size, 1)
+      assert.equal(limiter.getStatus('blocked-key').isBlocked, true)
 
       // The sweep runs on its own interval (windowMs / 10), so this asserts
       // the real wiring rather than poking a private method. A bucket becomes
       // collectable once it is older than windowMs * 2.
       await waitFor(
-        () => limiter.buckets.size === 0 && limiter.blocked.size === 0,
+        () => limiter.buckets.size === 0 && !limiter.getStatus('blocked-key').isBlocked,
         3000,
         'stale bucket evicted and expired block released'
       )

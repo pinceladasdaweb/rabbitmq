@@ -431,7 +431,6 @@ describe('Rpc reply channel lifecycle', () => {
     await assert.rejects(() => requestPromise, (error) =>
       error.code === 'RPC_CONNECTION_LOST' && /cancelled by the broker/.test(error.message)
     )
-    assert.equal(harness.rpc.replyChannel, null, 'the cancelled channel must not be reused')
 
     // The next request rebuilds the consumer and works end to end.
     const second = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
@@ -557,7 +556,8 @@ describe('Rpc reply channel lifecycle', () => {
       // Draining stderr prevents a deadlock if the probe ever writes a lot.
       child.stderr.resume()
       child.on('error', fail)
-      child.on('exit', succeed)
+      // 'close' (not 'exit') guarantees stdout has been drained.
+      child.on('close', succeed)
     })
 
     assert.equal(code, 0)

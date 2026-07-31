@@ -51,13 +51,23 @@ class ConsumerManager {
     }
   }
 
+  // Delivery tags are scoped to the channel that delivered them, so settlement
+  // must go back to that exact channel. Falling back to a pool channel would
+  // make the broker answer PRECONDITION_FAILED and close it, taking unrelated
+  // in-flight publishes down with it — failing loudly is the safer contract.
+  #settlementChannel (message) {
+    if (!message.__channel) {
+      throw new Error('Cannot settle a message that was not delivered by this consumer: its channel is unknown')
+    }
+
+    return message.__channel
+  }
+
   async ackMessage (message) {
     if (message.__ackSettled) return
 
     try {
-      const channel = message.__channel || await this.getChannel()
-
-      channel.ack(message)
+      this.#settlementChannel(message).ack(message)
       message.__ackSettled = true
     } catch (err) {
       this.logger.error(`Failed to acknowledge message: ${err.message}`)
@@ -70,9 +80,7 @@ class ConsumerManager {
     if (message.__ackSettled) return
 
     try {
-      const channel = message.__channel || await this.getChannel()
-
-      channel.nack(message, false, requeue)
+      this.#settlementChannel(message).nack(message, false, requeue)
       message.__ackSettled = true
     } catch (err) {
       this.logger.error(`Failed to negatively acknowledge message: ${err.message}`)

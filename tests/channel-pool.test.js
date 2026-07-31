@@ -205,9 +205,12 @@ describe('ChannelPool', () => {
 
     const original = pool.channels[0]
     const realCreate = connection.createConfirmChannel
-    let failures = 2
+    // One failure is enough to prove the retry loop exists; each extra attempt
+    // costs a real 500ms * attempt backoff and this file is the suite's
+    // critical path.
+    let failures = 1
 
-    // The first two replacement attempts fail, the third succeeds.
+    // The first replacement attempt fails, the second succeeds.
     connection.createConfirmChannel = async () => {
       if (failures-- > 0) throw new Error('connection not ready')
 
@@ -222,7 +225,7 @@ describe('ChannelPool', () => {
     assert.equal(pool.getChannel(), pool.channels[0], 'the replacement must be back in rotation')
   })
 
-  test('a replacement that lands after the pool closed is discarded, not left open', async () => {
+  test('a replacement that lands after the pool closed is discarded, not left open', async (t) => {
     const connection = createFakeConnection()
     const pool = new ChannelPool(connection, silentLogger, 1)
 
@@ -232,6 +235,14 @@ describe('ChannelPool', () => {
     let releaseCreate
     const gate = new Promise(resolve => { releaseCreate = resolve })
     const realCreate = connection.createConfirmChannel
+
+    // Symmetric with the sibling test: an assertion failing before the explicit
+    // close below must not strand the gate or the pool.
+    t.after(() => {
+      releaseCreate?.()
+
+      return pool.close()
+    })
 
     connection.createConfirmChannel = async () => {
       await gate
@@ -251,7 +262,7 @@ describe('ChannelPool', () => {
 
     await waitForCondition(() => late.closed, 3000, 'late replacement closed')
 
-    assert.equal(pool.channels.length, 0, 'a closed pool must not adopt the late channel')
+    assert.throws(() => pool.getChannel(), /not initialized/, 'a closed pool must not adopt the late channel')
   })
 
   test('close must not strip channel listeners: in-flight publish confirms still settle', async () => {
