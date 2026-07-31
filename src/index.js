@@ -30,6 +30,7 @@ class RabbitMQ extends EventEmitter {
   #rpc
   #shutdownHandlersInstalled
   #connectPromise
+  #restorePromise
 
   constructor (options = {}) {
     super()
@@ -41,6 +42,7 @@ class RabbitMQ extends EventEmitter {
     this.#useCache = options.useCache || false
     this.#shutdownHandlersInstalled = false
     this.#connectPromise = null
+    this.#restorePromise = null
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -96,6 +98,7 @@ class RabbitMQ extends EventEmitter {
       rateLimiter: this.#rateLimiter,
       maxPriority: options.maxPriority || 10,
       prefetchCount: options.prefetchCount ?? 10,
+      consumerRecoveryInterval: options.consumerRecoveryInterval,
       deadLetterExchange: options.deadLetterExchange || 'dlx',
       delayExchange: options.delayExchange || 'delayed',
       getExchange: () => this.#exchange,
@@ -153,15 +156,61 @@ class RabbitMQ extends EventEmitter {
     this.enableGracefulShutdown()
   }
 
+  // Everything that must be rebuilt on top of a fresh connection. Both entry
+  // points funnel through here — the automatic reconnection AND an explicit
+  // connect() that lands while the previous connection is gone — because
+  // rebuilding the pool without recreating consumers leaves publishing healthy
+  // while every consumer stays silently dead on channels of the old
+  // connection.
+  //
+  // Concurrent callers share one restore. Both recovery paths can be waiting on
+  // the same in-flight dial and resume together, in either order:
+  //   - the timer's attempt first: it starts the restore, and #doConnect then
+  //     sees a pool and skips;
+  //   - the manual connect() first: it starts the restore, and the timer's
+  //     'reconnected' reaches #handleReconnection, which has no pool check at
+  //     all and would restore again.
+  // The second ordering is why the caller-side `if (!this.#channelPool)` guard
+  // is not enough on its own. Two overlapping recreateAll() runs issue
+  // channel.consume twice per consumer, so every message is delivered twice.
+  async #restoreState () {
+    if (!this.#restorePromise) {
+      const restore = this.#doRestoreState().finally(() => {
+        // Only release the slot if this restore still owns it: a stale restore
+        // (one #handleDisconnection already dropped) finishing late must not
+        // clear a newer one, or the next caller would start a second restore
+        // alongside it and duplicate every consumer.
+        //
+        // NOT covered by a test: reaching it needs a third #restoreState()
+        // caller while a restore is in flight, and today there is none —
+        // #handleReconnection needs a disconnection first (which drops the slot
+        // anyway) and #doConnect is gated by the pool the in-flight restore
+        // already assigned. Kept because the check costs three lines while the
+        // failure it prevents is silent duplicate processing.
+        if (this.#restorePromise === restore) {
+          this.#restorePromise = null
+        }
+      })
+
+      this.#restorePromise = restore
+    }
+
+    return this.#restorePromise
+  }
+
+  async #doRestoreState () {
+    await this.#setupChannelPool()
+    await this.#topology.ensureExchange()
+    await this.#consumers.recreateAll()
+
+    // Failures accumulated against the previous connection say nothing
+    // about the fresh one — do not keep publishing blocked after recovery.
+    this.#circuitBreaker.reset()
+  }
+
   async #handleReconnection () {
     try {
-      await this.#setupChannelPool()
-      await this.#topology.ensureExchange()
-      await this.#consumers.recreateAll()
-
-      // Failures accumulated against the previous connection say nothing
-      // about the fresh one — do not keep publishing blocked after recovery.
-      this.#circuitBreaker.reset()
+      await this.#restoreState()
 
       this.emit('reconnected')
     } catch (error) {
@@ -174,6 +223,13 @@ class RabbitMQ extends EventEmitter {
     // Direct reply-to routes died with the connection: settle in-flight RPC
     // requests now instead of leaving them to hit their timeouts.
     this.#rpc.handleConnectionLoss()
+
+    // A restore still in flight was building on the connection that just died,
+    // so its result says nothing about the next one. Dropping it here stops the
+    // next recovery from joining it and concluding that state was restored when
+    // no pool or consumer exists — which leaves publishing broken until yet
+    // another disconnection happens to come along.
+    this.#restorePromise = null
 
     if (this.#channelPool) {
       // Marks the pool as closed so channel-replacement retry loops stop;
@@ -215,9 +271,13 @@ class RabbitMQ extends EventEmitter {
     const connection = await this.#connection.connect()
 
     if (connection) {
+      // No pool means this connection is new to the facade: either the very
+      // first connect (where recreating consumers and resetting the breaker are
+      // no-ops) or a manual connect() that beat the automatic reconnection
+      // timer to it — which the 'reconnected' event never covers, since that
+      // fires only from the timer path.
       if (!this.#channelPool) {
-        await this.#setupChannelPool()
-        await this.#topology.ensureExchange()
+        await this.#restoreState()
       }
 
       return connection

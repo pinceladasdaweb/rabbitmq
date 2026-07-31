@@ -19,6 +19,7 @@ class Rpc {
     this.pendingRequests = new Map()
     this.replyChannel = null
     this.replySetupPromise = null
+    this.replyListeners = null
     this.connectionEpoch = 0
   }
 
@@ -51,6 +52,7 @@ class Rpc {
     // setup that started against the dying connection must not install its
     // channel after this sweep already declared the world dead.
     this.connectionEpoch++
+    this.#detachReplyListeners()
     this.replyChannel = null
     this.rejectAllPending(reason)
   }
@@ -67,6 +69,7 @@ class Rpc {
   #invalidateReplyChannel (channel, reason) {
     if (this.replyChannel !== channel) return
 
+    this.#detachReplyListeners()
     this.replyChannel = null
     this.rejectAllPending(reason)
   }
@@ -109,26 +112,43 @@ class Rpc {
     // Requests publish with mandatory: an unroutable request (nothing bound
     // to the routing key) comes back as a basic.return and fails fast here
     // instead of burning the caller's full timeout.
-    channel.on('return', (msg) => {
+    const onReturn = (msg) => {
       this.#settlePending(msg?.properties?.correlationId, (pending) => {
         pending.reject(this.#rpcError('RPC_UNROUTABLE', `RPC request to ${msg.fields?.routingKey} could not be routed to any queue`))
       })
-    })
+    }
 
-    channel.on('close', () => {
+    const onClose = () => {
       this.#invalidateReplyChannel(channel, 'reply channel closed')
-    })
+    }
+
+    channel.on('return', onReturn)
+    channel.on('close', onClose)
+
+    this.replyListeners = { channel, onReturn, onClose }
 
     // The connection turned over while this setup was in flight: this
     // channel belongs to the dead connection and must not be installed —
     // future requests would publish into a channel already being torn down.
     if (epoch !== this.connectionEpoch) {
+      this.#detachReplyListeners()
+
       throw this.#rpcError('RPC_CONNECTION_LOST', 'RPC request aborted: connection lost during reply consumer setup')
     }
 
     this.replyChannel = channel
 
     return channel
+  }
+
+  #detachReplyListeners () {
+    if (!this.replyListeners) return
+
+    const { channel, onReturn, onClose } = this.replyListeners
+
+    channel.off('return', onReturn)
+    channel.off('close', onClose)
+    this.replyListeners = null
   }
 
   async #handleReply (msg) {

@@ -23,6 +23,9 @@ class RateLimiter extends EventEmitter {
 
     this.cleanupInterval = setInterval(() => this.#cleanup(), Math.min(this.windowMs / 10, 60000))
 
+    // Unref'd so a limiter nobody disposed cannot keep the process alive. Note
+    // this is not covered by a unit test: every test disposes its limiter, so
+    // the ref'd variant would never get the chance to hold the loop open.
     if (typeof this.cleanupInterval.unref === 'function') {
       this.cleanupInterval.unref()
     }

@@ -86,8 +86,21 @@ class SequentialProcessor {
         this.processing.delete(messageId)
       }
 
+      // Bounded retry, unlike subscribe() which never requeues: a first
+      // delivery may be retried, but a redelivery that fails again is
+      // dead-lettered. Without the redelivered check an always failing
+      // callback hot-loops (nack -> requeue -> redeliver -> nack).
+      //
+      // Caveat: the broker sets `redelivered` on ANY requeue, not just ours
+      // (an unacked message returned after a connection drop arrives
+      // redelivered too), so such a message gets no retry at all. AMQP offers
+      // no redelivery counter on classic queues; set `error.retryable = false`
+      // to opt out of retrying explicitly, or use a quorum queue's
+      // x-delivery-count if you need a true attempt budget.
+      const requeue = error.retryable !== false && !message.fields?.redelivered
+
       this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${error.message}`)
-      this.onFailure(message, error, error.retryable !== false)
+      this.onFailure(message, error, requeue)
     }
   }
 

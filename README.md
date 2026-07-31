@@ -288,6 +288,9 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 - **prefetchCount** `{number}`: Number of messages to prefetch.
   - Default: `10`
   - Example: `1`
+- **consumerRecoveryInterval** `{number}`: Base backoff in milliseconds between attempts to recover a consumer cancelled by the broker (attempt N waits N × this value, up to 3 attempts before `consumerLost` is emitted).
+  - Default: `1000`
+  - Example: `500`
 
 ### Message Options
 

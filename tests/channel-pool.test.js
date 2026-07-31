@@ -2,12 +2,7 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import { EventEmitter } from 'node:events'
 import ChannelPool from '../src/connection/channel-pool.js'
-
-const silentLogger = {
-  info: () => {},
-  warn: () => {},
-  error: () => {}
-}
+import { FakeChannel, silentLogger, waitFor as waitForCondition } from './helpers.js'
 
 function createFakeChannel () {
   const channel = new EventEmitter()
@@ -24,6 +19,23 @@ function createFakeConnection () {
     createdChannels: [],
     createConfirmChannel: async () => {
       const channel = createFakeChannel()
+      connection.createdChannels.push(channel)
+
+      return channel
+    }
+  }
+
+  return connection
+}
+
+// Hands out the shared FakeChannel, which models amqplib's confirm bookkeeping
+// (unconfirmed callbacks are failed by the channel's own 'close' listener) —
+// required by the tests that pin ChannelPool's teardown contract.
+function createConfirmAwareConnection () {
+  const connection = {
+    createdChannels: [],
+    createConfirmChannel: async () => {
+      const channel = new FakeChannel()
       connection.createdChannels.push(channel)
 
       return channel
@@ -181,5 +193,122 @@ describe('ChannelPool', () => {
     assert.equal(pool.channels.length, 0)
     assert.equal(pool.dedicatedChannels.size, 0)
     assert.ok(allChannels.every(channel => channel.closed))
+  })
+
+  test('a pool channel is replaced after a transient failure and returns to rotation', async (t) => {
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1)
+
+    await pool.initialize()
+    // The replacement loop sleeps between attempts; closing the pool stops it.
+    t.after(() => pool.close())
+
+    const original = pool.channels[0]
+    const realCreate = connection.createConfirmChannel
+    // One failure is enough to prove the retry loop exists; each extra attempt
+    // costs a real 500ms * attempt backoff and this file is the suite's
+    // critical path.
+    let failures = 1
+
+    // The first replacement attempt fails, the second succeeds.
+    connection.createConfirmChannel = async () => {
+      if (failures-- > 0) throw new Error('connection not ready')
+
+      return realCreate()
+    }
+
+    original.emit('close')
+
+    await waitForCondition(() => pool.channels[0] && pool.channels[0] !== original, 5000, 'channel replaced after retries')
+
+    assert.notEqual(pool.channels[0], original)
+    assert.equal(pool.getChannel(), pool.channels[0], 'the replacement must be back in rotation')
+  })
+
+  test('a replacement that lands after the pool closed is discarded, not left open', async (t) => {
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1)
+
+    await pool.initialize()
+
+    const original = pool.channels[0]
+    let releaseCreate
+    const gate = new Promise(resolve => { releaseCreate = resolve })
+    const realCreate = connection.createConfirmChannel
+
+    // Symmetric with the sibling test: an assertion failing before the explicit
+    // close below must not strand the gate or the pool.
+    t.after(() => {
+      releaseCreate?.()
+
+      return pool.close()
+    })
+
+    connection.createConfirmChannel = async () => {
+      await gate
+
+      return realCreate()
+    }
+
+    original.emit('close')
+
+    // The pool shuts down while the replacement is still being created.
+    await pool.close()
+    releaseCreate()
+
+    await waitForCondition(() => connection.createdChannels.length === 2, 3000, 'replacement channel created')
+
+    const late = connection.createdChannels[1]
+
+    await waitForCondition(() => late.closed, 3000, 'late replacement closed')
+
+    assert.throws(() => pool.getChannel(), /not initialized/, 'a closed pool must not adopt the late channel')
+  })
+
+  test('close must not strip channel listeners: in-flight publish confirms still settle', async () => {
+    // Regression, and the reason #closeChannel deliberately does NOT call
+    // removeAllListeners: amqplib's own 'close' listener is what fails every
+    // still-unconfirmed publish callback. Stripping it left in-flight confirm
+    // promises pending forever — a publish that never resolves nor rejects.
+    //
+    // FakeChannel models that amqplib behaviour, so this test fails the moment
+    // the listeners are stripped again.
+    const connection = createConfirmAwareConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1)
+
+    await pool.initialize()
+
+    const channel = pool.getChannel()
+    // A publish whose confirm the broker has not answered yet.
+    const inFlight = new Promise((resolve, reject) => {
+      channel.publish('ex', 'rk', Buffer.from('x'), {}, (err) => (err ? reject(err) : resolve()))
+    })
+
+    assert.equal(channel.unconfirmedCount, 1, 'the publish must be unconfirmed before closing')
+
+    await pool.close()
+
+    await assert.rejects(() => inFlight, /channel closed/, 'the confirm must be failed, never left pending')
+  })
+
+  test('a channel closing during pool shutdown does not trigger a replacement', async () => {
+    // Without the `closed` guard in the channel 'close' handler, pool.close()
+    // would kick off replacement loops that recreate channels on a connection
+    // that is going away.
+    const connection = createConfirmAwareConnection()
+    const pool = new ChannelPool(connection, silentLogger, 2)
+
+    await pool.initialize()
+
+    const createdDuringSetup = connection.createdChannels.length
+
+    await pool.close()
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.equal(
+      connection.createdChannels.length,
+      createdDuringSetup,
+      'shutting the pool down must not create replacement channels'
+    )
   })
 })
