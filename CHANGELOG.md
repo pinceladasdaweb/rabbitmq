@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.3.1 (2026-07-31)
+
+* test: unit-cover topology and connection with injectable fakes by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/448b3aa6b921a0a4dd9e7e3cb9bff98506dc7620)
+* test: unit-cover consumer-manager and publisher by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/75192e28352e113ff9c3a5af375ff5008a27d672)
+* test: unit-cover the facade lifecycle and message codec by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/6bb249dabec31a65b0362cb8116188abf314c0da)
+* fix: real poison-message policy for subscribeSequential, and honest tests by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2775363897072a158f6f3b097a1389244e713f80)
+* test: cover the remaining unguarded invariants; fix RPC reply-listener leak by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/ba24bcc07fcc6171c7efd0acb0f9654b8c062236)
+* fix: settle messages only on their delivering channel by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/75877f863c83dd9d2e68bdf6bb10f66a9d8202d7)
+* fix: restore full state when connect() beats the reconnection timer by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/a80752554fe97032157b1882b9ea063caa6d4f82)
+
+
 ## 1.3.0 (2026-07-30)
 
 * feat(minor): request/response (RPC) support over direct reply-to by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/93c2c2889dfd52fe7c0b4756883ae7ed630050ad)
