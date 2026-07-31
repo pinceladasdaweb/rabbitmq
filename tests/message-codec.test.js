@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
-
-const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
+import { silentLogger } from './helpers.js'
 
 describe('MessageCodec toBuffer/fromBuffer', () => {
   test('passes buffers through untouched', () => {

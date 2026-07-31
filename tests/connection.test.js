@@ -1,80 +1,48 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
-import { EventEmitter } from 'node:events'
 import RabbitMQConnection from '../src/connection/connection.js'
+import { installDialer } from './fake-amqp.js'
+import { createDialer, silentLogger, sleep, waitFor } from './helpers.js'
 
-const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
+// The dialer is installed onto amqplib itself (see fake-amqp.js), so nothing
+// test-specific reaches the constructor.
+const createConnection = (t, dialer, options = {}) => {
+  installDialer(t, dialer)
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
-
-const waitFor = async (predicate, timeoutMs = 3000, label = 'condition') => {
-  const start = Date.now()
-
-  while (Date.now() - start < timeoutMs) {
-    if (await predicate()) return
-
-    await sleep(5)
-  }
-
-  throw new Error(`Timeout waiting for: ${label}`)
+  return new RabbitMQConnection({
+    username: 'admin',
+    password: 'admin',
+    endpoints: ['node-a:5672'],
+    connectionName: 'unit-test',
+    reconnectInterval: 10,
+    maxReconnectInterval: 20,
+    ...options
+  }, silentLogger)
 }
-
-class FakeAmqpConnection extends EventEmitter {
-  async close () {
-    this.closed = true
-  }
-}
-
-// A controllable dialer: `plan` is a list of outcomes ('ok' or an Error) that
-// dials consume in order; the last entry repeats for further dials.
-const createDialer = (plan = ['ok']) => {
-  const dialer = {
-    dials: [],
-    connections: [],
-    connect: async (url, socketOptions) => {
-      dialer.dials.push({ url, socketOptions })
-
-      const outcome = plan.length > 1 ? plan.shift() : plan[0]
-
-      if (outcome !== 'ok') throw outcome
-
-      const connection = new FakeAmqpConnection()
-
-      dialer.connections.push(connection)
-
-      return connection
-    }
-  }
-
-  return dialer
-}
-
-const createConnection = (dialer, options = {}) => new RabbitMQConnection({
-  username: 'admin',
-  password: 'admin',
-  endpoints: ['node-a:5672'],
-  connectionName: 'unit-test',
-  reconnectInterval: 10,
-  maxReconnectInterval: 20,
-  amqpConnect: dialer.connect,
-  ...options
-}, silentLogger)
 
 describe('RabbitMQConnection constructor', () => {
+  // These reject before anything is dialed, so they need no fake dialer.
+  const construct = (options) => new RabbitMQConnection({
+    username: 'admin',
+    password: 'admin',
+    endpoints: ['node-a:5672'],
+    ...options
+  }, silentLogger)
+
   test('rejects invalid protocols', () => {
-    assert.throws(() => createConnection(createDialer(), { protocol: 'http' }), /Invalid protocol/)
+    assert.throws(() => construct({ protocol: 'http' }), /Invalid protocol/)
   })
 
   test('rejects empty or falsy endpoints', () => {
-    assert.throws(() => createConnection(createDialer(), { endpoints: [] }), /At least one valid/)
-    assert.throws(() => createConnection(createDialer(), { endpoints: [undefined] }), /At least one valid/)
+    assert.throws(() => construct({ endpoints: [] }), /At least one valid/)
+    assert.throws(() => construct({ endpoints: [undefined] }), /At least one valid/)
   })
 })
 
 describe('RabbitMQConnection connect', () => {
   test('dials with encoded credentials, vhost and the connection name', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer, {
+    const connection = createConnection(t, dialer, {
       username: 'u ser',
       password: 'p@ss/word',
       vhost: 'my/vhost',
@@ -86,14 +54,14 @@ describe('RabbitMQConnection connect', () => {
     const result = await connection.connect()
 
     assert.ok(result, 'connect must return the connection')
-    assert.equal(dialer.dials[0].url, 'amqps://u%20ser:p%40ss%2Fword@node-a:5672/my%2Fvhost')
-    assert.equal(dialer.dials[0].socketOptions.clientProperties.connection_name, 'unit-test')
+    assert.equal(dialer.urls[0], 'amqps://u%20ser:p%40ss%2Fword@node-a:5672/my%2Fvhost')
+    assert.equal(dialer.socketOptions.clientProperties.connection_name, 'unit-test')
     assert.equal(connection.getConnectionState(), 'connected')
   })
 
   test('emits connected with the endpoint and reports cluster status', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -111,7 +79,7 @@ describe('RabbitMQConnection connect', () => {
 
   test('a second connect() while connected reuses the connection without dialing again', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -119,7 +87,7 @@ describe('RabbitMQConnection connect', () => {
     const second = await connection.connect()
 
     assert.equal(first, second)
-    assert.equal(dialer.dials.length, 1)
+    assert.equal(dialer.dials, 1)
   })
 
   test('concurrent connect() callers share a single in-flight dial', async (t) => {
@@ -134,7 +102,7 @@ describe('RabbitMQConnection connect', () => {
       return gatedConnect(...args)
     }
 
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -145,20 +113,20 @@ describe('RabbitMQConnection connect', () => {
     const [first, second] = await Promise.all(attempts)
 
     assert.equal(first, second)
-    assert.equal(dialer.dials.length, 1, 'two parallel loops would leak a connection')
+    assert.equal(dialer.dials, 1, 'two parallel loops would leak a connection')
   })
 
   test('rotates to the next endpoint when the first one fails', async (t) => {
     const dialer = createDialer([new Error('ECONNREFUSED'), 'ok'])
-    const connection = createConnection(dialer, { endpoints: ['node-a:5672', 'node-b:5672'] })
+    const connection = createConnection(t, dialer, { endpoints: ['node-a:5672', 'node-b:5672'] })
 
     t.after(() => connection.disconnect())
 
     const result = await connection.connect()
 
     assert.ok(result)
-    assert.equal(dialer.dials.length, 2)
-    assert.match(dialer.dials[1].url, /node-b:5672/)
+    assert.equal(dialer.dials, 2)
+    assert.match(dialer.urls[1], /node-b:5672/)
     assert.equal(connection.getCurrentEndpoint(), 'node-b:5672')
   })
 })
@@ -166,7 +134,7 @@ describe('RabbitMQConnection connect', () => {
 describe('RabbitMQConnection reconnection', () => {
   test('starts background reconnection when every endpoint fails, then recovers', async (t) => {
     const dialer = createDialer([new Error('down'), new Error('still down'), 'ok'])
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -188,7 +156,7 @@ describe('RabbitMQConnection reconnection', () => {
 
   test('an unexpected connection close triggers reconnection', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -203,12 +171,37 @@ describe('RabbitMQConnection reconnection', () => {
     await reconnected
 
     assert.equal(connection.getConnectionState(), 'connected')
-    assert.equal(dialer.dials.length, 2)
+    assert.equal(dialer.dials, 2)
+  })
+
+  test('a successful connection resets the attempt counter so the next outage gets a full budget', async (t) => {
+    // Regression: without the reset on success, attempts accumulate across
+    // outages and a client with a finite budget gives up prematurely (here it
+    // would abandon the second outage without dialing at all).
+    const dialer = createDialer([new Error('down'), 'ok', new Error('down again')])
+    const connection = createConnection(t, dialer, { maxReconnectAttempts: 2 })
+
+    t.after(() => connection.disconnect())
+
+    const recovered = new Promise(resolve => connection.once('reconnected', resolve))
+
+    await connection.connect()
+    await recovered
+
+    assert.equal(dialer.dials, 2, 'first outage: one failed dial plus one successful retry')
+
+    const failed = new Promise(resolve => connection.once('reconnectFailed', resolve))
+
+    dialer.connections.at(-1).emit('close')
+
+    await failed
+
+    assert.equal(dialer.dials, 4, 'second outage must still get its two full attempts')
   })
 
   test('gives up with reconnectFailed after maxReconnectAttempts', async (t) => {
     const dialer = createDialer([new Error('permanently down')])
-    const connection = createConnection(dialer, { maxReconnectAttempts: 2 })
+    const connection = createConnection(t, dialer, { maxReconnectAttempts: 2 })
 
     t.after(() => connection.disconnect())
 
@@ -219,15 +212,15 @@ describe('RabbitMQConnection reconnection', () => {
 
     assert.equal(connection.getConnectionState(), 'failed')
     // 1 initial dial + 2 reconnect attempts, nothing further scheduled.
-    assert.equal(dialer.dials.length, 3)
+    assert.equal(dialer.dials, 3)
 
     await sleep(50)
-    assert.equal(dialer.dials.length, 3, 'no dials after giving up')
+    assert.equal(dialer.dials, 3, 'no dials after giving up')
   })
 
   test('emits connectionStateChanged through the lifecycle', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 
@@ -243,9 +236,9 @@ describe('RabbitMQConnection reconnection', () => {
 })
 
 describe('RabbitMQConnection disconnect', () => {
-  test('closes the connection and stops reacting to its close event', async () => {
+  test('closes the connection and stops reacting to its close event', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     await connection.connect()
 
@@ -265,28 +258,28 @@ describe('RabbitMQConnection disconnect', () => {
     await sleep(30)
 
     assert.equal(reconnectionStarted, false)
-    assert.equal(dialer.dials.length, 1)
+    assert.equal(dialer.dials, 1)
   })
 
-  test('disconnect while reconnecting cancels the retry loop', async () => {
+  test('disconnect while reconnecting cancels the retry loop', async (t) => {
     const dialer = createDialer([new Error('down')])
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     await connection.connect()
     assert.equal(connection.getConnectionState(), 'reconnecting')
 
     await connection.disconnect()
 
-    const dialsAtDisconnect = dialer.dials.length
+    const dialsAtDisconnect = dialer.dials
 
     await sleep(60)
 
-    assert.equal(dialer.dials.length, dialsAtDisconnect, 'no dials after disconnect')
+    assert.equal(dialer.dials, dialsAtDisconnect, 'no dials after disconnect')
     assert.equal(connection.getConnectionState(), 'disconnected')
   })
 
-  test('disconnect on an already disconnected instance is a no-op', async () => {
-    const connection = createConnection(createDialer())
+  test('disconnect on an already disconnected instance is a no-op', async (t) => {
+    const connection = createConnection(t, createDialer())
 
     await connection.disconnect()
 
@@ -295,7 +288,7 @@ describe('RabbitMQConnection disconnect', () => {
 
   test('connect() after disconnect() re-enables automatic reconnection', async (t) => {
     const dialer = createDialer()
-    const connection = createConnection(dialer)
+    const connection = createConnection(t, dialer)
 
     t.after(() => connection.disconnect())
 

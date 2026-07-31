@@ -108,7 +108,22 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(acked, [])
     assert.equal(nacked.length, 1)
     assert.equal(nacked[0].messageId, 'bad')
-    assert.equal(nacked[0].requeue, true)
+    assert.equal(nacked[0].requeue, true, 'a first delivery may be retried')
+  })
+
+  test('dead-letters a failing redelivery instead of requeueing it forever', async (t) => {
+    // Regression: the catch used to requeue on every ordinary error with no
+    // redelivered check, so an always failing callback hot-looped
+    // (nack -> requeue -> redeliver -> nack) instead of reaching the DLQ.
+    const { processor, acked, nacked } = createProcessor(t, {
+      callback: async () => { throw new Error('boom') }
+    })
+
+    await processor.handle({}, makeMessage('bad', { redelivered: true }))
+
+    assert.deepEqual(acked, [])
+    assert.equal(nacked.length, 1)
+    assert.equal(nacked[0].requeue, false, 'a redelivery that fails again must be dead-lettered')
   })
 
   test('honors error.retryable === false with requeue false', async (t) => {

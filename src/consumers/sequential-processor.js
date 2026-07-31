@@ -86,8 +86,14 @@ class SequentialProcessor {
         this.processing.delete(messageId)
       }
 
+      // Same poison-message policy as subscribe(): a first delivery may be
+      // retried, but a redelivery that fails again is dead-lettered instead of
+      // being requeued forever. Without the redelivered check, an always
+      // failing callback hot-loops (nack -> requeue -> redeliver -> nack).
+      const requeue = error.retryable !== false && !message.fields?.redelivered
+
       this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${error.message}`)
-      this.onFailure(message, error, error.retryable !== false)
+      this.onFailure(message, error, requeue)
     }
   }
 

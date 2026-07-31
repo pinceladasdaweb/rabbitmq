@@ -8,6 +8,9 @@ class ConsumerManager {
     this.codec = context.codec
     this.circuitBreaker = context.circuitBreaker
     this.prefetchCount = context.prefetchCount
+    // Base backoff between attempts to recover a broker-cancelled consumer
+    // (attempt N waits N * this value).
+    this.recoveryInterval = context.consumerRecoveryInterval ?? 1000
     this.getChannelPool = context.getChannelPool
     this.getChannel = context.getChannel
     this.emit = context.emit
@@ -170,7 +173,7 @@ class ConsumerManager {
     let knownEpoch = consumerInfo.epoch
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await sleep(1000 * attempt)
+      await sleep(this.recoveryInterval * attempt)
 
       const currentInfo = this.activeConsumers.get(consumerId)
 

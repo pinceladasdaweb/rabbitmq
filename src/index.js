@@ -81,8 +81,7 @@ class RabbitMQ extends EventEmitter {
       connectionName: options.connectionName || 'default_connection',
       reconnectInterval: options.reconnectInterval,
       maxReconnectInterval: options.maxReconnectInterval,
-      maxReconnectAttempts: options.maxReconnectAttempts,
-      amqpConnect: options.amqpConnect
+      maxReconnectAttempts: options.maxReconnectAttempts
     }, this.#logger)
 
     this.#connection.on('connected', () => this.emit('connected'))
@@ -97,6 +96,7 @@ class RabbitMQ extends EventEmitter {
       rateLimiter: this.#rateLimiter,
       maxPriority: options.maxPriority || 10,
       prefetchCount: options.prefetchCount ?? 10,
+      consumerRecoveryInterval: options.consumerRecoveryInterval,
       deadLetterExchange: options.deadLetterExchange || 'dlx',
       delayExchange: options.delayExchange || 'delayed',
       getExchange: () => this.#exchange,

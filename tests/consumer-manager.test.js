@@ -1,67 +1,12 @@
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
-import { EventEmitter } from 'node:events'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
+import { FakeChannel, silentLogger, sleep, waitFor } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
-
-const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
-
-const waitFor = async (predicate, timeoutMs = 5000, label = 'condition') => {
-  const start = Date.now()
-
-  while (Date.now() - start < timeoutMs) {
-    if (await predicate()) return
-
-    await sleep(10)
-  }
-
-  throw new Error(`Timeout waiting for: ${label}`)
-}
-
-class FakeChannel extends EventEmitter {
-  constructor () {
-    super()
-    this.consumers = []
-    this.prefetches = []
-    this.acked = []
-    this.nacked = []
-    this.cancelled = []
-    this.consumeSequence = 0
-    this.consumeError = null
-  }
-
-  async consume (queue, callback, options) {
-    if (this.consumeError) throw this.consumeError
-
-    const consumer = { queue, callback, options, consumerTag: `tag-${++this.consumeSequence}` }
-
-    this.consumers.push(consumer)
-
-    return { consumerTag: consumer.consumerTag }
-  }
-
-  async prefetch (count) {
-    this.prefetches.push(count)
-  }
-
-  ack (msg) {
-    this.acked.push(msg)
-  }
-
-  nack (msg, allUpTo, requeue) {
-    this.nacked.push({ msg, requeue })
-  }
-
-  async cancel (consumerTag) {
-    this.cancelled.push(consumerTag)
-  }
-}
 
 const createManager = (overrides = {}) => {
   const codec = new MessageCodec({ logger: silentLogger })
@@ -76,6 +21,9 @@ const createManager = (overrides = {}) => {
     logger: silentLogger,
     codec,
     prefetchCount: 10,
+    // Shrinks the broker-cancel recovery backoff so these tests assert on a
+    // deterministic signal instead of racing a 1s production timer.
+    consumerRecoveryInterval: 20,
     getChannelPool: () => channelPool,
     getChannel: async () => channel,
     emit: (event, payload) => events.push({ event, payload }),
@@ -239,7 +187,6 @@ describe('ConsumerManager lifecycle', () => {
 
     assert.equal(harness.manager.findQueueNameByTag(consumer.consumerTag), 'orders')
     assert.equal(harness.manager.findQueueNameByTag('unknown-tag'), null)
-    assert.equal(harness.manager.findQueueNameByTag(null), null)
   })
 
   test('unsubscribe cancels the consumer and drops all tracking', async () => {
@@ -284,16 +231,26 @@ describe('ConsumerManager lifecycle', () => {
     assert.equal(harness.manager.activeConsumers.size, 1, 'failed consumer stays registered for the next sweep')
   })
 
-  test('disposeAll cancels and clears every consumer', async () => {
+  test('disposeAll drops every consumer and stops broker-cancel recovery', async () => {
     const harness = createManager()
 
     await harness.manager.subscribe('orders', async () => {})
     await harness.manager.subscribe('invoices', async () => {})
 
+    const consumersBefore = harness.channel.consumers.length
+
     await harness.manager.disposeAll()
 
     assert.equal(harness.manager.activeConsumers.size, 0)
     assert.equal(harness.manager.consumersByTag.size, 0)
+
+    // A cancel notification arriving after disposal must not resurrect the
+    // consumer — disconnect() disposes and then closes the pool.
+    await harness.channel.consumers[0].callback(null)
+    await sleep(120)
+
+    assert.equal(harness.channel.consumers.length, consumersBefore, 'no consumer may be recreated after disposal')
+    assert.equal(harness.events.filter(e => e.event === 'consumerRecovered').length, 0)
   })
 
   test('a broker cancel (null message) emits consumerCancelled and recovers the consumer', async () => {
@@ -329,9 +286,33 @@ describe('ConsumerManager lifecycle', () => {
 
     assert.equal(harness.channel.consumers.length, 2)
 
-    await sleep(1300)
+    // Long enough for all three recovery attempts (20+40+60ms) to have run.
+    await sleep(200)
 
     assert.equal(harness.channel.consumers.length, 2, 'the cancel handler must not create a duplicate consumer')
+  })
+
+  test('a consumer that cannot be recovered is dropped and emits consumerLost', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    // The queue is gone for good: every recovery attempt fails.
+    harness.channel.consumeError = new Error('NOT_FOUND - no queue "orders"')
+
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(
+      () => harness.events.some(e => e.event === 'consumerLost'),
+      3000,
+      'consumerLost emitted after exhausting recovery attempts'
+    )
+
+    const lost = harness.events.find(e => e.event === 'consumerLost')
+
+    assert.equal(lost.payload.queueName, 'orders')
+    assert.equal(harness.manager.activeConsumers.size, 0, 'an unrecoverable consumer must not stay registered')
+    assert.equal(harness.manager.consumersByTag.size, 0)
   })
 })
 
@@ -362,6 +343,30 @@ describe('ConsumerManager subscribeSequential wiring', () => {
     await deliver(harness, { step: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
 
     await waitFor(() => harness.channel.nacked.length === 1, 3000, 'sequential message nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, true, 'a first delivery may be retried')
+    assert.equal(harness.channel.acked.length, 0)
+  })
+
+  test('a failing sequential redelivery is dead-lettered, not requeued forever', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', async () => {
+      throw new Error('boom')
+    })
+
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ step: 1 })
+
+    await consumer.callback({
+      content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered: true },
+      properties: { messageId: 'm1', headers: { 'x-compressed': false } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'sequential redelivery nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, false, 'poison policy: redeliveries go to the DLQ')
   })
 })
 

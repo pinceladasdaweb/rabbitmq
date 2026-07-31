@@ -20,13 +20,11 @@ class RabbitMQConnection extends EventEmitter {
   #isShuttingDown
   #isReconnecting
   #connectPromise
-  #amqpConnect
 
   constructor (options, logger) {
     super()
 
     this.#logger = logger
-    this.#amqpConnect = options.amqpConnect || ((url, socketOptions) => amqp.connect(url, socketOptions))
     this.#username = options.username
     this.#password = options.password
     this.#protocol = options.protocol || 'amqp'
@@ -98,7 +96,7 @@ class RabbitMQConnection extends EventEmitter {
       try {
         const endpoint = this.#endpoints[this.#currentEndpointIndex]
 
-        this.#connection = await this.#amqpConnect(this.#buildConnectionString(endpoint), {
+        this.#connection = await amqp.connect(this.#buildConnectionString(endpoint), {
           clientProperties: {
             connection_name: this.#connectionName
           }

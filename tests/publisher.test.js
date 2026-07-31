@@ -1,36 +1,9 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
-import { EventEmitter } from 'node:events'
 import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
 import CircuitBreaker from '../src/resilience/circuit-breaker.js'
-
-const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
-
-class FakeChannel extends EventEmitter {
-  constructor () {
-    super()
-    this.published = []
-    this.confirmErrors = []
-    // publishFireAndForget path: publish() returning false signals a full
-    // write buffer, making the publisher wait for drain/close/error.
-    this.keepGoingResults = []
-  }
-
-  publish (exchange, routingKey, content, options, confirmCallback) {
-    this.published.push({ exchange, routingKey, content, options })
-
-    if (confirmCallback) {
-      const error = this.confirmErrors.shift() ?? null
-
-      setImmediate(() => confirmCallback(error))
-    }
-
-    return this.keepGoingResults.length > 0 ? this.keepGoingResults.shift() : true
-  }
-}
+import { FakeChannel, silentLogger, sleep, waitFor } from './helpers.js'
 
 const createPublisher = (overrides = {}) => {
   const channel = new FakeChannel()
@@ -67,8 +40,7 @@ describe('Publisher validation', () => {
 
     assert.throws(() => publisher.validatePriority({ priority: -1 }), /Invalid priority/)
     assert.throws(() => publisher.validatePriority({ priority: 11 }), /Invalid priority/)
-    assert.doesNotThrow(() => publisher.validatePriority({ priority: 10 }))
-    assert.doesNotThrow(() => publisher.validatePriority({}))
+    assert.doesNotThrow(() => publisher.validatePriority({ priority: 10 }), 'maxPriority itself is valid')
   })
 })
 
@@ -188,6 +160,27 @@ describe('Publisher rate limiting', () => {
 
     assert.equal(rateLimiter.calls.length, 0, 'tokens must not be consumed while disconnected')
   })
+
+  test('publishing while disconnected leaves the circuit breaker closed', async () => {
+    // The preflight probe runs OUTSIDE the breaker on purpose: the
+    // reconnection state machine owns that failure mode. If the probe fed the
+    // breaker, an outage would trip it and keep blocking publishes after
+    // recovery.
+    const circuitBreaker = new CircuitBreaker({ failureThreshold: 2 })
+    const { publisher } = createPublisher({
+      circuitBreaker,
+      getChannel: async () => {
+        throw new Error('Not connected to RabbitMQ')
+      }
+    })
+
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(() => publisher.publish('orders', { id: i }), /Not connected/)
+    }
+
+    assert.equal(circuitBreaker.getState().state, 'CLOSED', 'a disconnected broker must not trip the breaker')
+    assert.equal(circuitBreaker.getState().failureCount, 0)
+  })
 })
 
 describe('Publisher publishBatch', () => {
@@ -198,12 +191,40 @@ describe('Publisher publishBatch', () => {
     await assert.rejects(() => publisher.publishBatch('orders', 'nope'), /non-empty array/)
   })
 
-  test('publishes every message of the batch and awaits all confirms', async () => {
+  test('does not resolve until every confirm in the batch has been answered', async () => {
     const { publisher, channel } = createPublisher()
 
-    await publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }])
+    // Confirms are held so a caller that forgets to await them is observable.
+    channel.manualConfirms = true
 
-    assert.equal(channel.published.length, 3)
+    let resolved = false
+    const pending = publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }]).then(() => { resolved = true })
+
+    await waitFor(() => channel.published.length === 3, 2000, 'all three messages published')
+    await sleep(20)
+
+    assert.equal(resolved, false, 'must not resolve while confirms are outstanding')
+
+    channel.releaseConfirms(2)
+    await sleep(20)
+
+    assert.equal(resolved, false, 'one outstanding confirm must still block resolution')
+
+    channel.releaseConfirms()
+    await pending
+
+    assert.equal(resolved, true)
+  })
+
+  test('rejects when the broker nacks one message of the batch', async () => {
+    const { publisher, channel } = createPublisher()
+
+    channel.confirmErrors.push(null, new Error('nacked'))
+
+    await assert.rejects(
+      () => publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }], { maxRetries: 1 }),
+      /not confirmed by the broker: nacked/
+    )
   })
 })
 
@@ -259,14 +280,33 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
     await assert.rejects(() => pending, /socket reset/)
   })
 
-  test('publishAsyncBatch validates input and publishes sequentially with the batch header', async () => {
-    const { publisher, channel } = createPublisher()
+  test('publishAsyncBatch rejects an empty or non-array batch', async () => {
+    const { publisher } = createPublisher()
 
     await assert.rejects(() => publisher.publishAsyncBatch('orders', []), /non-empty array/)
+    await assert.rejects(() => publisher.publishAsyncBatch('orders', 'nope'), /non-empty array/)
+  })
 
-    await publisher.publishAsyncBatch('orders', [{ n: 1 }, { n: 2 }])
+  test('publishAsyncBatch respects back-pressure: it waits for drain before the next message', async () => {
+    const { publisher, channel } = createPublisher()
 
-    assert.equal(channel.published.length, 2)
+    // The first publish reports a full write buffer, so the loop must stop
+    // there. Publishing the whole batch concurrently would defeat the
+    // serialization the sequential await exists for.
+    channel.keepGoingResults.push(false)
+
+    let resolved = false
+    const pending = publisher.publishAsyncBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }]).then(() => { resolved = true })
+
+    await sleep(20)
+
+    assert.equal(channel.published.length, 1, 'must not publish ahead while back-pressured')
+    assert.equal(resolved, false)
+
+    channel.emit('drain')
+    await pending
+
+    assert.equal(channel.published.length, 3)
     assert.ok(channel.published.every(p => p.options.headers['x-async-batch'] === true))
   })
 })

@@ -1,59 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
-import { EventEmitter } from 'node:events'
 import Topology from '../src/messaging/topology.js'
-
-const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
-
-class FakeChannel extends EventEmitter {
-  constructor () {
-    super()
-    this.assertedExchanges = []
-    this.assertedQueues = []
-    this.boundQueues = []
-    this.deletedExchanges = []
-    this.published = []
-    // Failure knobs
-    this.assertExchangeError = null
-    this.assertQueueError = null
-    this.confirmError = null
-    this.returnRoutingKey = null
-  }
-
-  async assertExchange (name, type, options) {
-    if (this.assertExchangeError) throw this.assertExchangeError
-
-    this.assertedExchanges.push({ name, type, options })
-  }
-
-  async assertQueue (name, options) {
-    if (this.assertQueueError) throw this.assertQueueError
-
-    this.assertedQueues.push({ name, options })
-  }
-
-  async bindQueue (queue, exchange, routingKey) {
-    this.boundQueues.push({ queue, exchange, routingKey })
-  }
-
-  async deleteExchange (name) {
-    this.deletedExchanges.push(name)
-  }
-
-  publish (exchange, routingKey, content, options, confirmCallback) {
-    this.published.push({ exchange, routingKey, content, options })
-
-    // basic.return (if configured) arrives before the confirm ack,
-    // mirroring the broker's ordering.
-    if (this.returnRoutingKey) {
-      this.emit('return', { fields: { routingKey: this.returnRoutingKey } })
-    }
-
-    if (confirmCallback) setImmediate(() => confirmCallback(this.confirmError))
-
-    return true
-  }
-}
+import { FakeChannel, silentLogger } from './helpers.js'
 
 const createTopology = (overrides = {}) => {
   const channel = new FakeChannel()
@@ -199,7 +147,11 @@ describe('Topology moveToDeadLetter', () => {
     assert.equal(published.options.headers['x-original-exchange'], 'main-exchange')
     assert.equal(published.options.headers['x-original-routing-key'], 'orders-route')
     assert.equal(published.options.headers.original, true, 'original headers are preserved')
-    assert.ok(published.options.headers['x-death-time'])
+
+    const deathTime = published.options.headers['x-death-time']
+
+    assert.match(deathTime, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, 'x-death-time must be an ISO timestamp')
+    assert.ok(Math.abs(Date.parse(deathTime) - Date.now()) < 60000, 'x-death-time must be the actual death time')
   })
 
   test('falls back to the routing-key convention when the consumer tag is unknown', async () => {
@@ -213,7 +165,7 @@ describe('Topology moveToDeadLetter', () => {
   test('rejects when the broker does not confirm the publish', async () => {
     const { topology, channel } = createTopology()
 
-    channel.confirmError = new Error('channel closed')
+    channel.confirmErrors.push(new Error('channel closed'))
 
     await assert.rejects(() => topology.moveToDeadLetter(buildMessage()), /Failed to move message to dead letter queue/)
   })
