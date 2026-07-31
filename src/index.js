@@ -81,7 +81,8 @@ class RabbitMQ extends EventEmitter {
       connectionName: options.connectionName || 'default_connection',
       reconnectInterval: options.reconnectInterval,
       maxReconnectInterval: options.maxReconnectInterval,
-      maxReconnectAttempts: options.maxReconnectAttempts
+      maxReconnectAttempts: options.maxReconnectAttempts,
+      amqpConnect: options.amqpConnect
     }, this.#logger)
 
     this.#connection.on('connected', () => this.emit('connected'))

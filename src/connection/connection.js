@@ -26,8 +26,6 @@ class RabbitMQConnection extends EventEmitter {
     super()
 
     this.#logger = logger
-    // Testing seam: unit tests inject a fake dialer here; everything else
-    // always dials through amqplib.
     this.#amqpConnect = options.amqpConnect || ((url, socketOptions) => amqp.connect(url, socketOptions))
     this.#username = options.username
     this.#password = options.password
