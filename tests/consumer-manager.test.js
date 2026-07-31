@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { FakeChannel, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
@@ -167,7 +167,63 @@ describe('ConsumerManager manual ack/nack', () => {
     assert.equal(harness.channel.acked.length, 0, 'wrapper must not ack a settled message')
   })
 
-  test('ack failures are rethrown to the caller', async () => {
+  test('a nack that the broker rejects is logged and leaves the message unsettled', async () => {
+    // settleAck only marks the message settled on success: if the channel
+    // rejected the nack the delivery genuinely was not settled, so a later
+    // explicit ack/nack must still be attempted rather than silently skipped.
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('handler exploded')
+    })
+
+    harness.channel.nack = () => {
+      throw new Error('channel gone')
+    }
+
+    const msg = await deliver(harness, { id: 1 })
+
+    assert.ok(
+      logger.records.error.some(message => /Failed to nack message: channel gone/.test(message)),
+      'the failure must be reported'
+    )
+    assert.equal(msg.__ackSettled, false, 'a failed nack must not claim the message was settled')
+  })
+
+  test('manual ack/nack settle on the channel that delivered the message', async () => {
+    // Delivery tags are scoped to their channel, so settlement must go back to
+    // the delivering channel — never to an arbitrary pool channel, which the
+    // broker would answer with PRECONDITION_FAILED and close.
+    const harness = createManager()
+    const delivering = new FakeChannel()
+    const message = { fields: { deliveryTag: 7 }, properties: {} }
+
+    harness.manager.attachAckControls(message, delivering)
+    await harness.manager.ackMessage(message)
+
+    assert.equal(delivering.acked.length, 1, 'the delivering channel settles the message')
+    assert.equal(harness.channel.acked.length, 0, 'a pool channel must not be used')
+    assert.equal(message.__ackSettled, true)
+  })
+
+  test('nack failures are rethrown and leave the message unsettled', async () => {
+    const harness = createManager()
+    const message = {
+      __channel: { nack () { throw new Error('channel gone') } },
+      fields: {},
+      properties: {}
+    }
+
+    await assert.rejects(() => harness.manager.nackMessage(message), /channel gone/)
+    assert.equal(
+      message.__ackSettled,
+      undefined,
+      'a failed nack must not claim settlement, or a later ack/nack would short-circuit'
+    )
+  })
+
+  test('ack failures are rethrown and leave the message unsettled', async () => {
     const harness = createManager()
     const message = {
       __channel: { ack () { throw new Error('channel gone') } },
@@ -176,6 +232,11 @@ describe('ConsumerManager manual ack/nack', () => {
     }
 
     await assert.rejects(() => harness.manager.ackMessage(message), /channel gone/)
+    assert.equal(
+      message.__ackSettled,
+      undefined,
+      'a failed ack must not claim settlement, or a later nack would short-circuit'
+    )
   })
 })
 
@@ -387,6 +448,40 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 3000, 'prefetch raised')
+  })
+
+  test('re-applies the optimized prefetch after a reconnection resets the channel', async () => {
+    // A recreated channel starts back at the initial prefetch, so the
+    // optimizer must push the value it believes in again. Without this the
+    // consumer silently runs at initialPrefetch forever after any reconnect.
+    const harness = createManager()
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20,
+      increaseFactor: 2
+    })
+
+    await deliver(harness, { n: 1 })
+    await sleep(30)
+    await deliver(harness, { n: 2 })
+    await waitFor(() => harness.channel.prefetches.includes(4), 3000, 'prefetch raised to 4')
+
+    // Simulate the reconnection path: recreateAll bumps the consumer's epoch,
+    // and the recreated channel is back at the initial prefetch.
+    harness.channel.prefetches.length = 0
+    await harness.manager.recreateAll()
+
+    assert.deepEqual(harness.channel.prefetches, [2], 'the recreated consumer starts at the initial prefetch')
+
+    // The next delivery must detect the epoch change and restore the value.
+    await deliver(harness, { n: 3 })
+
+    await waitFor(
+      () => harness.channel.prefetches.includes(4),
+      3000,
+      'optimized prefetch re-applied after the epoch change'
+    )
   })
 })
 

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import Rpc from '../src/messaging/rpc.js'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import { EventEmitter } from 'node:events'
 import Publisher from '../src/messaging/publisher.js'
@@ -384,6 +386,10 @@ describe('Rpc request()', () => {
 
     await assert.rejects(() => first, (error) => error.code === 'RPC_CONNECTION_LOST')
     assert.equal(harness.rpc.replyChannel, null, 'the fenced channel must not be installed')
+    // The fenced setup installed its listeners before discovering the epoch
+    // had moved: abandoning the channel without detaching them would leave
+    // them live and let the next rebuild stack another pair on top.
+    assert.equal(harness.replyChannel.listenerCount('return'), 0, 'a fenced setup must leave no return listener behind')
 
     // The lazy rebuild must produce a working consumer afterwards.
     harness.replyChannel.consume = originalConsume
@@ -391,9 +397,171 @@ describe('Rpc request()', () => {
     const second = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
 
     await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'second request published')
+
+    assert.equal(harness.replyChannel.listenerCount('return'), 1, 'exactly one listener set after the rebuild')
+
     await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
 
     assert.deepEqual(await second, { ok: true })
+  })
+})
+
+describe('Rpc reply channel lifecycle', () => {
+  test('rejects when there is no channel pool (not connected)', async () => {
+    const harness = createHarness()
+
+    harness.rpc.getChannelPool = () => null
+
+    await assert.rejects(
+      () => harness.rpc.request('users.get', { id: 1 }, { timeout: 2000 }),
+      /Not connected to RabbitMQ/
+    )
+  })
+
+  test('a broker cancel of the reply consumer rejects in-flight requests and forces a rebuild', async () => {
+    const harness = createHarness()
+
+    const requestPromise = harness.rpc.request('users.get', { id: 1 }, { timeout: 10000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    // The broker delivers a null message to signal basic.cancel.
+    await harness.replyChannel.consumers.at(-1).callback(null)
+
+    await assert.rejects(() => requestPromise, (error) =>
+      error.code === 'RPC_CONNECTION_LOST' && /cancelled by the broker/.test(error.message)
+    )
+    assert.equal(harness.rpc.replyChannel, null, 'the cancelled channel must not be reused')
+
+    // The next request rebuilds the consumer and works end to end.
+    const second = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 2, 2000, 'second request published')
+    assert.equal(harness.replyChannel.consumers.length, 2, 'a fresh reply consumer must be created')
+
+    await deliverReply(harness, harness.replyChannel.published[1].options.correlationId, { ok: true })
+
+    assert.deepEqual(await second, { ok: true })
+  })
+
+  test('repeated broker cancels do not accumulate listeners on the cached channel', async () => {
+    // A basic.cancel leaves the channel OPEN, and the pool caches dedicated
+    // channels by id — so every rebuild lands on the same channel object. If
+    // the previous listeners are not detached first, each cancel adds another
+    // 'return'/'close' pair and they pile up for the lifetime of the process.
+    const harness = createHarness()
+
+    // Wrapped in an object so awaiting this helper cannot adopt (and therefore
+    // wait on) the request promise, which only settles once we cancel it.
+    const issueRequest = async () => {
+      const publishedCount = harness.replyChannel.published.length
+      const pending = harness.rpc.request('users.get', { id: 1 }, { timeout: 5000 })
+
+      pending.catch(() => {})
+
+      await waitFor(() => harness.replyChannel.published.length > publishedCount, 2000, 'request published')
+
+      return { pending }
+    }
+
+    const { pending: first } = await issueRequest()
+
+    await harness.replyChannel.consumers.at(-1).callback(null)
+    await assert.rejects(() => first, (error) => error.code === 'RPC_CONNECTION_LOST')
+
+    const baseline = {
+      return: harness.replyChannel.listenerCount('return'),
+      close: harness.replyChannel.listenerCount('close')
+    }
+
+    // Three more cancel/rebuild cycles must not change the listener counts.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const { pending } = await issueRequest()
+
+      await harness.replyChannel.consumers.at(-1).callback(null)
+      await assert.rejects(() => pending, (error) => error.code === 'RPC_CONNECTION_LOST')
+
+      assert.equal(harness.replyChannel.listenerCount('return'), baseline.return, `cycle ${cycle}: no extra return listener`)
+      assert.equal(harness.replyChannel.listenerCount('close'), baseline.close, `cycle ${cycle}: no extra close listener`)
+    }
+
+    // A connection loss is the other rebuild path and must detach too.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const { pending } = await issueRequest()
+
+      harness.rpc.handleConnectionLoss()
+      await assert.rejects(() => pending, (error) => error.code === 'RPC_CONNECTION_LOST')
+
+      assert.equal(harness.replyChannel.listenerCount('return'), baseline.return, `loss cycle ${cycle}: no extra return listener`)
+      assert.equal(harness.replyChannel.listenerCount('close'), baseline.close, `loss cycle ${cycle}: no extra close listener`)
+    }
+
+    // And the reply route still works after all that churn.
+    const { pending: final } = await issueRequest()
+
+    await deliverReply(harness, harness.replyChannel.published.at(-1).options.correlationId, { ok: true })
+
+    assert.deepEqual(await final, { ok: true })
+  })
+
+  test('a basic.return for an unknown correlationId settles nothing', async () => {
+    const harness = createHarness()
+
+    const requestPromise = harness.rpc.request('users.get', { id: 1 }, { timeout: 5000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    harness.replyChannel.emit('return', {
+      fields: { routingKey: 'someone.else' },
+      properties: { correlationId: 'not-our-request' }
+    })
+    // A malformed return (no properties at all) must not throw either.
+    harness.replyChannel.emit('return', { fields: {} })
+
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
+
+    assert.deepEqual(await requestPromise, { ok: true }, 'the real reply must still settle the request')
+  })
+
+  test('an in-flight RPC timer does not keep the process alive', async (t) => {
+    // The only way to observe the unref: a child process that issues a request
+    // with a 60s timeout must still exit immediately.
+    const probe = fileURLToPath(new URL('./fixtures/rpc-unref-probe.mjs', import.meta.url))
+    const child = spawn(process.execPath, [probe], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    // Reaps the child on every exit path, including an assertion failure.
+    t.after(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    })
+
+    const { code, stdout } = await new Promise((resolve, reject) => {
+      let out = ''
+      let killTimer = null
+
+      // Every settle path clears the timer, or a ref'd 10s timer would hold
+      // the test runner's event loop open long after this test finished.
+      const settle = (fn) => (value) => {
+        clearTimeout(killTimer)
+        fn(value)
+      }
+
+      const succeed = settle(() => resolve({ code: child.exitCode, stdout: out }))
+      const fail = settle(reject)
+
+      killTimer = setTimeout(() => {
+        child.kill('SIGKILL')
+        fail(new Error('the probe did not exit: the RPC timeout timer is keeping the process alive'))
+      }, 10000)
+
+      child.stdout.on('data', (chunk) => { out += chunk })
+      // Draining stderr prevents a deadlock if the probe ever writes a lot.
+      child.stderr.resume()
+      child.on('error', fail)
+      child.on('exit', succeed)
+    })
+
+    assert.equal(code, 0)
+    assert.match(stdout, /EXITED_WITHOUT_WAITING_FOR_TIMEOUT/)
   })
 })
 

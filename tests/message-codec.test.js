@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
-import { silentLogger } from './helpers.js'
+import { recordingLogger, silentLogger } from './helpers.js'
 
 describe('MessageCodec toBuffer/fromBuffer', () => {
   test('passes buffers through untouched', () => {
@@ -69,6 +69,29 @@ describe('MessageCodec compression', () => {
     const { compressed } = await codec.encode({ blob: 'x'.repeat(500) })
 
     assert.equal(compressed, false)
+  })
+
+  test('falls back to the uncompressed payload when gzip fails', async () => {
+    // Compression is an optimization, never a reason to lose a message: a gzip
+    // failure must warn and send the original bytes.
+    const logger = recordingLogger()
+    const codec = new MessageCodec({ logger, useCompression: true, compressionThreshold: 10 })
+    const payload = { blob: 'x'.repeat(500) }
+    const buffer = Buffer.from(JSON.stringify(payload))
+
+    // zlib rejects input it cannot read. Handing compressIfNeeded a
+    // buffer-shaped value that gzip refuses reproduces that failure without
+    // depending on zlib internals.
+    codec.toBuffer = () => Object.assign(Object.create(null), {
+      length: buffer.length,
+      marker: 'original-payload'
+    })
+
+    const { content, compressed } = await codec.encode(payload)
+
+    assert.equal(compressed, false, 'the message must still be publishable')
+    assert.equal(content.marker, 'original-payload', 'the original payload is used unchanged')
+    assert.ok(logger.records.warn.some(message => /Failed to compress message/.test(message)))
   })
 
   test('decode rethrows decompression failures for content flagged as compressed', async () => {

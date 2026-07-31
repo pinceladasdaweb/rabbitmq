@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import { EventEmitter } from 'node:events'
 import ChannelPool from '../src/connection/channel-pool.js'
-import { FakeChannel, silentLogger } from './helpers.js'
+import { FakeChannel, silentLogger, waitFor as waitForCondition } from './helpers.js'
 
 function createFakeChannel () {
   const channel = new EventEmitter()
@@ -193,6 +193,65 @@ describe('ChannelPool', () => {
     assert.equal(pool.channels.length, 0)
     assert.equal(pool.dedicatedChannels.size, 0)
     assert.ok(allChannels.every(channel => channel.closed))
+  })
+
+  test('a pool channel is replaced after a transient failure and returns to rotation', async (t) => {
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1)
+
+    await pool.initialize()
+    // The replacement loop sleeps between attempts; closing the pool stops it.
+    t.after(() => pool.close())
+
+    const original = pool.channels[0]
+    const realCreate = connection.createConfirmChannel
+    let failures = 2
+
+    // The first two replacement attempts fail, the third succeeds.
+    connection.createConfirmChannel = async () => {
+      if (failures-- > 0) throw new Error('connection not ready')
+
+      return realCreate()
+    }
+
+    original.emit('close')
+
+    await waitForCondition(() => pool.channels[0] && pool.channels[0] !== original, 5000, 'channel replaced after retries')
+
+    assert.notEqual(pool.channels[0], original)
+    assert.equal(pool.getChannel(), pool.channels[0], 'the replacement must be back in rotation')
+  })
+
+  test('a replacement that lands after the pool closed is discarded, not left open', async () => {
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1)
+
+    await pool.initialize()
+
+    const original = pool.channels[0]
+    let releaseCreate
+    const gate = new Promise(resolve => { releaseCreate = resolve })
+    const realCreate = connection.createConfirmChannel
+
+    connection.createConfirmChannel = async () => {
+      await gate
+
+      return realCreate()
+    }
+
+    original.emit('close')
+
+    // The pool shuts down while the replacement is still being created.
+    await pool.close()
+    releaseCreate()
+
+    await waitForCondition(() => connection.createdChannels.length === 2, 3000, 'replacement channel created')
+
+    const late = connection.createdChannels[1]
+
+    await waitForCondition(() => late.closed, 3000, 'late replacement closed')
+
+    assert.equal(pool.channels.length, 0, 'a closed pool must not adopt the late channel')
   })
 
   test('close must not strip channel listeners: in-flight publish confirms still settle', async () => {

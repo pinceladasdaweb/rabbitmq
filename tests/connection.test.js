@@ -2,11 +2,11 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import RabbitMQConnection from '../src/connection/connection.js'
 import { installDialer } from './fake-amqp.js'
-import { createDialer, silentLogger, sleep, waitFor } from './helpers.js'
+import { createDialer, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 // The dialer is installed onto amqplib itself (see fake-amqp.js), so nothing
 // test-specific reaches the constructor.
-const createConnection = (t, dialer, options = {}) => {
+const createConnection = (t, dialer, { logger = silentLogger, ...options } = {}) => {
   installDialer(t, dialer)
 
   return new RabbitMQConnection({
@@ -17,7 +17,7 @@ const createConnection = (t, dialer, options = {}) => {
     reconnectInterval: 10,
     maxReconnectInterval: 20,
     ...options
-  }, silentLogger)
+  }, logger)
 }
 
 describe('RabbitMQConnection constructor', () => {
@@ -276,6 +276,40 @@ describe('RabbitMQConnection disconnect', () => {
 
     assert.equal(dialer.dials, dialsAtDisconnect, 'no dials after disconnect')
     assert.equal(connection.getConnectionState(), 'disconnected')
+  })
+
+  test('logs a connection error without tearing the connection down', async (t) => {
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer, { logger })
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    // amqplib emits 'error' before 'close' on a failing socket; the error
+    // handler must only report, since 'close' owns the recovery decision.
+    dialer.connections[0].emit('error', new Error('socket hiccup'))
+
+    assert.ok(logger.records.error.some(message => /Connection error: socket hiccup/.test(message)))
+    assert.equal(connection.getConnectionState(), 'connected', 'error alone must not change state')
+    assert.equal(dialer.dials, 1, 'error alone must not trigger a redial')
+  })
+
+  test('a close() that throws still leaves the instance cleanly disconnected', async (t) => {
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer)
+
+    await connection.connect()
+
+    dialer.connections[0].close = async () => {
+      throw new Error('socket already gone')
+    }
+
+    await connection.disconnect()
+
+    assert.equal(connection.getConnectionState(), 'disconnected')
+    assert.equal(connection.getConnection(), null, 'the dead connection must be released regardless')
   })
 
   test('disconnect on an already disconnected instance is a no-op', async (t) => {
