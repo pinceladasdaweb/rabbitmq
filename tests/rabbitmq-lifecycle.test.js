@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import RabbitMQ from '../src/index.js'
 import { test, describe } from 'node:test'
 import { installDialer } from './fake-amqp.js'
-import { createDialer, recordingLogger, silentLogger, waitFor } from './helpers.js'
+import { createDialer, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 // The dialer is installed onto amqplib itself (see fake-amqp.js): the facade is
 // constructed exactly as a user would construct it.
@@ -62,6 +62,37 @@ describe('RabbitMQ lifecycle (fake dialer)', () => {
     assert.equal(dialer.connections[0].channels.length, 2, 'a second pool would leak channelPoolSize channels')
   })
 
+  test('connect() on an already connected instance is a cheap no-op', async (t) => {
+    // Apps call connect() defensively (startup paths, health checks). A
+    // redundant call must not tear down and rebuild a healthy pool, nor
+    // recreate consumers — which would duplicate every delivery.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    const received = []
+
+    await rabbit.subscribe('orders', async (content) => received.push(content))
+
+    const channelsBefore = dialer.connections[0].channels.length
+    const consumersBefore = dialer.connections[0].consumersOn().length
+
+    await rabbit.connect()
+
+    assert.equal(dialer.dials, 1, 'no second dial')
+    assert.equal(dialer.connections[0].channels.length, channelsBefore, 'the pool must not be rebuilt')
+    assert.equal(dialer.connections[0].consumersOn().length, consumersBefore, 'consumers must not be recreated')
+
+    for (const consumer of dialer.connections[0].consumersOn()) {
+      await deliverTo(consumer, { n: 1 })
+    }
+
+    assert.deepEqual(received, [{ n: 1 }], 'a single delivery must be handled once')
+  })
+
   test('publish and subscribe work end to end over the fake broker', async (t) => {
     const dialer = createDialer()
     const rabbit = createRabbit(t, dialer)
@@ -114,6 +145,256 @@ describe('RabbitMQ lifecycle (fake dialer)', () => {
     await rabbit.publish('orders-route', { after: 'reconnect' })
 
     assert.equal(dialer.connections[1].publishedOn().length, 1, 'publishing resumes on the new pool')
+  })
+
+  test('a manual connect() that beats the reconnection timer still recreates consumers', async (t) => {
+    // Regression: recreateAll() used to hang off the 'reconnected' event, which
+    // only the automatic timer emits. A user calling connect() first rebuilt
+    // the pool — so publishing looked healthy — while every consumer stayed on
+    // channels of the dead connection and the queues silently stopped draining.
+    const dialer = createDialer()
+    // Long enough that the automatic retry cannot win the race.
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 5000, maxReconnectInterval: 5000 })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    const received = []
+
+    await rabbit.subscribe('orders', async (content) => received.push(content))
+
+    assert.equal(dialer.connections[0].consumersOn().length, 1)
+
+    const disconnected = new Promise(resolve => rabbit.once('disconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await disconnected
+
+    // The user reconnects by hand before the scheduled retry fires.
+    const connection = await rabbit.connect()
+
+    assert.ok(connection)
+    assert.equal(dialer.connections.length, 2, 'a fresh connection was dialed')
+    assert.equal(dialer.connections[1].consumersOn().length, 1, 'the consumer must be recreated')
+
+    // And it must actually deliver again, not merely exist.
+    await deliverTo(dialer.connections[1].consumersOn()[0], { afterManualConnect: true })
+
+    assert.deepEqual(received, [{ afterManualConnect: true }])
+  })
+
+  test('a manual connect() racing the reconnection timer restores state exactly once', async (t) => {
+    // Both recovery paths can be in flight at once: the timer's attempt and a
+    // user connect() share the connection-level mutex, so they resolve
+    // together and would each rebuild the pool (leaking one) and re-run
+    // recreateAll (issuing channel.consume twice per consumer, duplicating
+    // every delivery).
+    const dialer = createDialer()
+    const realConnect = dialer.connect
+    let gate = null
+    let dialAttempts = 0
+
+    // Wrapped before createRabbit installs it, since the dialer function is
+    // captured at install time. The counter lives here because dialer.dials
+    // only advances once the gate lets a dial through.
+    dialer.connect = async (...args) => {
+      dialAttempts++
+
+      if (gate) await gate
+
+      return realConnect(...args)
+    }
+
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 10, maxReconnectInterval: 10 })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    let releaseDial
+    gate = new Promise(resolve => { releaseDial = resolve })
+
+    const disconnected = new Promise(resolve => rabbit.once('disconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await disconnected
+
+    // Let the reconnection timer fire and park on the gated dial.
+    await waitFor(() => dialAttempts === 2, 3000, 'automatic retry parked on the gated dial')
+
+    // The user connects by hand while that attempt is still in flight.
+    const manual = rabbit.connect()
+
+    releaseDial()
+    await manual
+    // Give the timer path's own restore a chance to run too.
+    await waitFor(() => dialer.connections.length === 2, 3000, 'recovery connection established')
+    await sleep(80)
+
+    assert.equal(dialer.connections[1].consumersOn().length, 1, 'the consumer must be recreated exactly once')
+    // channelPoolSize (2) pool channels plus the consumer's dedicated channel.
+    // A second restore would build another pool and leak its channels here.
+    assert.equal(dialer.connections[1].channels.length, 3, 'exactly one channel pool was built')
+  })
+
+  test('a manual connect() that STARTS the dial, with the timer joining, restores once', async (t) => {
+    // The mirror image of the test above, and the ordering that the caller-side
+    // `if (!this.#channelPool)` guard cannot cover: the manual connect restores
+    // first, then the timer's 'reconnected' reaches #handleReconnection — which
+    // has no pool check — and would recreate every consumer a second time,
+    // making the broker deliver each message twice.
+    const dialer = createDialer()
+    const realConnect = dialer.connect
+    let gate = null
+    let dialAttempts = 0
+
+    dialer.connect = async (...args) => {
+      dialAttempts++
+
+      if (gate) await gate
+
+      return realConnect(...args)
+    }
+
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 60, maxReconnectInterval: 60 })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    const received = []
+
+    await rabbit.subscribe('orders', async (content) => received.push(content))
+
+    let releaseDial
+    gate = new Promise(resolve => { releaseDial = resolve })
+
+    const disconnected = new Promise(resolve => rabbit.once('disconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await disconnected
+
+    // The user connects by hand first; that dial parks on the gate.
+    const manual = rabbit.connect()
+
+    await waitFor(() => dialAttempts === 2, 3000, 'manual dial parked on the gate')
+
+    // Now the reconnection timer fires and joins the same in-flight dial.
+    await sleep(150)
+
+    releaseDial()
+    await manual
+    await sleep(150)
+
+    assert.equal(dialer.connections.length, 2, 'exactly one recovery connection')
+    assert.equal(dialer.connections[1].consumersOn().length, 1, 'consumer recreated exactly once')
+    assert.equal(dialer.connections[1].channels.length, 3, 'exactly one channel pool built')
+
+    // The damage a duplicate consumer causes, asserted directly.
+    for (const consumer of dialer.connections[1].consumersOn()) {
+      await deliverTo(consumer, { n: 1 })
+    }
+
+    assert.deepEqual(received, [{ n: 1 }], 'a single broker delivery must be handled once')
+  })
+
+  test('a restore interrupted by another disconnection is not reused for the next connection', async (t) => {
+    // A flapping broker: the connection dies again while the recovery is still
+    // building its pool. The in-flight restore belongs to that dead connection,
+    // so the next recovery must start its own — otherwise it joins the stale
+    // one, concludes state was restored, and leaves the instance with no pool
+    // and no consumers while reporting itself connected.
+    const dialer = createDialer()
+    let releaseChannels
+    const channelGate = new Promise(resolve => { releaseChannels = resolve })
+
+    // Only the FIRST recovery connection stalls while creating channels.
+    dialer.onConnection = (connection) => {
+      if (dialer.connections.length !== 2) return
+
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        await channelGate
+
+        return realCreate()
+      }
+    }
+
+    const rabbit = createRabbit(t, dialer, { channelPoolSize: 1 })
+
+    t.after(() => {
+      releaseChannels()
+
+      return rabbit.disconnect()
+    })
+
+    await rabbit.connect()
+
+    const received = []
+
+    await rabbit.subscribe('orders', async (content) => received.push(content))
+
+    // First drop: recovery reaches connection 2 and stalls mid-restore.
+    dialer.connections[0].emit('close')
+    await waitFor(() => dialer.connections.length === 2, 3000, 'first recovery connection dialed')
+
+    // Second drop while that restore is still stuck.
+    dialer.connections[1].emit('close')
+    await waitFor(() => dialer.connections.length === 3, 3000, 'second recovery connection dialed')
+
+    releaseChannels()
+
+    const healthy = dialer.connections[2]
+
+    await waitFor(() => healthy.consumersOn().length === 1, 3000, 'consumer restored on the live connection')
+
+    assert.equal(healthy.channels.length, 2, 'the live connection needs its pool channel plus the consumer channel')
+
+    // The instance must be genuinely usable again, not merely "connected".
+    await rabbit.publish('orders-route', { recovered: true })
+
+    assert.equal(healthy.publishedOn().length, 1)
+
+    await deliverTo(healthy.consumersOn()[0], { n: 1 })
+
+    assert.deepEqual(received, [{ n: 1 }], 'exactly one consumer is attached')
+  })
+
+  test('a manual connect() during recovery also resets the circuit breaker', async (t) => {
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, {
+      reconnectInterval: 5000,
+      maxReconnectInterval: 5000,
+      circuitBreaker: { failureThreshold: 2 }
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    for (const channel of dialer.connections[0].channels) {
+      channel.confirmErrors.push(new Error('broker down'), new Error('broker down'))
+    }
+
+    await assert.rejects(() => rabbit.publish('orders-route', { n: 1 }, { maxRetries: 1 }))
+    await assert.rejects(() => rabbit.publish('orders-route', { n: 2 }, { maxRetries: 1 }))
+    assert.equal(rabbit.getCircuitBreakerState().state, 'OPEN')
+
+    const disconnected = new Promise(resolve => rabbit.once('disconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await disconnected
+
+    await rabbit.connect()
+
+    assert.equal(rabbit.getCircuitBreakerState().state, 'CLOSED', 'a manual recovery must unblock publishing too')
+
+    await rabbit.publish('orders-route', { n: 3 })
+
+    assert.equal(dialer.connections[1].publishedOn().length, 1)
   })
 
   test('the circuit breaker is reset after a successful reconnection', async (t) => {
