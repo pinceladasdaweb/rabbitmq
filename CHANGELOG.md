@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.4.0 (2026-08-01)
+
+* feat(minor): explicit retryPolicy option for every subscribe method by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/6b96cdc39ecb83096fffc84e1c715659579fde89)
+* feat(minor): drop the deprecated setupGracefulShutdown alias and close the coverage gaps by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/94d492462cef15259d712c2513e06780b6312b4b)
+* fix: make processDeadLetterQueue honor retryPolicy instead of ignoring it by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/80e100d08896876c7528d7f1e65cd9190b005974)
+* fix(test): hold the event loop open in the facade's RPC timeout test by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/9c1fb48261cca9433f0a23b80eccb8c36b0b187e)
+
+
 ## 1.3.1 (2026-07-31)
 
 * test: unit-cover topology and connection with injectable fakes by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/448b3aa6b921a0a4dd9e7e3cb9bff98506dc7620)
