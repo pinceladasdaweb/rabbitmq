@@ -112,6 +112,23 @@ describe('RateLimiter', () => {
       assert.equal(await limiter.checkRateLimit('key-a'), true)
       assert.equal(await limiter.checkRateLimit('key-a'), false)
     })
+
+    test('an exhausted key is allowed again once its window rolls over', async (t) => {
+      // Same technique as the getStatus test below: windowMs stays large so
+      // the periodic sweep cannot delete the entry, and the elapsed window is
+      // simulated by rewriting windowStart. This exercises the reset branch
+      // inside checkRateLimit, not a missing-entry path.
+      const limiter = new RateLimiter({ strategy: 'fixed-window', maxRequests: 2, windowMs: 60000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(await limiter.checkRateLimit('key-a', 2), true)
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'window is exhausted')
+
+      limiter.requests.get('key-a').windowStart -= 60000
+
+      assert.equal(await limiter.checkRateLimit('key-a'), true, 'the new window starts from zero')
+      assert.equal(limiter.requests.get('key-a').count, 1, 'the old count was discarded, not carried over')
+    })
   })
 
   describe('sliding-window', () => {

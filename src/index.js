@@ -151,11 +151,6 @@ class RabbitMQ extends EventEmitter {
     }
   }
 
-  setupGracefulShutdown () {
-    this.#logger.warn('setupGracefulShutdown() is deprecated. Use enableGracefulShutdown() instead.')
-    this.enableGracefulShutdown()
-  }
-
   // Everything that must be rebuilt on top of a fresh connection. Both entry
   // points funnel through here — the automatic reconnection AND an explicit
   // connect() that lands while the previous connection is gone — because

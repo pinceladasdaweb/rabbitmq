@@ -129,6 +129,81 @@ const deliverReply = async (harness, correlationId, payload, extraHeaders = {}) 
 }
 
 describe('Rpc request()', () => {
+  test('reuses one reply consumer across requests instead of consuming again', async () => {
+    // The reply channel is set up lazily on the first request. Consuming the
+    // direct reply-to pseudo-queue a second time on the same channel is a
+    // protocol error, so the cached-channel short circuit is load-bearing.
+    const harness = createHarness()
+
+    const first = harness.rpc.request('users.get', { id: 1 }, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'first request published')
+
+    const second = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 2, 2000, 'second request published')
+
+    assert.equal(harness.replyChannel.consumers.length, 1, 'consume was issued exactly once')
+
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { n: 1 })
+    await deliverReply(harness, harness.replyChannel.published[1].options.correlationId, { n: 2 })
+
+    assert.deepEqual(await first, { n: 1 })
+    assert.deepEqual(await second, { n: 2 })
+  })
+
+  test('uses the default timeout when the caller does not set one', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', { id: 1 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    // 30s default, expressed as the per-message TTL.
+    assert.equal(harness.replyChannel.published[0].options.expiration, '30000')
+
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
+
+    assert.deepEqual(await pending, { ok: true })
+  })
+
+  test('a reply with no correlationId is discarded, settling nothing', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', { id: 1 }, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    await deliverReply(harness, undefined, { stray: true })
+
+    const correlationId = harness.replyChannel.published[0].options.correlationId
+
+    await deliverReply(harness, correlationId, { ok: true })
+
+    assert.deepEqual(await pending, { ok: true }, 'the uncorrelated reply never settled the request')
+  })
+
+  test('an error envelope with no message still rejects with a usable reason', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', { id: 1 }, { timeout: 2000 })
+      .then(() => null, (error) => error)
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    await deliverReply(
+      harness,
+      harness.replyChannel.published[0].options.correlationId,
+      {},
+      { 'x-rpc-error': true }
+    )
+
+    const error = await pending
+
+    assert.equal(error.code, 'RPC_RESPONDER_ERROR')
+    assert.match(error.message, /RPC responder failed/)
+  })
+
   test('resolves with the correlated reply and wires direct reply-to properties', async () => {
     const harness = createHarness()
 

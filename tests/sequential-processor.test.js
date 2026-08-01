@@ -125,6 +125,27 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(consulted, [{ messageId: 'bad', reason: 'boom' }], 'the policy sees the failing message and its error')
   })
 
+  test('a failing message with no messageId is still reported and settled', async (t) => {
+    // messageId is optional: dependency tracking needs it, plain processing
+    // does not. The failure path must not assume it exists.
+    const errors = []
+    const { processor, nacked } = createProcessor(t, {
+      callback: async () => { throw new Error('boom') },
+      options: { logger: { ...silentLogger, error: (line) => errors.push(line) } }
+    })
+
+    await processor.handle({}, { properties: {}, fields: {} })
+
+    assert.equal(nacked.length, 1)
+    assert.ok(errors.some(line => line.includes('(no messageId)')))
+  })
+
+  test('falls back to the default stale timeout when none is given', async (t) => {
+    const { processor } = createProcessor(t, { options: { staleTimeout: undefined } })
+
+    assert.equal(processor.staleTimeout, 30000)
+  })
+
   test('settles a failing message with requeue false when the policy refuses', async (t) => {
     const { processor, acked, nacked } = createProcessor(t, {
       callback: async () => { throw new Error('boom') },

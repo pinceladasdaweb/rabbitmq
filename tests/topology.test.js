@@ -130,6 +130,25 @@ describe('Topology moveToDeadLetter', () => {
     properties: { headers: { original: true } }
   })
 
+  test('falls back to the routing-key convention when no tag resolver is wired', async () => {
+    // Topology defaults getQueueNameByConsumerTag to () => null when the
+    // context omits it, so a message moved by a standalone Topology still
+    // resolves a DLQ instead of throwing on an undefined lookup.
+    const channel = new FakeChannel()
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => channel,
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    await topology.moveToDeadLetter(buildMessage())
+
+    assert.equal(channel.published[0].routingKey, 'orders-route_dlq')
+  })
+
   test('publishes to the DLQ resolved through the consumer tag with tracking headers', async () => {
     const { topology, channel } = createTopology({
       getQueueNameByConsumerTag: (tag) => (tag === 'tag-1' ? 'orders' : null)

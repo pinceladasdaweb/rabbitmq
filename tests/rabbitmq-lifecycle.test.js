@@ -585,26 +585,6 @@ describe('RabbitMQ graceful shutdown', () => {
       'shutdown failure logged'
     )
   })
-
-  test('setupGracefulShutdown warns and delegates to enableGracefulShutdown', async (t) => {
-    const logger = recordingLogger()
-    const dialer = createDialer()
-    const rabbit = createRabbit(t, dialer, { logger })
-
-    // The delegation target is replaced so the alias cannot install real
-    // SIGINT/SIGTERM handlers in the test runner process — with the default
-    // exitProcess: true, a CI cancellation would exit 0 and mask the failure.
-    const calls = []
-
-    rabbit.enableGracefulShutdown = (...args) => calls.push(args)
-
-    rabbit.setupGracefulShutdown()
-
-    assert.equal(calls.length, 1, 'the alias must delegate, not merely warn')
-    assert.ok(logger.records.warn.some(message => /deprecated/.test(message)))
-    assert.equal(process.listenerCount('SIGINT'), 0, 'no real signal handler may leak into the runner')
-    assert.equal(process.listenerCount('SIGTERM'), 0)
-  })
 })
 
 describe('RabbitMQ cache (fake dialer)', () => {
