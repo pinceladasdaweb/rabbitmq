@@ -1059,11 +1059,14 @@ See [`examples/23 - request-response`](examples/23%20-%20request-response) for a
     ```
 
 - **processDeadLetterQueue(originalQueueName, processor, options?)** `{Promise<void>}`
-  - Processes messages from a dead letter queue.
+  - Processes messages from a dead letter queue (`${originalQueueName}_dlq`).
   - Parameters:
     - **originalQueueName** `{string}`: Original queue name
     - **processor** `{Function}`: Processing function
-    - **options** `{Object}`: Consumer options
+    - **options** `{Object}`: Consumer options, including **retryPolicy** — see [Failure policy](#failure-policy-retrypolicy)
+  - A processor failure is logged and then settled under the subscription's `retryPolicy`, like any other consumer. Two things are worth knowing about what that means on a DLQ:
+    - `createQueue()` declares the DLQ **without a dead letter exchange of its own**, so the default `'none'` discards a message its processor could not handle. Declare the DLQ yourself with an `x-dead-letter-exchange` if failures must be preserved.
+    - `'once'` gives the processor a second attempt before the message is discarded — useful when the processor republishes to another system that can be briefly unavailable.
   - Example:
     ```javascript
     await rabbitMQ.processDeadLetterQueue('my-queue', async (message) => {

@@ -513,6 +513,16 @@ class RabbitMQ extends EventEmitter {
         await processor(message)
       } catch (error) {
         this.#logger.error(`Error processing dead letter message: ${error.message}`)
+
+        // Rethrown so this behaves like every other subscription: swallowing
+        // here made retryPolicy a silent no-op on this method alone.
+        //
+        // The default 'none' keeps the previous outcome. createQueue declares
+        // `${queue}_dlq` with no dead letter exchange of its own, so a nack
+        // without requeue discards the message exactly as the old ack did —
+        // only now 'once' can buy the processor a retry, and a DLQ the caller
+        // gave its own DLX routes onward instead of vanishing.
+        throw error
       }
     }, options)
 

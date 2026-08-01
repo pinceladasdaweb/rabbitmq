@@ -187,9 +187,9 @@ describe('RabbitMQ facade topology delegation', () => {
     await waitFor(() => seen.length === 1, 3000, 'dead letter processed')
   })
 
-  test('processDeadLetterQueue logs a failing processor and still acks', async (t) => {
-    // A dead letter that cannot be processed has nowhere further to go:
-    // rethrowing would nack it back into the same DLQ forever.
+  test('processDeadLetterQueue reports a failing processor and settles under the policy', async (t) => {
+    // Default 'none': the message is discarded, which is what a nack without
+    // requeue means on a DLQ that has no dead letter exchange of its own.
     const logger = recordingLogger()
     const { rabbit, connection } = await connected(t, { logger })
 
@@ -200,10 +200,29 @@ describe('RabbitMQ facade topology delegation', () => {
     const channel = connection.channels.find(c => c.consumers.length)
 
     await deliverTo(channel.consumers.at(-1), { id: 1 })
-    await waitFor(() => channel.acked.length === 1, 3000, 'dead letter acked despite the failure')
+    await waitFor(() => channel.nacked.length === 1, 3000, 'dead letter settled')
 
-    assert.equal(channel.nacked.length, 0, 'never nacked back into the DLQ')
+    assert.equal(channel.nacked[0].requeue, false)
+    assert.equal(channel.acked.length, 0, 'a failed processor must not report success')
     assert.ok(logger.records.error.some(line => line.includes('processor exploded')))
+  })
+
+  test('processDeadLetterQueue honors retryPolicy instead of silently ignoring it', async (t) => {
+    // Regression: the wrapper used to swallow every processor error, so the
+    // callback never threw and the option documented for this method did
+    // nothing at all.
+    const { rabbit, connection } = await connected(t)
+
+    await rabbit.processDeadLetterQueue('orders', async () => {
+      throw new Error('processor exploded')
+    }, { retryPolicy: 'once' })
+
+    const channel = connection.channels.find(c => c.consumers.length)
+
+    await deliverTo(channel.consumers.at(-1), { id: 1 })
+    await waitFor(() => channel.nacked.length === 1, 3000, 'dead letter settled')
+
+    assert.equal(channel.nacked[0].requeue, true, 'the first delivery is retried')
   })
 
   test('setupDelayExchange, setupDelayPlugin and isDelayPluginEnabled reach the broker', async (t) => {
