@@ -46,6 +46,21 @@ const lastConsumer = (connection) => {
   return channels.at(-1).consumers.at(-1)
 }
 
+// Node 22's test runner cancels a test whose only pending work is an unref'd
+// timer ('Promise resolution is still pending but the event loop has already
+// resolved') — and the RPC timeout timer is deliberately unref'd. One cancelled
+// test takes the whole file down with cancelledByParent, so a ref'd interval
+// holds the loop open while a purely timeout-driven assertion runs.
+const withLiveEventLoop = async (run) => {
+  const keepAlive = setInterval(() => {}, 50)
+
+  try {
+    return await run()
+  } finally {
+    clearInterval(keepAlive)
+  }
+}
+
 const deliverTo = (consumer, payload, properties = {}) => consumer.callback({
   content: Buffer.from(JSON.stringify(payload)),
   fields: { consumerTag: consumer.consumerTag, deliveryTag: 1 },
@@ -298,8 +313,9 @@ describe('RabbitMQ facade RPC delegation', () => {
   test('request rejects with RPC_TIMEOUT when no reply arrives', async (t) => {
     const { rabbit } = await connected(t)
 
-    const error = await rabbit.request('nowhere', { ping: 1 }, { timeout: 60 })
-      .then(() => null, (err) => err)
+    const error = await withLiveEventLoop(() =>
+      rabbit.request('nowhere', { ping: 1 }, { timeout: 60 }).then(() => null, (err) => err)
+    )
 
     assert.equal(error.code, 'RPC_TIMEOUT')
   })
