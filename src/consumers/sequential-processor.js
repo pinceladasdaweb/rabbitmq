@@ -5,6 +5,10 @@ class SequentialProcessor {
     this.staleTimeout = options.staleTimeout || 30000
     this.onSuccess = options.onSuccess
     this.onFailure = options.onFailure
+    // Supplied by ConsumerManager so the retry policy is decided in one place
+    // for every consumption path. Defaults to never requeueing, which is the
+    // safe answer when this processor is built directly.
+    this.shouldRequeue = options.shouldRequeue ?? (() => false)
     this.processing = new Map()
     this.pending = new Map()
     // Secondary index (dependsOn -> Set of pending messageIds) so releasing
@@ -86,18 +90,7 @@ class SequentialProcessor {
         this.processing.delete(messageId)
       }
 
-      // Bounded retry, unlike subscribe() which never requeues: a first
-      // delivery may be retried, but a redelivery that fails again is
-      // dead-lettered. Without the redelivered check an always failing
-      // callback hot-loops (nack -> requeue -> redeliver -> nack).
-      //
-      // Caveat: the broker sets `redelivered` on ANY requeue, not just ours
-      // (an unacked message returned after a connection drop arrives
-      // redelivered too), so such a message gets no retry at all. AMQP offers
-      // no redelivery counter on classic queues; set `error.retryable = false`
-      // to opt out of retrying explicitly, or use a quorum queue's
-      // x-delivery-count if you need a true attempt budget.
-      const requeue = error.retryable !== false && !message.fields?.redelivered
+      const requeue = this.shouldRequeue(message, error)
 
       this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${error.message}`)
       this.onFailure(message, error, requeue)
@@ -128,7 +121,7 @@ class SequentialProcessor {
 
     // A stale processing entry is bookkeeping only: it does not release its
     // dependents (the dependency never actually completed) — they expire via
-    // the rule below, requeueing on first expiry and dead-lettering redeliveries.
+    // the rule below and are settled under the subscription's retry policy.
     for (const [messageId, data] of this.processing.entries()) {
       if (now - data.startTime > this.staleTimeout) {
         this.logger?.warn(`Removing stale processing entry for message ${messageId}`)
@@ -140,12 +133,14 @@ class SequentialProcessor {
       if (now - data.queuedAt > this.staleTimeout) {
         this.#removePending(messageId, data.dependsOn)
 
-        // First expiry goes back to the queue; if the message is already a
-        // redelivery, dead-letter it instead of creating an infinite loop.
-        const requeue = !data.message.fields?.redelivered
+        // Same retry policy as a handler failure: under 'once' a first expiry
+        // goes back to the queue (the dependency may arrive later), a
+        // redelivery is dead-lettered instead of looping forever.
+        const error = new Error(`Dependency ${data.dependsOn} was never resolved`)
+        const requeue = this.shouldRequeue(data.message, error)
 
         this.logger?.warn(`Pending message ${messageId} timed out waiting for ${data.dependsOn}. ${requeue ? 'Requeueing' : 'Dead-lettering'}`)
-        this.onFailure(data.message, new Error(`Dependency ${data.dependsOn} was never resolved`), requeue)
+        this.onFailure(data.message, error, requeue)
       }
     }
   }

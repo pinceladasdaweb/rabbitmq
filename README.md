@@ -629,6 +629,7 @@ All examples share their connection settings through [examples/config.mjs](examp
 | 21 | [consumer-management](examples/21%20-%20consumer-management) | `unsubscribe()`, consumer lifecycle events, `enableGracefulShutdown()`, `connect({ waitForConnection })` |
 | 22 | [native-dead-letter](examples/22%20-%20native-dead-letter) | Built-in DLQ support: `createQueue()`, `moveToDeadLetter()`, `processDeadLetterQueue()` |
 | 23 | [request-response](examples/23%20-%20request-response) | Distributed RPC over direct reply-to: `request()`, `respond()`, timeouts and error envelopes |
+| 24 | [retry-policy](examples/24%20-%20retry-policy) | `retryPolicy: 'none'` vs `'once'` side by side, plus the `error.retryable = false` opt-out |
 
 ## Available Methods
 
@@ -758,12 +759,70 @@ All examples share their connection settings through [examples/config.mjs](examp
 
 ### Message Consumption
 
+#### Failure policy (`retryPolicy`)
+
+Every subscribe method accepts `retryPolicy`, which decides what happens to a message whose processing threw:
+
+| Value | Behaviour |
+| --- | --- |
+| `'none'` | Nack without requeue — the message goes straight to the DLQ. No retries. |
+| `'once'` | A first delivery is requeued and retried. A delivery already marked `redelivered` is dead-lettered instead, so a permanently failing message can never hot-loop. |
+
+Defaults preserve each method's historical behaviour:
+
+| Method | Default |
+| --- | --- |
+| `subscribe` | `'none'` |
+| `subscribeWithOptimizedPrefetch` | `'none'` |
+| `subscribeParallel` | `'none'` |
+| `respond` (RPC) | `'none'` |
+| `processDeadLetterQueue` | `'none'` |
+| `subscribeSequential` | `'once'` |
+
+```javascript
+// Handler is idempotent — a transient failure is worth one retry.
+await rabbitMQ.subscribe('orders', handleOrder, { retryPolicy: 'once' })
+
+// Ordering matters more than the retry.
+await rabbitMQ.subscribeSequential('steps', handleStep, { retryPolicy: 'none' })
+```
+
+A handler can decline the retry per message by marking the error:
+
+```javascript
+await rabbitMQ.subscribe('orders', async (message) => {
+  if (!isValid(message)) {
+    const error = new Error('Malformed payload')
+    error.retryable = false // permanent: skip the retry, dead-letter it now
+
+    throw error
+  }
+
+  await processOrder(message)
+}, { retryPolicy: 'once' })
+```
+
+The policy is a **ceiling**: `error.retryable = false` opts out of a retry, but `retryable = true` does not create one under `'none'`. An unrecognized value throws at subscribe time rather than silently falling back.
+
+Things worth knowing before choosing `'once'`:
+
+- **The retry is immediate, with no backoff.** If the failure is a dependency that is down for a few seconds, the redelivery happens within milliseconds and fails again — reaching the DLQ anyway. The retry helps with instantaneous blips, not outages.
+- **A requeue means the message may be processed twice.** Only choose `'once'` when the handler is idempotent, or when a partially applied side effect can safely be reapplied.
+- **The broker sets `redelivered` on *any* requeue, not just ours.** An unacked message returned to the queue after a connection drop arrives already marked, so an infrastructure event can consume the retry budget before the handler ever fails. AMQP has no redelivery counter on classic queues — use a [quorum queue](https://www.rabbitmq.com/docs/quorum-queues)'s `x-delivery-count` if you need a true attempt budget.
+- **On `subscribeSequential`, a retry can break ordering.** The requeued message returns to the queue while later messages keep being processed.
+- **On `respond` (RPC), a retry re-runs the responder.** The staleness guard drops requests past their deadline, but a fast retry within the deadline executes the handler a second time.
+- **Decode failures follow the policy too.** They are deterministic, so under `'once'` an undecodable message costs one pointless redelivery before the DLQ.
+- **`noAck: true` makes the policy moot.** Nothing is acknowledged, so there is no nack to requeue — the broker considers the message delivered the moment it leaves the queue.
+
+See [`examples/24 - retry-policy`](examples/24%20-%20retry-policy) for a runnable demo that puts both policies and the opt-out side by side on the same failing payload.
+
 - **subscribe(queueName, callback, options?)** `{Promise<Object>}`
   - Basic message consumption with automatic acknowledgment.
   - Parameters:
     - **queueName** `{string}`: Queue to consume from
     - **callback** `{Function}`: Message handling function
-    - **options** `{Object}`: Consumption options
+    - **options** `{Object}`: Consumption options, including:
+      - **retryPolicy** `{'none'|'once'}`: Failure policy (default: `'none'`) — see [Failure policy](#failure-policy-retrypolicy)
   - Returns the consumer object — keep its `consumerTag` if you plan to call `unsubscribe()` later.
   - Example:
     ```javascript
@@ -840,12 +899,15 @@ All examples share their connection settings through [examples/config.mjs](examp
   - Parameters:
     - **queueName** `{string}`: Queue to consume from
     - **callback** `{Function}`: Message handling function
-    - **options** `{Object}`: Consumption options
+    - **options** `{Object}`: Consumption options, including:
+      - **retryPolicy** `{'none'|'once'}`: Failure policy (default: `'once'` — the only method that retries by default) — see [Failure policy](#failure-policy-retrypolicy)
+      - **staleTimeout** `{number}`: How long a message may wait for its dependency before being settled under the retry policy (default: `30000`)
   - Message Dependency Format:
     - Messages must include messageId in properties
     - Dependencies specified in headers['depends-on']
   - Notes:
     - Messages are acknowledged only after they are actually processed. Messages parked waiting for a dependency stay unacknowledged.
+    - This is the only subscribe method that defaults to `retryPolicy: 'once'`. The requeued message goes back to the queue while later ones keep being processed, so the retry can break the ordering this method exists to provide — pass `'none'` when order matters more than the retry.
     - Dependency reordering requires `prefetchCount` greater than `1` (default is `1`, which is strictly sequential). Use e.g. `{ prefetchCount: 5 }` so dependent messages can be buffered while their dependency is being processed.
   - Example:
     ```javascript
@@ -907,6 +969,7 @@ Distributed request/response built on RabbitMQ's [direct reply-to](https://www.r
   - Error handling follows the poison-message policy:
     - default: a handler crash nacks the request to the DLQ (no hot requeue loops) and the requester surfaces the failure through its timeout;
     - `{ replyOnError: true }`: the error is published back as a structured envelope and the requester rejects immediately with `RPC_RESPONDER_ERROR`.
+  - `retryPolicy` defaults to `'none'` here and is best left alone: a retry re-runs the responder. The staleness guard drops requests past their deadline, but a redelivery that lands within the deadline executes the handler a second time.
   - A reply-transport failure after a **successful** handler never dead-letters the request (a DLQ replay would re-run committed side effects): the responder falls back to an error envelope (e.g. when the result is not serializable, the requester fails fast with `RPC_RESPONDER_ERROR`), and if even that cannot be published the request is acked and the requester's timeout takes over.
   - Responders are regular consumers: they are recreated automatically after a reconnection.
   - Parameters:

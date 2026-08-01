@@ -445,6 +445,158 @@ describe('ConsumerManager subscribeSequential wiring', () => {
   })
 })
 
+describe('ConsumerManager retryPolicy', () => {
+  const deliverFailing = async (harness, { redelivered = false, retryable } = {}) => {
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ step: 1 })
+
+    await consumer.callback({
+      content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered },
+      properties: { messageId: 'm1', headers: { 'x-compressed': false } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'message nacked')
+
+    return harness.channel.nacked[0].requeue
+  }
+
+  const failing = (retryable) => async () => {
+    const error = new Error('boom')
+
+    if (retryable !== undefined) error.retryable = retryable
+
+    throw error
+  }
+
+  test("subscribe defaults to 'none': a failure goes straight to the DLQ", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing())
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("subscribe with 'once' retries a first delivery", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test("subscribe with 'once' dead-letters a redelivery", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness, { redelivered: true }), false)
+  })
+
+  test("subscribe with 'once' honors error.retryable === false", async () => {
+    // The opt-out used to exist only in the sequential path; a handler that
+    // knows the failure is permanent can now skip the retry in both.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(false), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("error.retryable === true cannot force a retry under 'none'", async () => {
+    // The subscription's policy is a ceiling: a handler must not be able to
+    // requeue into a subscription that opted out of retries.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(true))
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("subscribeSequential defaults to 'once'", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', failing())
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test("subscribeSequential with 'none' never requeues", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', failing(), { retryPolicy: 'none' })
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test('an undecodable message follows the policy too', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'once' })
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    await consumer.callback({
+      content: Buffer.from('not-gzip'),
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered: false },
+      properties: { headers: { 'x-compressed': true } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'undecodable message nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  // The wrapper methods build their own options object before delegating to
+  // subscribe. Asserting the pass-through rather than reasoning about it: a
+  // future destructure that swallows retryPolicy would silently disable the
+  // caller's policy.
+  test('subscribeWithOptimizedPrefetch forwards the policy', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test('subscribeParallel forwards the policy', async (t) => {
+    const harness = createManager()
+
+    t.after(() => harness.manager.disposeAll())
+
+    await harness.manager.subscribeParallel('orders', FLAKY_WORKER, { workerCount: 1, retryPolicy: 'once' })
+
+    await deliver(harness, { shouldFail: true })
+    await waitFor(() => harness.channel.nacked.length === 1, 5000, 'worker failure nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  test('an invalid policy is rejected at subscribe time, not silently ignored', async () => {
+    const harness = createManager()
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'twice' }),
+      /Invalid retryPolicy 'twice'/
+    )
+    await assert.rejects(
+      () => harness.manager.subscribeSequential('orders', async () => {}, { retryPolicy: 'always' }),
+      /Invalid retryPolicy 'always'/
+    )
+  })
+
+  test('retryPolicy is not forwarded to the broker as a consume argument', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'once', priority: 5 })
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    assert.equal(consumer.options.retryPolicy, undefined)
+    assert.equal(consumer.options.priority, 5, 'genuine consume options still pass through')
+  })
+})
+
 describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
   test('raises the prefetch when processing is consistently fast', async () => {
     const harness = createManager()
