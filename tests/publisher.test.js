@@ -3,7 +3,7 @@ import { test, describe } from 'node:test'
 import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
 import CircuitBreaker from '../src/resilience/circuit-breaker.js'
-import { FakeChannel, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 const createPublisher = (overrides = {}) => {
   const channel = new FakeChannel()
@@ -285,6 +285,23 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
 
     await assert.rejects(() => publisher.publishAsyncBatch('orders', []), /non-empty array/)
     await assert.rejects(() => publisher.publishAsyncBatch('orders', 'nope'), /non-empty array/)
+  })
+
+  test('publishAsyncBatch logs and rethrows when the batch cannot be published', async () => {
+    const logger = recordingLogger()
+    const { publisher, channel } = createPublisher({ logger })
+
+    // The failure has to come from the publish itself: preflight's connection
+    // probe calls getChannel() before the try, so breaking that would never
+    // reach the reporting path this test is about.
+    channel.publish = () => { throw new Error('channel is closed') }
+
+    await assert.rejects(() => publisher.publishAsyncBatch('orders', [{ n: 1 }]), /channel is closed/)
+
+    assert.ok(
+      logger.records.error.some(line => line.includes('Failed to publish batch asynchronously')),
+      'the failure is reported before being rethrown'
+    )
   })
 
   test('publishAsyncBatch respects back-pressure: it waits for drain before the next message', async () => {

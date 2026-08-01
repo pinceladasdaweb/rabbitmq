@@ -94,9 +94,38 @@ export interface PublishOptions {
   [key: string]: unknown
 }
 
+/**
+ * What happens to a message whose processing failed.
+ *
+ * - `'none'`: nack without requeue — the message goes straight to the DLQ.
+ * - `'once'`: a first delivery is requeued and retried; a delivery already
+ *   marked `redelivered`, or one whose error carries `retryable === false`,
+ *   is dead-lettered instead. Never more than one retry, so a permanently
+ *   failing message cannot hot-loop.
+ */
+export type RetryPolicy = 'none' | 'once'
+
+/**
+ * Error shape a consumer handler can throw to opt out of the subscription's
+ * retry. Setting `retryable = false` skips the retry under `'once'`; setting
+ * it to `true` does not create one under `'none'`.
+ */
+export interface RetryableError extends Error {
+  retryable?: boolean
+}
+
 export interface SubscribeOptions {
   noAck?: boolean
   prefetchCount?: number
+  /**
+   * Failure policy for this subscription. Defaults to `'none'` everywhere
+   * except `subscribeSequential`, which defaults to `'once'`.
+   *
+   * The policy is a ceiling: a handler can decline a retry with
+   * `error.retryable = false`, but cannot force one under `'none'`.
+   * An unrecognized value throws at subscribe time.
+   */
+  retryPolicy?: RetryPolicy
   [key: string]: unknown
 }
 
@@ -151,6 +180,13 @@ export interface DelayExchangeOptions {
 
 export interface SequentialSubscribeOptions extends SubscribeOptions {
   staleTimeout?: number
+  /**
+   * Defaults to `'once'` here, unlike every other subscribe method. The
+   * requeued message goes back to the queue while later ones keep being
+   * processed, so the retry can break the ordering this method provides —
+   * pass `'none'` when order matters more than the retry.
+   */
+  retryPolicy?: RetryPolicy
 }
 
 export interface ConsumeMessageFields {
@@ -211,8 +247,6 @@ export declare class RabbitMQ extends EventEmitter {
   getChannel (): Promise<unknown>
   getClusterStatus (): ClusterStatus
   enableGracefulShutdown (options?: GracefulShutdownOptions): void
-  /** @deprecated Use enableGracefulShutdown() instead. */
-  setupGracefulShutdown (): void
 
   setExchange (name: string, type?: 'direct' | 'topic' | 'fanout' | 'headers', options?: Record<string, unknown>): void
 

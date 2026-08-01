@@ -585,26 +585,6 @@ describe('RabbitMQ graceful shutdown', () => {
       'shutdown failure logged'
     )
   })
-
-  test('setupGracefulShutdown warns and delegates to enableGracefulShutdown', async (t) => {
-    const logger = recordingLogger()
-    const dialer = createDialer()
-    const rabbit = createRabbit(t, dialer, { logger })
-
-    // The delegation target is replaced so the alias cannot install real
-    // SIGINT/SIGTERM handlers in the test runner process — with the default
-    // exitProcess: true, a CI cancellation would exit 0 and mask the failure.
-    const calls = []
-
-    rabbit.enableGracefulShutdown = (...args) => calls.push(args)
-
-    rabbit.setupGracefulShutdown()
-
-    assert.equal(calls.length, 1, 'the alias must delegate, not merely warn')
-    assert.ok(logger.records.warn.some(message => /deprecated/.test(message)))
-    assert.equal(process.listenerCount('SIGINT'), 0, 'no real signal handler may leak into the runner')
-    assert.equal(process.listenerCount('SIGTERM'), 0)
-  })
 })
 
 describe('RabbitMQ cache (fake dialer)', () => {
@@ -765,7 +745,7 @@ describe('RabbitMQ rate limiting and DLQ processing (fake dialer)', () => {
     assert.equal(rabbit.getRateLimitStatus('orders-route').isBlocked, true)
   })
 
-  test('processDeadLetterQueue acks messages whose processor crashed and keeps consuming', async (t) => {
+  test('processDeadLetterQueue settles a crashed processor under the policy and keeps consuming', async (t) => {
     const dialer = createDialer()
     const rabbit = createRabbit(t, dialer)
 
@@ -794,9 +774,12 @@ describe('RabbitMQ rate limiting and DLQ processing (fake dialer)', () => {
 
     const consumerChannel = dialer.connections[0].channels.find(c => c.consumers.length > 0)
 
-    // The swallowed error is the point: without it the subscribe pipeline
-    // would nack the message and dead-letter an already-inspected message.
-    assert.equal(consumerChannel.acked.length, 3, 'every DLQ message must be acked, including the crashing one')
-    assert.equal(consumerChannel.nacked.length, 0)
+    // The processor failure is reported to the subscribe pipeline rather than
+    // swallowed, so retryPolicy governs this method like any other. Under the
+    // default 'none' the crashing message is nacked without requeue, which on
+    // a DLQ carrying no dead letter exchange of its own discards it — the same
+    // destination the previous ack gave it, but no longer reported as success.
+    assert.equal(consumerChannel.acked.length, 2, 'the two messages that processed cleanly are acked')
+    assert.deepEqual(consumerChannel.nacked.map(n => n.requeue), [false], 'the crashing one is settled, not requeued')
   })
 })

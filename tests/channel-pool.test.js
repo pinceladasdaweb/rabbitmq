@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import { EventEmitter } from 'node:events'
 import ChannelPool from '../src/connection/channel-pool.js'
-import { FakeChannel, silentLogger, waitFor as waitForCondition } from './helpers.js'
+import { FakeChannel, recordingLogger, silentLogger, waitFor as waitForCondition } from './helpers.js'
 
 function createFakeChannel () {
   const channel = new EventEmitter()
@@ -289,6 +289,51 @@ describe('ChannelPool', () => {
     await pool.close()
 
     await assert.rejects(() => inFlight, /channel closed/, 'the confirm must be failed, never left pending')
+  })
+
+  test('close tolerates a channel that refuses to close', async () => {
+    // Teardown errors are routine when the connection is already gone: they
+    // must not abort the loop and leave the remaining channels open.
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 2)
+
+    await pool.initialize()
+
+    const [first, second] = pool.channels
+
+    first.close = async () => { throw new Error('connection already gone') }
+
+    await pool.close()
+
+    assert.equal(second.closed, true, 'the second channel was still closed')
+    assert.deepEqual(pool.channels, [], 'the pool emptied despite the failure')
+  })
+
+  test('a slot whose replacement never succeeds is reported and left out of rotation', async (t) => {
+    // Costly on purpose: the replacement loop backs off 500ms * attempt, so
+    // exhausting all 5 attempts takes ~7.5s of real time. It is the only way
+    // to reach the give-up branch, and a slot that silently vanishes from
+    // rotation is exactly the kind of failure worth a loud log line.
+    const logger = recordingLogger()
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, logger, 1)
+
+    await pool.initialize()
+    t.after(() => pool.close())
+
+    const original = pool.channels[0]
+
+    connection.createConfirmChannel = async () => { throw new Error('connection not ready') }
+
+    original.emit('close')
+
+    await waitForCondition(
+      () => logger.records.error.some(line => line.includes('could not be recreated')),
+      15000,
+      'the exhausted slot is reported'
+    )
+
+    assert.equal(pool.channels[0], null, 'the dead slot is left empty, never handed out')
   })
 
   test('a channel closing during pool shutdown does not trigger a replacement', async () => {

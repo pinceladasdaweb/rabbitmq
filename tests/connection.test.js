@@ -347,6 +347,37 @@ describe('RabbitMQConnection disconnect', () => {
     assert.equal(connection.getConnectionState(), 'disconnected')
   })
 
+  test('a dial that fails after disconnect() was called settles as disconnected, not reconnecting', async (t) => {
+    // disconnect() lands while connect() is still dialing. Starting a
+    // reconnection loop at that point would resurrect a connection the caller
+    // explicitly shut down, and nothing would ever stop it.
+    let releaseDial
+    const dialGate = new Promise(resolve => { releaseDial = resolve })
+
+    const dialer = {
+      connections: [],
+      connect: async () => {
+        await dialGate
+
+        throw new Error('broker refused the connection')
+      }
+    }
+
+    const connection = createConnection(t, dialer)
+    const connecting = connection.connect()
+
+    await connection.disconnect()
+
+    releaseDial()
+
+    assert.equal(await connecting, null)
+    assert.equal(connection.getConnectionState(), 'disconnected')
+
+    // A reconnection loop would keep dialing; nothing must be scheduled.
+    await sleep(60)
+    assert.equal(connection.getConnectionState(), 'disconnected', 'no reconnection cycle was started')
+  })
+
   test('connect() after disconnect() re-enables automatic reconnection', async (t) => {
     const dialer = createDialer()
     const connection = createConnection(t, dialer)

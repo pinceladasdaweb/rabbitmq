@@ -99,6 +99,40 @@ class ConsumerManager {
     }
   }
 
+  // Rejected at subscribe time rather than defaulted: a typo silently falling
+  // back to 'none' would quietly disable retries the caller asked for.
+  #resolveRetryPolicy (retryPolicy, defaultPolicy) {
+    const policy = retryPolicy ?? defaultPolicy
+
+    if (policy !== 'none' && policy !== 'once') {
+      throw new Error(`Invalid retryPolicy '${policy}': expected 'none' or 'once'`)
+    }
+
+    return policy
+  }
+
+  // The single place that decides whether a failed message goes back to the
+  // queue. Both consumption paths route through it, so subscribe() and
+  // subscribeSequential() cannot drift apart again.
+  //
+  // 'once' is a ceiling, not a guarantee: `error.retryable === false` opts out
+  // of the retry, and a delivery already marked `redelivered` never gets
+  // another one — without that check an always failing callback hot-loops
+  // (nack -> requeue -> redeliver -> nack).
+  //
+  // Caveat of the `redelivered` flag: the broker sets it on ANY requeue, not
+  // just ours. An unacked message returned to the queue after a connection
+  // drop arrives redelivered too, so an infrastructure event can consume the
+  // retry budget before the handler ever fails. AMQP offers no redelivery
+  // counter on classic queues; use a quorum queue's x-delivery-count if you
+  // need a true attempt budget.
+  #shouldRequeue (message, error, retryPolicy) {
+    if (retryPolicy !== 'once') return false
+    if (error?.retryable === false) return false
+
+    return !message.fields?.redelivered
+  }
+
   registerConsumer (queueName, setup) {
     const consumerId = `consumer-${queueName}-${++this.consumerSequence}`
 
@@ -212,17 +246,20 @@ class ConsumerManager {
 
   // Shared consume pipeline used by subscribe and subscribeSequential: the
   // only variable part is how a decoded message is processed and settled,
-  // provided by hooks.createProcessor({ channel, consumerInfo, noAck }).
+  // provided by hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue }).
   async #subscribeCore (queueName, callback, options, hooks) {
     this.#validateSubscribeArgs(queueName, callback)
 
+    const { retryPolicy: requestedPolicy, ...consumeOptions } = options
+    const retryPolicy = this.#resolveRetryPolicy(requestedPolicy, hooks.defaultRetryPolicy)
     const noAck = options.noAck === true
     const prefetchCount = options.prefetchCount ?? hooks.defaultPrefetch
+    const shouldRequeue = (message, error) => this.#shouldRequeue(message, error, retryPolicy)
 
     const consumerId = this.registerConsumer(queueName, async () => {
       const channel = await this.getDedicatedChannel(consumerId)
       const consumerInfo = this.activeConsumers.get(consumerId)
-      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck })
+      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue })
 
       if (!noAck) {
         await channel.prefetch(prefetchCount)
@@ -245,15 +282,17 @@ class ConsumerManager {
         } catch (error) {
           this.logger.error(`Error processing message: ${error.message}`)
 
-          // Requeueing here would hot-loop poison messages (e.g. content
-          // that fails to decode) — dead-letter them instead.
+          // The retry policy governs every failure in the pipeline, decode
+          // errors included. A decode failure is deterministic, so under
+          // 'once' it costs one pointless redelivery before the DLQ — the
+          // price of a single rule with no carve-outs to remember.
           if (!noAck) {
-            this.settleAck(msg, channel, 'nack', false)
+            this.settleAck(msg, channel, 'nack', shouldRequeue(msg, error))
           }
         }
       }
 
-      const consumer = await channel.consume(queueName, wrappedCallback, { ...options, noAck })
+      const consumer = await channel.consume(queueName, wrappedCallback, { ...consumeOptions, noAck })
 
       consumerInfo.channel = channel
       this.#trackConsumerTag(consumerId, consumerInfo, consumer.consumerTag)
@@ -277,6 +316,10 @@ class ConsumerManager {
   async subscribe (queueName, callback, options = {}) {
     return this.#subscribeCore(queueName, callback, options, {
       defaultPrefetch: this.prefetchCount,
+      // Never requeues by default: a handler that already applied part of its
+      // side effect would apply it again on the redelivery. Opt into
+      // 'once' when the handler is idempotent.
+      defaultRetryPolicy: 'none',
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
       createProcessor: ({ channel, noAck }) => async (content, msg) => {
         await callback(content, msg)
@@ -293,8 +336,13 @@ class ConsumerManager {
 
     return this.#subscribeCore(queueName, callback, options, {
       defaultPrefetch: 1,
+      // Historical default, kept for compatibility. Note the tension: the
+      // requeued message goes back to the queue while later ones keep being
+      // processed, so the retry can break the very ordering this method
+      // exists to provide. Pass 'none' when order matters more than the retry.
+      defaultRetryPolicy: 'once',
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
-      createProcessor: ({ channel, consumerInfo, noAck }) => {
+      createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
         consumerInfo.sequentialProcessor?.dispose()
 
@@ -302,6 +350,7 @@ class ConsumerManager {
           callback,
           logger: this.logger,
           staleTimeout,
+          shouldRequeue,
           onSuccess: (message) => {
             if (!noAck) {
               this.settleAck(message, channel, 'ack')

@@ -445,6 +445,171 @@ describe('ConsumerManager subscribeSequential wiring', () => {
   })
 })
 
+describe('ConsumerManager retryPolicy', () => {
+  const deliverFailing = async (harness, { redelivered = false, retryable } = {}) => {
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ step: 1 })
+
+    await consumer.callback({
+      content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered },
+      properties: { messageId: 'm1', headers: { 'x-compressed': false } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'message nacked')
+
+    return harness.channel.nacked[0].requeue
+  }
+
+  const failing = (retryable) => async () => {
+    const error = new Error('boom')
+
+    if (retryable !== undefined) error.retryable = retryable
+
+    throw error
+  }
+
+  test("subscribe defaults to 'none': a failure goes straight to the DLQ", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing())
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("subscribe with 'once' retries a first delivery", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test("subscribe with 'once' dead-letters a redelivery", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness, { redelivered: true }), false)
+  })
+
+  test("subscribe with 'once' honors error.retryable === false", async () => {
+    // The opt-out used to exist only in the sequential path; a handler that
+    // knows the failure is permanent can now skip the retry in both.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(false), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("error.retryable === true cannot force a retry under 'none'", async () => {
+    // The subscription's policy is a ceiling: a handler must not be able to
+    // requeue into a subscription that opted out of retries.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', failing(true))
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test("subscribeSequential defaults to 'once'", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', failing())
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test("subscribeSequential with 'none' never requeues", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', failing(), { retryPolicy: 'none' })
+
+    assert.equal(await deliverFailing(harness), false)
+  })
+
+  test('an undecodable message follows the policy too', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'once' })
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    await consumer.callback({
+      content: Buffer.from('not-gzip'),
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered: false },
+      properties: { headers: { 'x-compressed': true } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'undecodable message nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  // The wrapper methods build their own options object before delegating to
+  // subscribe. Asserting the pass-through rather than reasoning about it: a
+  // future destructure that swallows retryPolicy would silently disable the
+  // caller's policy.
+  test('subscribeWithOptimizedPrefetch forwards the policy', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', failing(), { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), true)
+  })
+
+  test('subscribeParallel forwards the policy', async (t) => {
+    const harness = createManager()
+
+    t.after(() => harness.manager.disposeAll())
+
+    await harness.manager.subscribeParallel('orders', FLAKY_WORKER, { workerCount: 1, retryPolicy: 'once' })
+
+    await deliver(harness, { shouldFail: true })
+    await waitFor(() => harness.channel.nacked.length === 1, 5000, 'worker failure nacked')
+
+    assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  test('unsubscribe still tears down when the broker refuses the cancel', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    harness.channel.cancel = async () => { throw new Error('unknown consumer tag') }
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true, 'the consumer is dropped anyway')
+    assert.ok(logger.records.warn.some(line => line.includes('unknown consumer tag')))
+    assert.equal(harness.manager.findConsumerIdByTag(consumer.consumerTag), null)
+  })
+
+  test('an invalid policy is rejected at subscribe time, not silently ignored', async () => {
+    const harness = createManager()
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'twice' }),
+      /Invalid retryPolicy 'twice'/
+    )
+    await assert.rejects(
+      () => harness.manager.subscribeSequential('orders', async () => {}, { retryPolicy: 'always' }),
+      /Invalid retryPolicy 'always'/
+    )
+  })
+
+  test('retryPolicy is not forwarded to the broker as a consume argument', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'once', priority: 5 })
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    assert.equal(consumer.options.retryPolicy, undefined)
+    assert.equal(consumer.options.priority, 5, 'genuine consume options still pass through')
+  })
+})
+
 describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
   test('raises the prefetch when processing is consistently fast', async () => {
     const harness = createManager()
@@ -462,6 +627,123 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 3000, 'prefetch raised')
+  })
+
+  test('lowers the prefetch when processing is consistently slow', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
+      // Above the 500ms threshold the optimizer treats the consumer as
+      // saturated and backs the prefetch off.
+      await sleep(520)
+    }, {
+      initialPrefetch: 8,
+      optimizationInterval: 20,
+      decreaseFactor: 0.5,
+      minPrefetch: 1
+    })
+
+    assert.deepEqual(harness.channel.prefetches, [8])
+
+    await deliver(harness, { n: 1 })
+    await sleep(30)
+    await deliver(harness, { n: 2 })
+
+    await waitFor(() => harness.channel.prefetches.includes(4), 5000, 'prefetch lowered')
+  })
+
+  test('leaves the prefetch alone when the measured pace warrants no change', async () => {
+    // Between the two thresholds (100ms fast, 500ms slow) the optimizer must
+    // decide on nothing and skip the channel round-trip entirely.
+    const harness = createManager()
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
+      await sleep(200)
+    }, {
+      initialPrefetch: 4,
+      optimizationInterval: 20
+    })
+
+    await deliver(harness, { n: 1 })
+    await sleep(30)
+    await deliver(harness, { n: 2 })
+
+    assert.deepEqual(harness.channel.prefetches, [4], 'no adjustment was applied')
+  })
+
+  test('the optimizer stops quietly while the consumer has no channel', async () => {
+    // Two distinct states must both short-circuit: the consumer entry being
+    // gone (unsubscribed) and the entry existing with no channel yet — which
+    // is how a consumer looks mid-recreation, since registerConsumer starts
+    // it at channel: null. Only the second exercises the `?.channel` guard;
+    // reaching the optimizer in that state would throw on undefined.prefetch.
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    const consumer = await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20,
+      increaseFactor: 2
+    })
+
+    const channel = harness.channel
+    const wrapped = channel.consumers.at(-1).callback
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    harness.manager.activeConsumers.get(consumerId).channel = null
+
+    const before = channel.prefetches.length
+
+    await wrapped({
+      content: (await harness.codec.encode({ n: 1 })).content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1 },
+      properties: { headers: { 'x-compressed': false } }
+    })
+
+    await sleep(30)
+
+    await wrapped({
+      content: (await harness.codec.encode({ n: 2 })).content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 2 },
+      properties: { headers: { 'x-compressed': false } }
+    })
+
+    assert.equal(channel.prefetches.length, before, 'no prefetch call while the channel is missing')
+    assert.equal(channel.acked.length, 2, 'the messages were still processed and acked')
+
+    // The real discriminator: without the guard the optimizer reaches
+    // applyPrefetch and dereferences the missing channel. That failure is
+    // swallowed by applyPrefetch's own catch, so silence in the warn log is
+    // the only evidence that the guard actually short-circuited.
+    assert.deepEqual(logger.records.warn, [], 'the guard short-circuits instead of failing inside applyPrefetch')
+  })
+
+  test('a failed prefetch adjustment is logged and never fails the message', async () => {
+    // The optimization runs after the callback already succeeded: letting it
+    // throw would nack an already-processed message to the DLQ.
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20,
+      increaseFactor: 2
+    })
+
+    harness.channel.prefetch = async () => { throw new Error('channel is closing') }
+
+    await deliver(harness, { n: 1 })
+    await sleep(30)
+    await deliver(harness, { n: 2 })
+
+    await waitFor(
+      () => logger.records.warn.some(line => line.includes('channel is closing')),
+      3000,
+      'prefetch failure logged'
+    )
+
+    assert.equal(harness.channel.nacked.length, 0, 'the processed messages were not dead-lettered')
+    assert.equal(harness.channel.acked.length, 2)
   })
 
   test('re-applies the optimized prefetch after a reconnection resets the channel', async () => {
@@ -529,5 +811,20 @@ describe('ConsumerManager subscribeParallel', () => {
 
     await waitFor(() => harness.channel.nacked.length === 1, 5000, 'worker failure nacked')
     assert.equal(harness.channel.nacked[0].requeue, false)
+  })
+
+  test('terminates the worker pool when the subscription itself fails', async () => {
+    // Otherwise a failed subscribe leaks live worker threads and the process
+    // never exits.
+    const harness = createManager()
+
+    harness.channel.consumeError = new Error('queue does not exist')
+
+    await assert.rejects(
+      () => harness.manager.subscribeParallel('orders', ECHO_WORKER, { workerCount: 1 }),
+      /queue does not exist/
+    )
+
+    assert.equal(harness.manager.workerPools.size, 0, 'no pool was left registered')
   })
 })

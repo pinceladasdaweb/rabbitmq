@@ -75,6 +75,33 @@ describe('WorkerPool', () => {
     assert.equal(pool.size, 0)
   })
 
+  test('terminate rejects work already queued behind a busy worker', async (t) => {
+    // The previous test terminates an idle pool, so nothing is waiting. This
+    // one puts a real waiter in the queue first: without rejecting them,
+    // terminate() would leave those callers hanging forever.
+    const pool = new WorkerPool(WORKER_FILE, { workerCount: 1, logger: silentLogger })
+
+    t.after(() => pool.terminate())
+
+    // Outcomes are captured the moment the calls are made: both settle while
+    // terminate() is still running, and an unobserved rejection would fail
+    // the test as unhandled rather than as the assertion below.
+    const settle = (promise) => promise.then(() => null, (error) => error)
+
+    const inFlight = settle(pool.run({ command: 'slow', ms: 300, content: 'busy' }))
+
+    await waitFor(() => pool.idleWorkers.length === 0, 3000, 'the only worker is busy')
+
+    const queued = settle(pool.run({ content: 'queued' }))
+
+    await waitFor(() => pool.waiters.length === 1, 3000, 'the second call is queued as a waiter')
+
+    await pool.terminate()
+
+    assert.match((await queued).message, /Worker pool has been terminated/)
+    await inFlight
+  })
+
   test('a worker that throws mid-message rejects the run and is reported', async (t) => {
     // Distinct from a worker that politely returns { success: false }: an
     // uncaught throw surfaces as the worker's 'error' event.

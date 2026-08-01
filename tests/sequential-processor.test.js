@@ -98,9 +98,22 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(order, [1, 2, 3])
   })
 
+  // The retry policy itself lives in ConsumerManager (#shouldRequeue) so both
+  // consumption paths share one rule. What this processor owns is delegating
+  // to it faithfully — these tests assert the delegation, not the policy.
+  // The policy's own behaviour is covered end-to-end in consumer-manager.test.js.
   test('nacks a failing message and does not ack it', async (t) => {
+    const consulted = []
+
     const { processor, acked, nacked } = createProcessor(t, {
-      callback: async () => { throw new Error('boom') }
+      callback: async () => { throw new Error('boom') },
+      options: {
+        shouldRequeue: (message, error) => {
+          consulted.push({ messageId: message.properties.messageId, reason: error.message })
+
+          return true
+        }
+      }
     })
 
     await processor.handle({}, makeMessage('bad'))
@@ -108,48 +121,75 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(acked, [])
     assert.equal(nacked.length, 1)
     assert.equal(nacked[0].messageId, 'bad')
-    assert.equal(nacked[0].requeue, true, 'a first delivery may be retried')
+    assert.equal(nacked[0].requeue, true, 'the policy answer is what settles the message')
+    assert.deepEqual(consulted, [{ messageId: 'bad', reason: 'boom' }], 'the policy sees the failing message and its error')
   })
 
-  test('dead-letters a failing redelivery instead of requeueing it forever', async (t) => {
-    // Regression: the catch used to requeue on every ordinary error with no
-    // redelivered check, so an always failing callback hot-looped
-    // (nack -> requeue -> redeliver -> nack) instead of reaching the DLQ.
-    const { processor, acked, nacked } = createProcessor(t, {
-      callback: async () => { throw new Error('boom') }
+  test('a failing message with no messageId is still reported and settled', async (t) => {
+    // messageId is optional: dependency tracking needs it, plain processing
+    // does not. The failure path must not assume it exists.
+    const errors = []
+    const { processor, nacked } = createProcessor(t, {
+      callback: async () => { throw new Error('boom') },
+      options: { logger: { ...silentLogger, error: (line) => errors.push(line) } }
     })
 
-    await processor.handle({}, makeMessage('bad', { redelivered: true }))
+    await processor.handle({}, { properties: {}, fields: {} })
+
+    assert.equal(nacked.length, 1)
+    assert.ok(errors.some(line => line.includes('(no messageId)')))
+  })
+
+  test('falls back to the default stale timeout when none is given', async (t) => {
+    const { processor } = createProcessor(t, { options: { staleTimeout: undefined } })
+
+    assert.equal(processor.staleTimeout, 30000)
+  })
+
+  test('settles a failing message with requeue false when the policy refuses', async (t) => {
+    const { processor, acked, nacked } = createProcessor(t, {
+      callback: async () => { throw new Error('boom') },
+      options: { shouldRequeue: () => false }
+    })
+
+    await processor.handle({}, makeMessage('bad'))
 
     assert.deepEqual(acked, [])
     assert.equal(nacked.length, 1)
-    assert.equal(nacked[0].requeue, false, 'a redelivery that fails again must be dead-lettered')
+    assert.equal(nacked[0].requeue, false)
   })
 
-  test('honors error.retryable === false with requeue false', async (t) => {
+  test('never requeues when built without a policy', async (t) => {
+    // Direct construction has no subscription to inherit a policy from, so the
+    // safe answer is the one that cannot hot-loop.
     const { processor, nacked } = createProcessor(t, {
-      callback: async () => {
-        const error = new Error('permanent')
-        error.retryable = false
-
-        throw error
-      }
+      callback: async () => { throw new Error('boom') }
     })
 
-    await processor.handle({}, makeMessage('permanent-failure'))
+    await processor.handle({}, makeMessage('bad'))
 
     assert.equal(nacked[0].requeue, false)
   })
 
-  test('requeues stale pending messages on first expiry and dead-letters redeliveries', async (t) => {
+  test('settles stale pending messages through the same policy', async (t) => {
     let releaseFirst
 
     const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+    const consulted = []
 
     const { processor, nacked } = createProcessor(t, {
       staleTimeout: 80,
       callback: async (content) => {
         if (content.hold) await firstBlocked
+      },
+      options: {
+        // Answers differently per message, so a hardcoded requeue value on the
+        // expiry path could not produce this result.
+        shouldRequeue: (message, error) => {
+          consulted.push({ messageId: message.properties.messageId, reason: error.message })
+
+          return message.properties.messageId === 'fresh'
+        }
       }
     })
 
@@ -157,7 +197,7 @@ describe('SequentialProcessor', () => {
 
     await sleep(20)
     await processor.handle({}, makeMessage('fresh', { dependsOn: 'dep' }))
-    await processor.handle({}, makeMessage('retried', { dependsOn: 'dep', redelivered: true }))
+    await processor.handle({}, makeMessage('retried', { dependsOn: 'dep' }))
 
     await sleep(200)
 
@@ -165,9 +205,14 @@ describe('SequentialProcessor', () => {
     const retried = nacked.find(entry => entry.messageId === 'retried')
 
     assert.ok(fresh, 'fresh pending message expired')
-    assert.equal(fresh.requeue, true, 'first expiry goes back to the queue')
-    assert.ok(retried, 'redelivered pending message expired')
-    assert.equal(retried.requeue, false, 'redelivery is dead-lettered to avoid loops')
+    assert.equal(fresh.requeue, true)
+    assert.ok(retried, 'other pending message expired')
+    assert.equal(retried.requeue, false)
+    assert.deepEqual(
+      consulted.map(entry => entry.reason),
+      ['Dependency dep was never resolved', 'Dependency dep was never resolved'],
+      'the policy receives the dependency failure, not a synthetic error'
+    )
 
     releaseFirst()
     await first
