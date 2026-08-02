@@ -1,4 +1,5 @@
 import Rpc from './messaging/rpc.js'
+import describeError from './utils/describe-error.js'
 import Logger from './utils/logger.js'
 import { EventEmitter } from 'node:events'
 import _NodeCache from '@cacheable/node-cache'
@@ -516,7 +517,7 @@ class RabbitMQ extends EventEmitter {
       try {
         await processor(message)
       } catch (error) {
-        this.#logger.error(`Error processing dead letter message: ${error.message}`)
+        this.#logger.error(`Error processing dead letter message: ${describeError(error)}`)
 
         // Rethrown so this behaves like every other subscription: swallowing
         // here made retryPolicy a silent no-op on this method alone.

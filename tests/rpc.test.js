@@ -730,6 +730,28 @@ describe('Rpc respond()', () => {
     assert.equal(harness.consumerChannel.nacked.length, 0)
   })
 
+  test('a responder that throws a non-Error still produces an envelope (issue #18)', async () => {
+    // The envelope used to read error.message directly: `throw null` crashed
+    // the catch, so instead of the promised RPC_RESPONDER_ERROR the requester
+    // got silence until its timeout — and the request went to the DLQ.
+    const harness = createHarness()
+
+    await harness.rpc.respond('rpc-queue', async () => {
+      throw null // eslint-disable-line no-throw-literal
+    }, { replyOnError: true })
+
+    await deliverRequest(harness, { value: 1 }, { replyTo: 'amq.rabbitmq.reply-to.abc', correlationId: 'corr-null' })
+
+    await waitFor(() => harness.poolChannel.published.length === 1, 2000, 'error reply published')
+
+    const reply = harness.poolChannel.published[0]
+
+    assert.equal(reply.options.headers['x-rpc-error'], true)
+    assert.deepEqual(await harness.codec.decode(reply.content, false), { message: 'null' })
+    assert.equal(harness.consumerChannel.acked.length, 1, 'the request is acked, not dead-lettered')
+    assert.equal(harness.consumerChannel.nacked.length, 0)
+  })
+
   test('handler crash without replyOnError nacks to the DLQ and publishes nothing', async () => {
     const harness = createHarness()
 

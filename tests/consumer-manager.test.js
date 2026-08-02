@@ -716,6 +716,38 @@ describe('ConsumerManager retryPolicy', () => {
     assert.equal(harness.channel.nacked.length, 0)
   })
 
+  test('a handler that throws a non-Error still settles the message (issue #18)', async () => {
+    // JavaScript allows `throw null`. The catch used to read error.message
+    // before settling, so the TypeError it raised skipped the nack entirely:
+    // the delivery sat unacknowledged until the channel died, with no
+    // redelivery in the meantime. One case per throwable shape.
+    for (const thrown of [null, undefined, 'just a string']) {
+      const harness = createManager()
+
+      await harness.manager.subscribe('orders', async () => {
+        throw thrown // eslint-disable-line no-throw-literal
+      })
+
+      await deliver(harness, { id: 1 })
+
+      assert.equal(harness.channel.nacked.length, 1, `thrown ${String(thrown)}: the message must be settled`)
+      assert.equal(harness.channel.acked.length, 0)
+    }
+  })
+
+  test("a null throw under 'once' still gets its retry (issue #18)", async () => {
+    // Pins the optional chaining in #shouldRequeue: `error?.retryable` runs
+    // against the raw thrown value, and with `throw null` the un-guarded form
+    // crashes inside the catch — no settlement at all, let alone a retry.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      throw null // eslint-disable-line no-throw-literal
+    }, { retryPolicy: 'once' })
+
+    assert.equal(await deliverFailing(harness), true, 'a first delivery is still retried')
+  })
+
   test('a message delivered without a fields object does not break the retry policy', async () => {
     // The policy reads message.fields.redelivered. Anything that hands the
     // pipeline a message without `fields` — a hand-rolled republish, a shim,

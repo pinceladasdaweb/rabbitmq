@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import describeError from '../utils/describe-error.js'
 
 // RabbitMQ's direct reply-to pseudo-queue: consuming from it (noAck) turns the
 // consumer's channel into a private, zero-declaration reply route.
@@ -294,7 +295,9 @@ class Rpc {
           throw error
         }
 
-        await this.#publishReply(replyTo, correlationId, { message: error.message }, { 'x-rpc-error': true })
+        // describeError: a responder that throws null must still produce an
+        // envelope the requester can reject with, not crash this catch.
+        await this.#publishReply(replyTo, correlationId, { message: describeError(error) }, { 'x-rpc-error': true })
 
         return
       }
