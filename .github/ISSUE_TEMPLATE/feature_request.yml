@@ -1,0 +1,44 @@
+name: Feature request
+description: Something this library should be able to do and cannot
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to build, and where does the library leave you
+        stuck? Describe the situation rather than the API you have in mind —
+        the shape of the solution is easier to get right from the problem.
+      placeholder: |
+        A failed message should be retried three times with backoff before reaching the DLQ.
+        Today retryPolicy: 'once' retries immediately, which never helps when the database
+        is down for a few seconds.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: The workaround, if you have one, and why it is not enough.
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: What it might look like
+      description: Optional. A sketch of the API, if you already have one in mind.
+      render: js
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does it fit the project's constraints?
+      description: >
+        Not a filter — say so if it does not, and it can be discussed. But
+        these shape whether something belongs here or in your application.
+      options:
+        - label: It can be expressed in AMQP 0-9-1, without depending on a broker plugin
+        - label: It cannot requeue a message without something that bounds the retries
+        - label: It changes no existing call's behaviour, or the change is worth a version bump
+        - label: I would be willing to work on it

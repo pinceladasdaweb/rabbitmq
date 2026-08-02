@@ -36,6 +36,10 @@ describe('RabbitMQConnection constructor', () => {
   test('rejects empty or falsy endpoints', () => {
     assert.throws(() => construct({ endpoints: [] }), /At least one valid/)
     assert.throws(() => construct({ endpoints: [undefined] }), /At least one valid/)
+    // One bad entry among good ones is still a misconfiguration: it would dial
+    // an undefined host on whichever attempt rotated onto it, long after start.
+    assert.throws(() => construct({ endpoints: ['node-a:5672', ''] }), /At least one valid/)
+    assert.doesNotThrow(() => construct({ endpoints: ['node-a:5672', 'node-b:5672'] }))
   })
 })
 
@@ -117,8 +121,9 @@ describe('RabbitMQConnection connect', () => {
   })
 
   test('rotates to the next endpoint when the first one fails', async (t) => {
+    const logger = recordingLogger()
     const dialer = createDialer([new Error('ECONNREFUSED'), 'ok'])
-    const connection = createConnection(t, dialer, { endpoints: ['node-a:5672', 'node-b:5672'] })
+    const connection = createConnection(t, dialer, { logger, endpoints: ['node-a:5672', 'node-b:5672'] })
 
     t.after(() => connection.disconnect())
 
@@ -128,6 +133,13 @@ describe('RabbitMQConnection connect', () => {
     assert.equal(dialer.dials, 2)
     assert.match(dialer.urls[1], /node-b:5672/)
     assert.equal(connection.getCurrentEndpoint(), 'node-b:5672')
+
+    // Which node refused matters: in a cluster this is how an operator tells a
+    // single sick broker from a network-wide outage.
+    assert.ok(
+      logger.records.error.some(line => line.includes('node-a:5672') && line.includes('ECONNREFUSED')),
+      'the failed node and the reason are both named'
+    )
   })
 })
 
@@ -200,8 +212,9 @@ describe('RabbitMQConnection reconnection', () => {
   })
 
   test('gives up with reconnectFailed after maxReconnectAttempts', async (t) => {
+    const logger = recordingLogger()
     const dialer = createDialer([new Error('permanently down')])
-    const connection = createConnection(t, dialer, { maxReconnectAttempts: 2 })
+    const connection = createConnection(t, dialer, { logger, maxReconnectAttempts: 2 })
 
     t.after(() => connection.disconnect())
 
@@ -211,6 +224,10 @@ describe('RabbitMQConnection reconnection', () => {
     await failed
 
     assert.equal(connection.getConnectionState(), 'failed')
+    assert.ok(
+      logger.records.error.some(line => /Max reconnect attempts \(2\)/.test(line)),
+      'giving up is announced with the budget that was exhausted'
+    )
     // 1 initial dial + 2 reconnect attempts, nothing further scheduled.
     assert.equal(dialer.dials, 3)
 
@@ -345,6 +362,112 @@ describe('RabbitMQConnection disconnect', () => {
     await connection.disconnect()
 
     assert.equal(connection.getConnectionState(), 'disconnected')
+  })
+
+  test('backs off exponentially and caps at maxReconnectInterval', async (t) => {
+    // The schedule had no assertion at all: doubling could have been halving,
+    // the cap could have been a floor, and nothing would have noticed. The
+    // scheduler logs the delay it picked, which makes this deterministic
+    // rather than a race against real elapsed time.
+    const logger = recordingLogger()
+    const dialer = createDialer([new Error('broker down')])
+    const connection = createConnection(t, dialer, {
+      logger,
+      reconnectInterval: 10,
+      maxReconnectInterval: 40,
+      maxReconnectAttempts: 5
+    })
+
+    t.after(() => connection.disconnect())
+
+    const failed = new Promise(resolve => connection.once('reconnectFailed', resolve))
+
+    await connection.connect()
+    await failed
+
+    const delays = logger.records.info
+      .map(line => /Reconnection attempt \d+\/5 in (\d+)ms/.exec(line))
+      .filter(Boolean)
+      .map(match => Number(match[1]))
+
+    assert.deepEqual(delays, [10, 20, 40, 40, 40], 'doubles, then holds at the ceiling')
+  })
+
+  test('defaults the backoff interval to one second and its ceiling to fifteen', async (t) => {
+    // Constructed directly: the helper above pins both values, so it can never
+    // exercise the defaults. Only the first scheduled delay is inspected —
+    // enough to pin both, and it costs nothing to observe.
+    const firstDelay = async (options) => {
+      const logger = recordingLogger()
+
+      installDialer(t, createDialer([new Error('broker down')]))
+
+      const connection = new RabbitMQConnection({
+        username: 'admin',
+        password: 'admin',
+        endpoints: ['node-a:5672'],
+        maxReconnectAttempts: 5,
+        ...options
+      }, logger)
+
+      await connection.connect()
+      await connection.disconnect()
+
+      const line = logger.records.info.find(entry => /Reconnection attempt 1\/5 in/.test(entry))
+
+      assert.ok(line, 'a reconnection was scheduled')
+
+      return Number(/in (\d+)ms/.exec(line)[1])
+    }
+
+    assert.equal(await firstDelay({}), 1000, 'the default interval is one second')
+
+    // An interval above the default ceiling is clamped on the very first
+    // schedule, which pins the ceiling without waiting for the backoff to grow.
+    assert.equal(await firstDelay({ reconnectInterval: 20000 }), 15000, 'the default ceiling is fifteen seconds')
+  })
+
+  test('startReconnection is a no-op once disconnect() has been called', async (t) => {
+    // It is a public method, so an application (or a stale callback) can call
+    // it after shutdown. Reconnecting there would resurrect a connection the
+    // caller deliberately closed, with nothing left to stop it.
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer)
+
+    await connection.connect()
+    await connection.disconnect()
+
+    const dialsBefore = dialer.dials
+
+    connection.startReconnection()
+    await sleep(80)
+
+    assert.equal(dialer.dials, dialsBefore, 'no dial was attempted')
+    assert.equal(connection.getConnectionState(), 'disconnected')
+  })
+
+  test('a reconnect timer that fires after a manual connect() does not dial again', async (t) => {
+    // The timer and a user calling connect() race. If the timer does not check
+    // the state first, it opens a second AMQP connection and leaks the loser.
+    const dialer = createDialer([new Error('broker down'), 'ok'])
+    const connection = createConnection(t, dialer, { reconnectInterval: 120, maxReconnectInterval: 120 })
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    // The user reconnects by hand well before the scheduled retry fires.
+    await connection.connect()
+
+    assert.equal(connection.getConnectionState(), 'connected')
+
+    const dialsBefore = dialer.dials
+
+    // Now let the timer fire into an already connected client.
+    await sleep(200)
+
+    assert.equal(dialer.dials, dialsBefore, 'the timer found the connection healthy and stood down')
+    assert.equal(connection.getConnectionState(), 'connected')
   })
 
   test('a dial that fails after disconnect() was called settles as disconnected, not reconnecting', async (t) => {

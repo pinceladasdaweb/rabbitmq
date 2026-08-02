@@ -518,6 +518,36 @@ describe('Rpc reply channel lifecycle', () => {
     assert.deepEqual(await second, { ok: true })
   })
 
+  test('a cancel arriving after the connection was already lost is ignored', async () => {
+    // handleConnectionLoss detaches the 'return'/'close' listeners but cannot
+    // unregister the consume callback, so a basic.cancel can still arrive for
+    // a channel the RPC layer has already let go. Without the identity check
+    // it would invalidate whatever channel is current by then.
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', { id: 1 }, { timeout: 10000 })
+      .then(() => null, (error) => error)
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'request published')
+
+    harness.rpc.handleConnectionLoss()
+
+    const first = await pending
+
+    assert.equal(first.code, 'RPC_CONNECTION_LOST')
+
+    // The late cancel for the channel that is no longer the reply channel.
+    await harness.replyChannel.consumers.at(-1).callback(null)
+
+    // A fresh request still works: nothing was torn down a second time.
+    const second = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 2, 2000, 'second request published')
+    await deliverReply(harness, harness.replyChannel.published[1].options.correlationId, { ok: true })
+
+    assert.deepEqual(await second, { ok: true })
+  })
+
   test('repeated broker cancels do not accumulate listeners on the cached channel', async () => {
     // A basic.cancel leaves the channel OPEN, and the pool caches dedicated
     // channels by id — so every rebuild lands on the same channel object. If

@@ -63,6 +63,48 @@ describe('MessageCodec compression', () => {
     assert.deepEqual(await codec.decode(big.content, big.compressed), bigPayload)
   })
 
+  test('the threshold is a floor to exceed, not to reach', async () => {
+    // A payload exactly at the threshold stays uncompressed: gzip on a payload
+    // that small costs more than it saves, and the boundary is the only place
+    // the comparison can be wrong without anything else noticing.
+    const codec = new MessageCodec({ logger: silentLogger, useCompression: true, compressionThreshold: 64 })
+    const exact = Buffer.alloc(64, 0x61)
+
+    const atThreshold = await codec.compressIfNeeded(exact)
+
+    assert.equal(atThreshold.compressed, false, 'exactly at the threshold is left alone')
+
+    const overThreshold = await codec.compressIfNeeded(Buffer.alloc(65, 0x61))
+
+    assert.equal(overThreshold.compressed, true, 'one byte over is compressed')
+  })
+
+  test('compression and decompression failures survive a missing logger', async () => {
+    // logger is optional on the codec and both failure paths log through `?.`.
+    // Losing a guard turns a recoverable gzip failure into a TypeError thrown
+    // from inside the catch — the encode stops falling back and the message is
+    // lost instead of merely sent uncompressed.
+    const codec = new MessageCodec({ useCompression: true, compressionThreshold: 10 })
+    const payload = { blob: 'x'.repeat(500) }
+    const buffer = Buffer.from(JSON.stringify(payload))
+
+    // Same technique as the sibling test above: gzip only rejects on input
+    // toBuffer would never produce, so the branch is reached artificially.
+    codec.toBuffer = () => Object.assign(Object.create(null), { length: buffer.length })
+
+    const { compressed } = await codec.encode(payload)
+
+    assert.equal(compressed, false, 'fell back to the uncompressed payload')
+
+    // Asserting *which* error matters: without the `?.` guard the caller gets
+    // a TypeError from the logging line instead of the gzip failure, and a
+    // bare rejects() would pass on both.
+    await assert.rejects(
+      () => codec.decode(Buffer.from('not-gzip'), true),
+      (error) => !(error instanceof TypeError) && /incorrect header check|unexpected end|gzip|zlib/i.test(error.message)
+    )
+  })
+
   test('never compresses when the feature is disabled', async () => {
     const codec = new MessageCodec({ logger: silentLogger, useCompression: false, compressionThreshold: 10 })
 

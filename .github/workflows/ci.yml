@@ -43,7 +43,7 @@ jobs:
         run: npm install
 
       - name: Lint
-        run: npx standard src/ tests/
+        run: npx standard src/ tests/ examples/
 
       - name: Type declarations check
         run: npm run check:types

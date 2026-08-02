@@ -33,6 +33,7 @@
     "test": "node --test 'tests/**/*.test.js'",
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude='tests/**' 'tests/**/*.test.js'",
     "test:integration": "RABBITMQ_INTEGRATION=1 node --test 'tests/**/*.test.js'",
+    "test:mutation": "stryker run",
     "check:types": "tsc --noEmit --strict index.d.ts"
   },
   "engines": {
@@ -66,6 +67,8 @@
     "@rollup/plugin-commonjs": "^29.0.3",
     "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^16.0.3",
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/tap-runner": "^9.6.1",
     "lint-staged": "^17.2.0",
     "rollup": "^4.62.3",
     "standard": "^17.1.2",
@@ -75,7 +78,7 @@
   "dependencies": {
     "@cacheable/node-cache": "^3.1.1",
     "amqplib": "^2.0.1",
-    "breakwater": "^0.5.3"
+    "breakwater": "^0.7.0"
   },
   "lint-staged": {
     "src/**/*.js": "standard",

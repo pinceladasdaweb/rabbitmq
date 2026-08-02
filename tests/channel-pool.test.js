@@ -78,7 +78,7 @@ describe('ChannelPool', () => {
 
   test('getDedicatedChannel reuses the channel for the same id', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     const channelA = await pool.getDedicatedChannel('consumer-1')
     const channelB = await pool.getDedicatedChannel('consumer-1')
@@ -90,7 +90,7 @@ describe('ChannelPool', () => {
 
   test('dedicated channel is removed from the pool on error and on close', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     const channelA = await pool.getDedicatedChannel('consumer-1')
     channelA.emit('error', new Error('channel error'))
@@ -123,7 +123,7 @@ describe('ChannelPool', () => {
 
   test('pool channel closed without an error event is also replaced', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     await pool.initialize()
 
@@ -163,7 +163,7 @@ describe('ChannelPool', () => {
 
   test('getChannel throws when every channel is dead', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -197,7 +197,7 @@ describe('ChannelPool', () => {
 
   test('a pool channel is replaced after a transient failure and returns to rotation', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     await pool.initialize()
     // The replacement loop sleeps between attempts; closing the pool stops it.
@@ -205,9 +205,8 @@ describe('ChannelPool', () => {
 
     const original = pool.channels[0]
     const realCreate = connection.createConfirmChannel
-    // One failure is enough to prove the retry loop exists; each extra attempt
-    // costs a real 500ms * attempt backoff and this file is the suite's
-    // critical path.
+    // One failure is enough to prove the retry loop exists; the give-up test
+    // below walks all five attempts.
     let failures = 1
 
     // The first replacement attempt fails, the second succeeds.
@@ -227,7 +226,7 @@ describe('ChannelPool', () => {
 
   test('a replacement that lands after the pool closed is discarded, not left open', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     await pool.initialize()
 
@@ -274,7 +273,7 @@ describe('ChannelPool', () => {
     // FakeChannel models that amqplib behaviour, so this test fails the moment
     // the listeners are stripped again.
     const connection = createConfirmAwareConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1)
+    const pool = new ChannelPool(connection, silentLogger, 1, 1)
 
     await pool.initialize()
 
@@ -289,6 +288,31 @@ describe('ChannelPool', () => {
     await pool.close()
 
     await assert.rejects(() => inFlight, /channel closed/, 'the confirm must be failed, never left pending')
+  })
+
+  test('channel errors after the pool closed are not reported', async () => {
+    // Closing a pool makes the broker error its channels. Logging those would
+    // bury the real cause of a shutdown under noise the operator cannot act on.
+    const logger = recordingLogger()
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, logger, 1)
+
+    await pool.initialize()
+
+    const channel = pool.channels[0]
+
+    channel.emit('error', new Error('while the pool was alive'))
+    assert.ok(logger.records.error.some(line => line.includes('while the pool was alive')), 'a live pool reports')
+
+    await pool.close()
+
+    channel.emit('error', new Error('after the pool closed'))
+
+    assert.equal(
+      logger.records.error.some(line => line.includes('after the pool closed')),
+      false,
+      'teardown noise stays quiet'
+    )
   })
 
   test('close tolerates a channel that refuses to close', async () => {
@@ -310,13 +334,18 @@ describe('ChannelPool', () => {
   })
 
   test('a slot whose replacement never succeeds is reported and left out of rotation', async (t) => {
-    // Costly on purpose: the replacement loop backs off 500ms * attempt, so
-    // exhausting all 5 attempts takes ~7.5s of real time. It is the only way
-    // to reach the give-up branch, and a slot that silently vanishes from
-    // rotation is exactly the kind of failure worth a loud log line.
+    // Exhausting all 5 attempts at the production backoff costs ~7.5s of real
+    // time, which every surviving mutant then pays during mutation testing.
+    // channelRecoveryInterval is a real option — same knob shape as
+    // consumerRecoveryInterval — so the loop runs in full on a 20ms base.
+    //
+    // Not 1ms: the elapsed assertion below is what pins `recoveryInterval *
+    // attempt`. At 1ms the arithmetic becomes unobservable and a mutated
+    // backoff survives, which is how making this test fast first weakened it.
     const logger = recordingLogger()
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, logger, 1)
+    const pool = new ChannelPool(connection, logger, 1, 20)
+    const startedAt = Date.now()
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -334,6 +363,21 @@ describe('ChannelPool', () => {
     )
 
     assert.equal(pool.channels[0], null, 'the dead slot is left empty, never handed out')
+
+    // 20ms × (1+2+3+4+5) = 300ms of backoff across the five attempts. The
+    // lower bound is what keeps the backoff arithmetic honest: a mutated
+    // multiplier, a dropped attempt or a constant delay all land under it.
+    const elapsed = Date.now() - startedAt
+
+    assert.ok(elapsed >= 250, `the five attempts backed off progressively (took ${elapsed}ms)`)
+  })
+
+  test('defaults the recovery backoff to 500ms', () => {
+    // Every other test pins the interval to keep the suite fast, which leaves
+    // the production default asserted nowhere.
+    const pool = new ChannelPool(createFakeConnection(), silentLogger, 1)
+
+    assert.equal(pool.recoveryInterval, 500)
   })
 
   test('a channel closing during pool shutdown does not trigger a replacement', async () => {

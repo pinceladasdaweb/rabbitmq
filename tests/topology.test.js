@@ -114,6 +114,21 @@ describe('Topology createQueue', () => {
     assert.equal(main.options.arguments['x-dead-letter-exchange'], 'dlx')
   })
 
+  test('reports which queue could not be created', async () => {
+    const errors = []
+    const { topology, channel } = createTopology({
+      logger: { ...silentLogger, error: (line) => errors.push(line) }
+    })
+
+    channel.assertQueueError = new Error('PRECONDITION_FAILED')
+
+    await assert.rejects(() => topology.createQueue('orders'), /PRECONDITION_FAILED/)
+
+    // Naming the queue is what makes this actionable during a deploy that
+    // declares dozens of them.
+    assert.ok(errors.some(line => line.includes("'orders'") && line.includes('PRECONDITION_FAILED')))
+  })
+
   test('propagates queue assertion failures', async () => {
     const { topology, channel } = createTopology()
 

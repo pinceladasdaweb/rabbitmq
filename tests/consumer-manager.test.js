@@ -153,6 +153,103 @@ describe('ConsumerManager manual ack/nack', () => {
     assert.equal(delivered.__ackSettled, true)
   })
 
+  test('the ack controls are hidden from anything that walks the message', async () => {
+    // __channel points at the amqplib channel, which is cyclic. If either
+    // property were enumerable, JSON.stringify on a delivered message — the
+    // most ordinary thing a handler can do — would throw, and a spread would
+    // silently carry a live channel around.
+    const harness = createManager()
+    let delivered = null
+    let settledDuringHandler = null
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      delivered = msg
+      // Read inside the handler: the pipeline acks as soon as it returns.
+      settledDuringHandler = msg.__ackSettled
+    })
+
+    await deliver(harness, { id: 1 })
+
+    assert.ok(delivered.__channel, 'the delivering channel is still reachable')
+    assert.equal(settledDuringHandler, false, 'the message starts out unsettled')
+
+    assert.deepEqual(
+      Object.keys(delivered).filter(key => key.startsWith('__')),
+      [],
+      'neither control shows up as an own enumerable key'
+    )
+
+    assert.doesNotThrow(() => JSON.stringify(delivered), 'a handler can still serialize the message')
+    assert.equal(JSON.stringify(delivered).includes('__channel'), false)
+  })
+
+  test('settlement never uses allUpTo: one message at a time', async () => {
+    // allUpTo: true would settle every unacknowledged message up to this
+    // delivery tag — silently acknowledging work that was never done.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      if (content.bad) await harness.manager.nackMessage(msg)
+    })
+
+    await deliver(harness, { bad: true })
+
+    assert.deepEqual(harness.channel.nacked.map(n => n.allUpTo), [false])
+  })
+
+  test('nackMessage defaults to no requeue', async () => {
+    // The default matters more than the explicit case: a handler that calls
+    // nackMessage(msg) on a poison message and gets a requeue hot-loops.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      await harness.manager.nackMessage(msg)
+    })
+
+    await deliver(harness, { id: 1 })
+
+    assert.deepEqual(harness.channel.nacked.map(n => n.requeue), [false])
+  })
+
+  test('settleAck defaults to no requeue and latches after the first settlement', async () => {
+    // settleAck keeps its own copy of the exactly-once guard, separate from
+    // ackMessage/nackMessage. Without it the pipeline can ack a message on the
+    // success path and then nack the same delivery tag from the outer catch.
+    const harness = createManager()
+    const channel = harness.channel
+    const msg = { fields: {}, properties: {} }
+
+    harness.manager.attachAckControls(msg, channel)
+    harness.manager.settleAck(msg, channel, 'nack')
+    harness.manager.settleAck(msg, channel, 'nack')
+    harness.manager.settleAck(msg, channel, 'ack')
+
+    assert.deepEqual(channel.nacked.map(n => ({ requeue: n.requeue, allUpTo: n.allUpTo })), [{ requeue: false, allUpTo: false }])
+    assert.equal(channel.acked.length, 0, 'a settled message cannot be acked afterwards')
+  })
+
+  test('a settled message is never settled twice, whichever path settles it', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      await harness.manager.ackMessage(msg)
+      await harness.manager.ackMessage(msg)
+      await harness.manager.nackMessage(msg)
+    })
+
+    await deliver(harness, { id: 1 })
+
+    assert.equal(harness.channel.acked.length, 1, 'the ack flag really latches')
+    assert.equal(harness.channel.nacked.length, 0)
+  })
+
+  test('rejects a queue name that is only whitespace', async () => {
+    const harness = createManager()
+
+    await assert.rejects(() => harness.manager.subscribe('   ', async () => {}), /non-empty string/)
+    await assert.rejects(() => harness.manager.subscribeSequential('\t\n', async () => {}), /non-empty string/)
+  })
+
   test('nackMessage honors the requeue option and settles once', async () => {
     const harness = createManager()
 
@@ -368,7 +465,8 @@ describe('ConsumerManager lifecycle', () => {
   })
 
   test('a consumer that cannot be recovered is dropped and emits consumerLost', async () => {
-    const harness = createManager()
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
 
     await harness.manager.subscribe('orders', async () => {})
 
@@ -382,6 +480,13 @@ describe('ConsumerManager lifecycle', () => {
       3000,
       'consumerLost emitted after exhausting recovery attempts'
     )
+
+    // The queue name is the whole point of these lines: an application with a
+    // dozen consumers needs to know which one stopped draining, and how many
+    // attempts were spent before giving up.
+    assert.ok(logger.records.warn.some(line => line.includes('orders') && line.includes('cancelled by the broker')))
+    assert.ok(logger.records.warn.some(line => line.includes('orders') && /attempt \d+\/3/.test(line)))
+    assert.ok(logger.records.error.some(line => line.includes('orders') && line.includes('could not be recovered')))
 
     const lost = harness.events.find(e => e.event === 'consumerLost')
 
@@ -570,6 +675,169 @@ describe('ConsumerManager retryPolicy', () => {
     await waitFor(() => harness.channel.nacked.length === 1, 5000, 'worker failure nacked')
 
     assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  test('noAck: true means the library never settles anything', async () => {
+    // With noAck the broker considers the message delivered the moment it
+    // leaves the queue. Sending an ack or nack afterwards is a protocol error
+    // on an unknown delivery tag, and the broker closes the channel for it.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async (content) => {
+      if (content.explode) throw new Error('boom')
+    }, { noAck: true })
+
+    await deliver(harness, { id: 1 })
+    // The failure path settles separately from the success path, so it needs
+    // its own delivery: a handler that never throws leaves the catch untested.
+    await deliver(harness, { id: 2, explode: true })
+
+    assert.equal(harness.channel.acked.length, 0)
+    assert.equal(harness.channel.nacked.length, 0)
+    assert.deepEqual(harness.channel.prefetches, [], 'prefetch is meaningless without acknowledgement')
+  })
+
+  test('noAck: true also silences the sequential path, success and failure alike', async () => {
+    const harness = createManager()
+    const seen = []
+
+    await harness.manager.subscribeSequential('orders', async (content) => {
+      seen.push(content)
+
+      if (content.explode) throw new Error('boom')
+    }, { noAck: true })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1' })
+    await deliver(harness, { id: 2, explode: true }, { messageId: 'm2' })
+
+    await waitFor(() => seen.length === 2, 3000, 'both messages processed')
+
+    assert.equal(harness.channel.acked.length, 0)
+    assert.equal(harness.channel.nacked.length, 0)
+  })
+
+  test('a message delivered without a fields object does not break the retry policy', async () => {
+    // The policy reads message.fields.redelivered. Anything that hands the
+    // pipeline a message without `fields` — a hand-rolled republish, a shim,
+    // a future amqplib — would throw inside the catch, turning a handled
+    // failure into an unhandled rejection that settles nothing.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('boom')
+    }, { retryPolicy: 'once' })
+
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ id: 1 })
+
+    await consumer.callback({
+      content,
+      properties: { headers: { 'x-compressed': false } }
+    })
+
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'settled despite the missing fields')
+
+    assert.equal(harness.channel.nacked[0].requeue, true, 'treated as a first delivery')
+  })
+
+  test('recovers a broker-cancelled consumer on the last allowed attempt', async () => {
+    // Three attempts, not two: the recovery budget is what carries a consumer
+    // through a queue being recreated during a deploy.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const recovered = []
+
+    harness.events.length = 0
+    harness.channel.consumeError = new Error('queue still gone')
+
+    // Fails on attempts 1 and 2, succeeds on 3.
+    let failures = 2
+
+    const realConsume = harness.channel.consume.bind(harness.channel)
+
+    harness.channel.consume = async (...args) => {
+      if (failures-- > 0) throw new Error('queue still gone')
+
+      return realConsume(...args)
+    }
+
+    harness.channel.consumeError = null
+
+    await harness.channel.consumers.at(-1).callback(null)
+
+    await waitFor(
+      () => harness.events.some(e => e.event === 'consumerRecovered'),
+      5000,
+      'consumer recovered on the third attempt'
+    )
+
+    recovered.push(...harness.events.filter(e => e.event === 'consumerRecovered'))
+
+    assert.equal(recovered.length, 1)
+    assert.equal(recovered[0].payload.queueName, 'orders', 'the event says which queue came back')
+    assert.ok(recovered[0].payload.consumerTag, 'and under which tag')
+  })
+
+  test('subscribeSequential defaults its stale timeout to 30 seconds', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribeSequential('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    assert.equal(harness.manager.activeConsumers.get(consumerId).sequentialProcessor.staleTimeout, 30000)
+
+    await harness.manager.disposeAll()
+  })
+
+  test('the subscription log names the queue and the prefetch it settled on', async () => {
+    // Operators read these to confirm a deploy actually attached its consumers.
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    await harness.manager.subscribe('orders', async () => {}, { prefetchCount: 7 })
+    await harness.manager.subscribeSequential('steps', async () => {})
+
+    assert.ok(logger.records.info.some(line => line.includes('orders') && line.includes('7')))
+    assert.ok(logger.records.info.some(line => line.includes('steps') && line.includes('sequential')))
+
+    await harness.manager.disposeAll()
+  })
+
+  test('unsubscribing a sequential consumer disposes its processor', async () => {
+    // The processor owns a cleanup interval and two maps. Dropping the consumer
+    // without disposing it leaks all three for the life of the process.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribeSequential('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const processor = harness.manager.activeConsumers.get(consumerId).sequentialProcessor
+
+    assert.ok(processor, 'the sequential consumer built a processor')
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    assert.equal(processor.cleanupInterval._destroyed ?? false, true, 'its cleanup timer was cleared')
+  })
+
+  test('recreating a sequential consumer disposes the processor tied to the old channel', async () => {
+    // On reconnect the setup runs again. Keeping the previous processor alive
+    // leaves a second cleanup timer settling messages on a dead channel.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribeSequential('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const first = harness.manager.activeConsumers.get(consumerId).sequentialProcessor
+
+    await harness.manager.recreateAll()
+
+    const second = harness.manager.activeConsumers.get(consumerId).sequentialProcessor
+
+    assert.notEqual(second, first, 'a fresh processor was built')
+    assert.equal(first.cleanupInterval._destroyed ?? false, true, 'the previous one was disposed')
+
+    await harness.manager.disposeAll()
   })
 
   test('unsubscribe still tears down when the broker refuses the cancel', async () => {

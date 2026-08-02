@@ -1,3 +1,4 @@
+import os from 'node:os'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
@@ -64,6 +65,69 @@ describe('WorkerPool', () => {
     await waitFor(() => pool.size === 0, 5000, 'worker permanently dead')
 
     await assert.rejects(() => pool.run({ content: 'anyone there?' }), /All workers have died/)
+  })
+
+  test('defaults the worker count to the number of CPUs', async (t) => {
+    const pool = new WorkerPool(WORKER_FILE, { logger: silentLogger })
+
+    t.after(() => pool.terminate())
+
+    assert.equal(pool.size, os.cpus().length)
+  })
+
+  test('hands each worker its id and the caller\'s workerData', async (t) => {
+    // The worker reads workerData.workerId to identify itself, and callers
+    // pass their own fields alongside it. Dropping either leaves workers
+    // indistinguishable and any caller configuration silently missing.
+    const pool = new WorkerPool(WORKER_FILE, {
+      workerCount: 2,
+      workerData: { queueName: 'orders' },
+      logger: silentLogger
+    })
+
+    t.after(() => pool.terminate())
+
+    const results = await Promise.all([
+      pool.run({ content: 1 }),
+      pool.run({ content: 2 })
+    ])
+
+    const ids = results.map(r => r.workerId).sort()
+
+    assert.deepEqual(ids, [0, 1], 'each worker knows which one it is')
+  })
+
+  test('respawns up to five times by default', async (t) => {
+    // maxRespawns defaults to 5. Every existing test pins it explicitly, so
+    // the default was free to be anything, including 0.
+    const pool = new WorkerPool(WORKER_FILE, { workerCount: 1, logger: silentLogger })
+
+    t.after(() => pool.terminate())
+
+    assert.equal(pool.maxRespawns, 5)
+
+    // Five crashes are survivable; the sixth exhausts the budget.
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await assert.rejects(() => pool.run({ command: 'crash' }), /Worker exited/, `crash ${attempt}`)
+      await waitFor(() => pool.size === 1, 5000, `worker respawned after crash ${attempt}`)
+    }
+
+    await assert.rejects(() => pool.run({ command: 'crash' }), /Worker exited/)
+    await waitFor(() => pool.size === 0, 5000, 'the budget is exhausted after the sixth')
+  })
+
+  test('survives with no logger through crash, respawn and exhaustion', async (t) => {
+    // Every log call site guards with `?.`. Dropping one guard turns a worker
+    // crash — already the bad path — into a TypeError inside an event handler.
+    const pool = new WorkerPool(WORKER_FILE, { workerCount: 1, maxRespawns: 1 })
+
+    t.after(() => pool.terminate())
+
+    await assert.rejects(() => pool.run({ command: 'crash' }), /Worker exited/)
+    await waitFor(() => pool.size === 1, 5000, 'respawned without a logger')
+
+    await assert.rejects(() => pool.run({ command: 'crash' }), /Worker exited/)
+    await waitFor(() => pool.size === 0, 5000, 'gave up without a logger')
   })
 
   test('terminate rejects pending and future work', async (t) => {
