@@ -1,4 +1,5 @@
 import WorkerPool from './worker-pool.js'
+import describeError from '../utils/describe-error.js'
 import { setTimeout as sleep } from 'node:timers/promises'
 import SequentialProcessor from './sequential-processor.js'
 
@@ -280,7 +281,10 @@ class ConsumerManager {
 
           await processMessage(decodedContent, msg)
         } catch (error) {
-          this.logger.error(`Error processing message: ${error.message}`)
+          // describeError, not error.message: a handler can throw null or a
+          // string, and a crash here would leave the delivery unsettled
+          // forever — no ack, no nack, no redelivery until the channel dies.
+          this.logger.error(`Error processing message: ${describeError(error)}`)
 
           // The retry policy governs every failure in the pipeline, decode
           // errors included. A decode failure is deterministic, so under

@@ -386,6 +386,30 @@ describe('RabbitMQ facade topology delegation', () => {
     assert.ok(logger.records.error.some(line => line.includes('processor exploded')))
   })
 
+  test('processDeadLetterQueue settles a processor that throws a non-Error (issue #18)', async (t) => {
+    // The wrapper logs before rethrowing; reading .message on a null throw
+    // crashed the log line and turned a handled failure into an unhandled one.
+    const logger = recordingLogger()
+    const { rabbit, connection } = await connected(t, { logger })
+
+    await rabbit.processDeadLetterQueue('orders', async () => {
+      throw null // eslint-disable-line no-throw-literal
+    })
+
+    const channel = connection.channels.find(c => c.consumers.length)
+
+    await deliverTo(channel.consumers.at(-1), { id: 1 })
+    await waitFor(() => channel.nacked.length === 1, 3000, 'dead letter settled despite the null throw')
+
+    // The full line, not a substring: the un-normalised form crashes while
+    // building this exact message, and the TypeError it raises also contains
+    // the word "null" — a looser assertion is satisfied by the bug itself.
+    assert.ok(
+      logger.records.error.some(line => line.includes('Error processing dead letter message: null')),
+      'the DLQ log line is produced, not derailed by the thrown shape'
+    )
+  })
+
   test('processDeadLetterQueue honors retryPolicy instead of silently ignoring it', async (t) => {
     // Regression: the wrapper used to swallow every processor error, so the
     // callback never threw and the option documented for this method did

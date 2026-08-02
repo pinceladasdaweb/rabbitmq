@@ -1,3 +1,5 @@
+import describeError from '../utils/describe-error.js'
+
 class SequentialProcessor {
   constructor (options) {
     this.callback = options.callback
@@ -92,7 +94,10 @@ class SequentialProcessor {
 
       const requeue = this.shouldRequeue(message, error)
 
-      this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${error.message}`)
+      // describeError tolerates a handler throwing null or a string; reading
+      // .message here used to crash the catch and skip onFailure entirely,
+      // leaving the message unacknowledged (issue #18).
+      this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${describeError(error)}`)
       this.onFailure(message, error, requeue)
     }
   }

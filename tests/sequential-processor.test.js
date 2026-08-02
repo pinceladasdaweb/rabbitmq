@@ -125,6 +125,23 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(consulted, [{ messageId: 'bad', reason: 'boom' }], 'the policy sees the failing message and its error')
   })
 
+  test('a handler that throws a non-Error is still settled and reported (issue #18)', async (t) => {
+    // Reading error.message on `throw null` used to crash this catch before
+    // onFailure ran, leaving the message unacknowledged with no redelivery.
+    const errors = []
+    const { processor, nacked } = createProcessor(t, {
+      callback: async () => {
+        throw null // eslint-disable-line no-throw-literal
+      },
+      options: { logger: { ...silentLogger, error: (line) => errors.push(line) } }
+    })
+
+    await processor.handle({}, makeMessage('poison'))
+
+    assert.equal(nacked.length, 1, 'the failure reached onFailure')
+    assert.ok(errors.some(line => line.includes('null')), 'the log renders the thrown value')
+  })
+
   test('a failing message with no messageId is still reported and settled', async (t) => {
     // messageId is optional: dependency tracking needs it, plain processing
     // does not. The failure path must not assume it exists.
