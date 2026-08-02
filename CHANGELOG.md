@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.5.0 (2026-08-02)
+
+* feat(minor): add mutation testing, community files and a configurable channel backoff by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/294f874027004c53ff7a9e8f7605bbd111004b48)
+
+
 ## 1.4.0 (2026-08-01)
 
 * feat(minor): explicit retryPolicy option for every subscribe method by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/6b96cdc39ecb83096fffc84e1c715659579fde89)
