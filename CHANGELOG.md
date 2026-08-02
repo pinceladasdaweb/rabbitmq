@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 1.5.1 (2026-08-02)
+
+* fix: settle the message even when a handler throws a non-Error by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/b770912dfd465b83bb307ba7a138b5cec55bc4aa)
+
+
 ## 1.5.0 (2026-08-02)
 
 * feat(minor): add mutation testing, community files and a configurable channel backoff by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/294f874027004c53ff7a9e8f7605bbd111004b48)
