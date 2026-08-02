@@ -349,6 +349,160 @@ describe('RateLimiter', () => {
     })
   })
 
+  describe('defaults', () => {
+    test('falls back to the token-bucket strategy', async (t) => {
+      const limiter = new RateLimiter({ maxRequests: 2, windowMs: 60000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(limiter.getStatus('key-a').strategy, 'token-bucket')
+
+      assert.equal(await limiter.checkRateLimit('key-a'), true)
+      assert.equal(await limiter.checkRateLimit('key-a'), true)
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'the default strategy actually limits')
+    })
+  })
+
+  describe('burstable', () => {
+    // The whole burst feature had no assertions: burstable, burstLimit and the
+    // bucket sizing they drive were free to be anything.
+    test('is off by default: the bucket holds exactly maxRequests', async (t) => {
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 4, windowMs: 60000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(limiter.burstable, false)
+      assert.equal(limiter.tokenBucketSize, 4)
+      assert.equal(limiter.getStatus('key-a').remainingTokens, 4)
+    })
+
+    test('sizes the bucket to burstLimit when enabled', async (t) => {
+      const limiter = new RateLimiter({
+        strategy: 'token-bucket',
+        maxRequests: 4,
+        windowMs: 60000,
+        burstable: true,
+        burstLimit: 10
+      })
+
+      t.after(() => limiter.dispose())
+
+      assert.equal(limiter.tokenBucketSize, 10)
+      assert.equal(limiter.getStatus('key-a').burstable, true)
+
+      // The burst is real: more than maxRequests calls go through at once.
+      for (let i = 0; i < 10; i++) {
+        assert.equal(await limiter.checkRateLimit('key-a'), true, `burst call ${i + 1}`)
+      }
+
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'the burst is still bounded')
+    })
+
+    test('defaults burstLimit to one and a half times maxRequests', async (t) => {
+      const limiter = new RateLimiter({
+        strategy: 'token-bucket',
+        maxRequests: 4,
+        windowMs: 60000,
+        burstable: true
+      })
+
+      t.after(() => limiter.dispose())
+
+      assert.equal(limiter.burstLimit, 6, 'multiplied, not divided')
+      assert.equal(limiter.tokenBucketSize, 6)
+    })
+  })
+
+  describe('cleanup leaves live state alone', () => {
+    // The sweep tests above prove it collects. These prove it does not
+    // over-collect: a sweep that drops a live counter silently resets someone's
+    // rate limit and lets the traffic it was holding back through.
+    const sweptAtLeastOnce = (limiter) => sleep(Math.min(limiter.windowMs / 10, 60000) * 3 + 20)
+
+    test('keeps a fixed-window counter that belongs to the current window', async (t) => {
+      const windowMs = 3000
+      const limiter = new RateLimiter({ strategy: 'fixed-window', maxRequests: 2, windowMs })
+      t.after(() => limiter.dispose())
+
+      // Fixed windows are anchored to the clock, not to when the limiter was
+      // built: the boundary falls every `windowMs` of epoch time. If one passes
+      // while this test sleeps, the sweep drops the entry for the right reason
+      // and the assertions below would fail on correct code. Rather than pay an
+      // alignment wait up front, the observation is retried on the rare pass
+      // that straddles a boundary.
+      const windowAt = () => Math.floor(Date.now() / windowMs) * windowMs
+      let openedIn, closedIn
+
+      do {
+        openedIn = windowAt()
+
+        await limiter.checkRateLimit('key-a', 2)
+        assert.equal(limiter.getRemainingTokens('key-a'), 0)
+
+        await sweptAtLeastOnce(limiter)
+
+        closedIn = windowAt()
+      } while (openedIn !== closedIn)
+
+      assert.equal(limiter.requests.has('key-a'), true, 'the entry survived the sweep')
+      assert.equal(limiter.getRemainingTokens('key-a'), 0, 'and its count was not reset')
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'so the key is still limited')
+    })
+
+    test('keeps sliding-window entries that are still inside the window', async (t) => {
+      const limiter = new RateLimiter({ strategy: 'sliding-window', maxRequests: 2, windowMs: 3000 })
+      t.after(() => limiter.dispose())
+
+      await limiter.checkRateLimit('key-a', 2)
+
+      await sweptAtLeastOnce(limiter)
+
+      assert.equal(limiter.requests.has('key-a'), true)
+      assert.equal(limiter.getRemainingTokens('key-a'), 0)
+      assert.equal(await limiter.checkRateLimit('key-a'), false)
+    })
+
+    test('keeps a token bucket that was refilled recently', async (t) => {
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 3000 })
+      t.after(() => limiter.dispose())
+
+      await limiter.checkRateLimit('key-a', 2)
+      assert.equal(limiter.buckets.size, 1)
+
+      await sweptAtLeastOnce(limiter)
+
+      assert.equal(limiter.buckets.size, 1, 'a fresh bucket is not collectable')
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'its spent tokens were not restored')
+    })
+
+    test('keeps a leaky-bucket queue that has not drained yet', async (t) => {
+      const limiter = new RateLimiter({ strategy: 'leaky-bucket', maxRequests: 100, windowMs: 3000, queueLimit: 2 })
+      t.after(() => limiter.dispose())
+
+      await limiter.checkRateLimit('key-a', 2)
+      assert.equal(limiter.leakyQueues.has('key-a'), true)
+
+      await sweptAtLeastOnce(limiter)
+
+      assert.equal(limiter.leakyQueues.has('key-a'), true, 'the queue survived the sweep')
+      assert.equal(limiter.getRemainingTokens('key-a'), 0, 'and still counts as occupied')
+    })
+
+    test('does not release a block that has not expired', async (t) => {
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 3000 })
+      t.after(() => limiter.dispose())
+
+      const unblocked = []
+
+      limiter.on('key-unblocked', ({ key }) => unblocked.push(key))
+      limiter.blockKey('key-a', 60000)
+
+      await sweptAtLeastOnce(limiter)
+
+      assert.deepEqual(unblocked, [], 'nothing was unblocked early')
+      assert.equal(limiter.getStatus('key-a').isBlocked, true)
+      assert.equal(await limiter.checkRateLimit('key-a'), false)
+    })
+  })
+
   describe('dispose', () => {
     test('clears internal state', async () => {
       const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 1, windowMs: 60000 })

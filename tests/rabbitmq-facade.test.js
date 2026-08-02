@@ -67,6 +67,170 @@ const deliverTo = (consumer, payload, properties = {}) => consumer.callback({
   properties: { headers: { 'x-compressed': false }, ...properties }
 })
 
+describe('RabbitMQ facade constructor defaults', () => {
+  // None of these had an assertion: every fallback was free to be anything,
+  // including nothing. They are observable at the wire — the connection string
+  // the dialer receives, the client properties, the exchanges declared.
+  const bare = (t, options = {}) => {
+    const dialer = createDialer()
+
+    installDialer(t, dialer)
+
+    const rabbit = new RabbitMQ({
+      username: 'admin',
+      password: 'admin',
+      endpoints: ['node-a:5672'],
+      channelPoolSize: 1,
+      logger: silentLogger,
+      ...options
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    return { rabbit, dialer }
+  }
+
+  test('names the connection default_connection when none is given', async (t) => {
+    const { rabbit, dialer } = bare(t)
+
+    await rabbit.connect()
+
+    assert.equal(dialer.socketOptions.clientProperties.connection_name, 'default_connection')
+  })
+
+  test('falls back to the environment for credentials and endpoint', async (t) => {
+    const previous = {
+      user: process.env.RABBITMQ_USER,
+      pass: process.env.RABBITMQ_PASS,
+      endpoint: process.env.RABBITMQ_ENDPOINT
+    }
+
+    process.env.RABBITMQ_USER = 'env-user'
+    process.env.RABBITMQ_PASS = 'env-pass'
+    process.env.RABBITMQ_ENDPOINT = 'env-host:5672'
+
+    t.after(() => {
+      for (const [key, value] of [['RABBITMQ_USER', previous.user], ['RABBITMQ_PASS', previous.pass], ['RABBITMQ_ENDPOINT', previous.endpoint]]) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    })
+
+    const dialer = createDialer()
+
+    installDialer(t, dialer)
+
+    const rabbit = new RabbitMQ({ channelPoolSize: 1, logger: silentLogger })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    assert.equal(dialer.urls[0], 'amqp://env-user:env-pass@env-host:5672')
+  })
+
+  test('explicit options win over the environment', async (t) => {
+    const previous = process.env.RABBITMQ_USER
+
+    process.env.RABBITMQ_USER = 'env-user'
+    t.after(() => {
+      if (previous === undefined) delete process.env.RABBITMQ_USER
+      else process.env.RABBITMQ_USER = previous
+    })
+
+    const { rabbit, dialer } = bare(t)
+
+    await rabbit.connect()
+
+    assert.match(dialer.urls[0], /^amqp:\/\/admin:admin@node-a:5672$/)
+  })
+
+  test('accepts a single endpoint as well as a list', async (t) => {
+    const dialer = createDialer()
+
+    installDialer(t, dialer)
+
+    const rabbit = new RabbitMQ({
+      username: 'admin',
+      password: 'admin',
+      endpoint: 'solo-host:5672',
+      channelPoolSize: 1,
+      logger: silentLogger
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    assert.equal(dialer.urls[0], 'amqp://admin:admin@solo-host:5672')
+  })
+
+  test('defaults the dead letter exchange to dlx', async (t) => {
+    const { rabbit, dialer } = bare(t)
+
+    await rabbit.connect()
+    await rabbit.setupDeadLetterExchange()
+
+    const declared = dialer.connections[0].channels.flatMap(c => c.assertedExchanges)
+
+    assert.ok(declared.some(e => e.name === 'dlx'), 'the DLQ routing depends on this name')
+  })
+
+  test('defaults the delay exchange to delayed', async (t) => {
+    const { rabbit, dialer } = bare(t)
+
+    await rabbit.connect()
+    await rabbit.setupDelayExchange()
+
+    const declared = dialer.connections[0].channels.flatMap(c => c.assertedExchanges)
+
+    assert.ok(declared.some(e => e.name === 'delayed' && e.type === 'x-delayed-message'))
+  })
+
+  test('defaults maxPriority to 10', async (t) => {
+    const { rabbit } = bare(t, { exchange: { name: 'prio-exchange', type: 'direct' } })
+
+    await rabbit.connect()
+
+    await rabbit.publish('route', { n: 1 }, { priority: 10 })
+    await assert.rejects(() => rabbit.publish('route', { n: 1 }, { priority: 11 }), /priority/i)
+  })
+
+  test('defaults the exchange type to direct when only a name is given', async (t) => {
+    const { rabbit, dialer } = bare(t, { exchange: { name: 'typeless-exchange' } })
+
+    await rabbit.connect()
+
+    const declared = dialer.connections[0].channels.flatMap(c => c.assertedExchanges)
+
+    assert.ok(declared.some(e => e.name === 'typeless-exchange' && e.type === 'direct'))
+  })
+
+  test('resolves a queue name from a consumer tag for dead lettering', async (t) => {
+    // The facade wires this lookup into Topology; without it moveToDeadLetter
+    // falls back to the routing key and can pick the wrong DLQ.
+    const { rabbit, dialer } = bare(t, { exchange: { name: 'dl-exchange', type: 'direct' } })
+
+    await rabbit.connect()
+    await rabbit.createQueue('orders')
+
+    const consumer = await rabbit.subscribe('orders', async () => {})
+
+    await rabbit.moveToDeadLetter({
+      content: Buffer.from('{}'),
+      fields: { consumerTag: consumer.consumerTag, routingKey: 'some-other-route' },
+      properties: { headers: {} }
+    })
+
+    const published = dialer.connections[0].channels.flatMap(c => c.published)
+
+    assert.ok(
+      published.some(p => p.routingKey === 'orders_dlq'),
+      'resolved through the consumer tag, not the routing key'
+    )
+  })
+})
+
 describe('RabbitMQ facade consumption delegation', () => {
   test('subscribe reaches the broker with the configured prefetch', async (t) => {
     const { rabbit, connection } = await connected(t, { prefetchCount: 7 })
@@ -510,6 +674,105 @@ describe('RabbitMQ facade connection edge cases', () => {
     )
   })
 
+  test('waitForConnection with no timeout waits indefinitely and still resolves', async (t) => {
+    // Omitting the timeout is the documented way to say "block until the
+    // broker is back". No timer is armed at all, so the cleanup path runs with
+    // nothing to clear — a branch the timed variant never reaches.
+    const dialer = createDialer([new Error('broker down'), 'ok'])
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    const connection = await rabbit.connect({ waitForConnection: true })
+
+    assert.ok(connection, 'the reconnection satisfied the waiter')
+    assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+  })
+
+  test('waitForConnection treats timeout: 0 as no timeout', async (t) => {
+    // The guard is `timeout > 0`, so zero means "no deadline" rather than
+    // "expire immediately" — arming a 0ms timer would reject the caller before
+    // the first reconnection attempt even runs.
+    const dialer = createDialer([new Error('broker down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 60, maxReconnectInterval: 60 })
+
+    t.after(() => rabbit.disconnect())
+
+    const connection = await rabbit.connect({ waitForConnection: true, timeout: 0 })
+
+    assert.ok(connection, 'zero did not cut the wait short')
+    assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+  })
+
+  test('waitForConnection gives up when the reconnection does', async (t) => {
+    const dialer = createDialer([new Error('broker down')])
+    const rabbit = createRabbit(t, dialer, { maxReconnectAttempts: 1 })
+
+    t.after(() => rabbit.disconnect())
+
+    await assert.rejects(
+      () => rabbit.connect({ waitForConnection: true }),
+      /all reconnection attempts failed/
+    )
+  })
+
+  test('disconnect disposes the rate limiter', async (t) => {
+    // The limiter owns a sweep interval and per-key state. Leaving it running
+    // after disconnect keeps a timer alive for a client nobody is using.
+    const { rabbit } = await connected(t, {
+      rateLimiter: { enabled: true, maxRequests: 1, interval: 60000, strategy: 'fixed-window' }
+    })
+
+    await rabbit.publish('route', { n: 1 })
+    await assert.rejects(() => rabbit.publish('route', { n: 2 }, { maxRetries: 1 }), /Rate limit exceeded/)
+
+    await rabbit.disconnect()
+
+    assert.equal(
+      rabbit.getRateLimitStatus('route').remainingTokens,
+      1,
+      'disposing cleared the per-key state'
+    )
+  })
+
+  test('a throwing disconnected listener does not abort the shutdown', async (t) => {
+    // emit('disconnected') runs inside disconnect()'s try, so a listener that
+    // throws lands in the catch. Without it, one bad application listener
+    // would turn a graceful shutdown into a rejected promise.
+    const logger = recordingLogger()
+    const { rabbit } = await connected(t, { logger })
+
+    rabbit.on('disconnected', () => { throw new Error('listener blew up') })
+
+    await assert.doesNotReject(() => rabbit.disconnect())
+
+    assert.ok(
+      logger.records.warn.some(line => line.includes('listener blew up')),
+      'the failure is reported, not swallowed silently'
+    )
+    assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected', 'the connection still went down')
+  })
+
+  test('uses the built-in logger when none is provided', async (t) => {
+    // options.logger has a default. Losing it makes every log call throw on a
+    // client constructed the simplest possible way.
+    const dialer = createDialer()
+
+    installDialer(t, dialer)
+
+    const rabbit = new RabbitMQ({
+      username: 'admin',
+      password: 'admin',
+      endpoints: ['node-a:5672'],
+      channelPoolSize: 1
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    await assert.doesNotReject(() => rabbit.connect())
+    assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+  })
+
   test('getChannel rejects once the pool is gone', async (t) => {
     const { rabbit } = await connected(t)
 
@@ -522,6 +785,29 @@ describe('RabbitMQ facade connection edge cases', () => {
     const { rabbit } = await connected(t)
 
     assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+  })
+
+  test('circuit breaker state changes surface on the facade', async (t) => {
+    // Another context.emit bridge — this one documented as
+    // circuitBreakerStateChanged, and the only way an application learns
+    // publishing has been cut off.
+    const { rabbit, connection } = await connected(t, {
+      circuitBreaker: { failureThreshold: 2, timeout: 60000 }
+    })
+
+    const states = []
+
+    rabbit.on('circuitBreakerStateChanged', (state) => states.push(state))
+
+    connection.channels.forEach((channel) => {
+      channel.confirmErrors.push(new Error('broker refused'), new Error('broker refused'))
+    })
+
+    for (let i = 0; i < 2; i++) {
+      await rabbit.publish('route', { n: i }, { maxRetries: 1 }).catch(() => {})
+    }
+
+    await waitFor(() => states.includes('OPEN'), 3000, 'the breaker opening reached the facade')
   })
 
   test('consumer events raised inside ConsumerManager surface on the facade', async (t) => {
@@ -567,6 +853,61 @@ describe('RabbitMQ facade connection edge cases', () => {
 })
 
 describe('RabbitMQ facade shutdown', () => {
+  // Both process hooks are captured rather than installed: a genuine SIGTERM
+  // handler would let a cancelled CI run exit 0 and report an aborted suite as
+  // green, and a genuine process.exit would end the test runner.
+  const captureProcessHooks = (t) => {
+    const installed = []
+    const exits = []
+    const originalOn = process.on.bind(process)
+    const originalExit = process.exit.bind(process)
+
+    // process.once() routes through process.on() with a wrapper, so this
+    // intercepts both.
+    process.on = (event, handler) => {
+      if (event === 'SIGINT' || event === 'SIGTERM') {
+        installed.push({ event, handler })
+
+        return process
+      }
+
+      return originalOn(event, handler)
+    }
+
+    process.exit = (code) => { exits.push(code) }
+
+    t.after(() => {
+      process.on = originalOn
+      process.exit = originalExit
+    })
+
+    return { installed, exits }
+  }
+
+  test('exits the process on a clean shutdown by default', async (t) => {
+    // The default is exitProcess: true — a signal handler that disconnects and
+    // then lets the process linger defeats the point of installing one.
+    const { rabbit } = await connected(t)
+    const { installed, exits } = captureProcessHooks(t)
+
+    rabbit.enableGracefulShutdown()
+
+    await installed[0].handler()
+    await waitFor(() => exits.length === 1, 3000, 'the process was asked to exit')
+
+    assert.deepEqual(exits, [0], 'a clean shutdown exits 0')
+    assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected')
+  })
+
+  test('honors a custom signal list', async (t) => {
+    const { rabbit } = await connected(t)
+    const { installed } = captureProcessHooks(t)
+
+    rabbit.enableGracefulShutdown({ signals: ['SIGTERM'], exitProcess: false })
+
+    assert.deepEqual(installed.map(entry => entry.event), ['SIGTERM'], 'only what was asked for')
+  })
+
   test('enableGracefulShutdown is idempotent and disconnects on the signal', async (t) => {
     const { rabbit } = await connected(t)
     const installed = []

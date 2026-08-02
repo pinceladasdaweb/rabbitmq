@@ -54,6 +54,27 @@ describe('logger', () => {
     assert.equal(logMock.mock.callCount(), 1)
   })
 
+  test('reads the level from LOG_LEVEL when the caller gives none', (t) => {
+    // The default parameter is `process.env.LOG_LEVEL || 'info'`. Without the
+    // environment read, setting LOG_LEVEL=debug in a deployment silently does
+    // nothing and the diagnostics people turned on never appear.
+    const previous = process.env.LOG_LEVEL
+
+    process.env.LOG_LEVEL = 'debug'
+    t.after(() => {
+      if (previous === undefined) delete process.env.LOG_LEVEL
+      else process.env.LOG_LEVEL = previous
+    })
+
+    // debug is written through console.log, like info.
+    const logMock = t.mock.method(console, 'log', () => {})
+    const logger = createLogger()
+
+    logger.debug('now visible')
+
+    assert.equal(logMock.mock.callCount(), 1, 'LOG_LEVEL=debug lets debug through')
+  })
+
   test('falls back to info for unknown levels', (t) => {
     const logMock = t.mock.method(console, 'log', () => {})
 

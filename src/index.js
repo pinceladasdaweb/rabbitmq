@@ -19,6 +19,7 @@ class RabbitMQ extends EventEmitter {
   #exchange
   #channelPool
   #channelPoolSize
+  #channelRecoveryInterval
   #codec
   #circuitBreaker
   #cache
@@ -39,6 +40,9 @@ class RabbitMQ extends EventEmitter {
     this.#exchange = options.exchange || {}
     this.#channelPool = null
     this.#channelPoolSize = options.channelPoolSize || 10
+    // Left undefined when unset: ChannelPool owns the default, and repeating
+    // it here would be a second source of truth that no test could tell apart.
+    this.#channelRecoveryInterval = options.channelRecoveryInterval
     this.#useCache = options.useCache || false
     this.#shutdownHandlersInstalled = false
     this.#connectPromise = null
@@ -245,7 +249,7 @@ class RabbitMQ extends EventEmitter {
       throw new Error('No active connection to RabbitMQ')
     }
 
-    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize)
+    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval)
     await this.#channelPool.initialize()
   }
 

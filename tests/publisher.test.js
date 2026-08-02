@@ -41,6 +41,10 @@ describe('Publisher validation', () => {
     assert.throws(() => publisher.validatePriority({ priority: -1 }), /Invalid priority/)
     assert.throws(() => publisher.validatePriority({ priority: 11 }), /Invalid priority/)
     assert.doesNotThrow(() => publisher.validatePriority({ priority: 10 }), 'maxPriority itself is valid')
+    // Both ends of the range are inclusive. Zero is the AMQP default priority,
+    // so rejecting it would break the most ordinary explicit value there is.
+    assert.doesNotThrow(() => publisher.validatePriority({ priority: 0 }), 'zero is a valid priority')
+    assert.doesNotThrow(() => publisher.validatePriority({}), 'omitting priority is always fine')
   })
 })
 
@@ -285,6 +289,26 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
 
     await assert.rejects(() => publisher.publishAsyncBatch('orders', []), /non-empty array/)
     await assert.rejects(() => publisher.publishAsyncBatch('orders', 'nope'), /non-empty array/)
+  })
+
+  test('a non-Error channel failure during drain still rejects with an Error', async () => {
+    // amqplib emits whatever the broker handed it. A thrown string would leave
+    // the caller with `undefined` for error.message on the retry path.
+    const { publisher, channel } = createPublisher()
+
+    channel.keepGoingResults.push(false)
+
+    const pending = publisher.publishAsyncBatch('orders', [{ n: 1 }, { n: 2 }])
+      .then(() => null, (error) => error)
+
+    await sleep(20)
+
+    channel.emit('error', 'connection reset by peer')
+
+    const error = await pending
+
+    assert.ok(error instanceof Error, 'the caller always receives an Error')
+    assert.match(error.message, /Channel error while waiting for drain/)
   })
 
   test('publishAsyncBatch logs and rethrows when the batch cannot be published', async () => {

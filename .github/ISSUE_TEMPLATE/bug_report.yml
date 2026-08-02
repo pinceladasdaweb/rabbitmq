@@ -1,0 +1,88 @@
+name: Bug report
+description: The library behaves differently from what the documentation says
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Found a security vulnerability instead? Do not file it here — use
+        [private reporting](https://github.com/pinceladasdaweb/rabbitmq/security/advisories/new).
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: And what you expected instead.
+      placeholder: |
+        After the broker restarts, publishing works again but the consumer never receives another message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >
+        The smallest snippet that shows it — how the client is constructed,
+        the subscribe or publish calls involved, and what you send. If the
+        broker has to be in a particular state (queue deleted, connection
+        dropped, plugin missing), say how to get it there.
+      render: js
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Optional, but usually decisive. The library logs connection,
+        reconnection, consumer recovery and settlement failures — the lines
+        around the moment things go wrong are worth more than a stack trace.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+      placeholder: 1.4.0
+    validations:
+      required: true
+
+  - type: input
+    id: broker
+    attributes:
+      label: RabbitMQ version and topology
+      description: Single node or cluster, and whether it runs behind a proxy or load balancer.
+      placeholder: RabbitMQ 4.2.8, single node in Docker
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime
+      placeholder: Node 24.3.0 on Linux
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is involved
+      multiple: true
+      options:
+        - connection / reconnection
+        - channel pool
+        - publishing (confirms, batches, retries)
+        - consuming (subscribe)
+        - sequential consuming (depends-on)
+        - parallel consuming (worker threads)
+        - acknowledgement / retryPolicy
+        - dead letter queues
+        - request/response (RPC)
+        - delayed messages
+        - circuit breaker / rate limiter
+        - cache
+        - types (index.d.ts)
+        - other

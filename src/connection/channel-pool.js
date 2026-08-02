@@ -3,10 +3,15 @@ import { setTimeout as sleep } from 'node:timers/promises'
 const MAX_REPLACE_ATTEMPTS = 5
 
 class ChannelPool {
-  constructor (connection, logger, size = 10) {
+  // recoveryInterval is the base backoff between attempts to recreate a dead
+  // pool channel (attempt N waits N × this value). Configurable for the same
+  // reason consumerRecoveryInterval is: five attempts at the default add up to
+  // 7.5s, which is right for a broker restart and far too slow for a test.
+  constructor (connection, logger, size = 10, recoveryInterval = 500) {
     this.connection = connection
     this.logger = logger
     this.size = size
+    this.recoveryInterval = recoveryInterval
     this.channels = []
     this.index = 0
     this.dedicatedChannels = new Map()
@@ -62,7 +67,7 @@ class ChannelPool {
       } catch (error) {
         this.logger.warn(`Failed to recreate pool channel ${index} (attempt ${attempt}/${MAX_REPLACE_ATTEMPTS}): ${error.message}`)
 
-        await sleep(500 * attempt, undefined, { ref: false })
+        await sleep(this.recoveryInterval * attempt, undefined, { ref: false })
       }
     }
 

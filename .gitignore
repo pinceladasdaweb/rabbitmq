@@ -4,3 +4,7 @@ index.d.cts
 .vscode/
 .DS_Store
 .env
+
+# Stryker mutation reports
+reports/
+.stryker-tmp/

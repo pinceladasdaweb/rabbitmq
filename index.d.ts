@@ -63,6 +63,8 @@ export interface RabbitMQOptions {
   exchange?: ExchangeOptions
   prefetchCount?: number
   channelPoolSize?: number
+  /** Base backoff in ms between attempts to recreate a dead pool channel (attempt N waits N * this, 5 attempts before the slot is dropped). Default: 500. */
+  channelRecoveryInterval?: number
   /** Base backoff in ms between attempts to recover a broker-cancelled consumer (attempt N waits N * this). Default: 1000. */
   consumerRecoveryInterval?: number
   useCompression?: boolean

@@ -218,6 +218,112 @@ describe('SequentialProcessor', () => {
     await first
   })
 
+  test('processes and acks a message that carries no messageId', async (t) => {
+    // messageId is only needed for dependency tracking. A plain message
+    // without one must still run, still be acked, and leave no bookkeeping
+    // entry behind — every `if (messageId)` guard has a live path both ways.
+    const processed = []
+    const { processor, acked } = createProcessor(t, {
+      callback: async (content) => processed.push(content)
+    })
+
+    await processor.handle({ n: 1 }, { properties: {}, fields: {} })
+
+    assert.deepEqual(processed, [{ n: 1 }])
+    assert.deepEqual(acked, [undefined], 'onSuccess still received the message')
+    assert.equal(processor.processing.size, 0, 'nothing was tracked for it')
+  })
+
+  test('works with no logger at all', async (t) => {
+    // logger is optional and every call site guards with `?.`. Dropping one
+    // guard throws on the first message, so this exercises all four paths:
+    // parking a dependent, success, failure, and releasing the dependent.
+    let releaseFirst
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+
+    const processor = new SequentialProcessor({
+      callback: async (content) => {
+        if (content.hold) await firstBlocked
+        if (content.explode) throw new Error('boom')
+      },
+      staleTimeout: 30000,
+      onSuccess: () => {},
+      onFailure: () => {}
+    })
+
+    t.after(() => processor.dispose())
+
+    const first = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('waiting', { dependsOn: 'dep' }))
+    await processor.handle({ explode: true }, makeMessage('bad'))
+
+    releaseFirst()
+    await first
+
+    assert.equal(processor.pending.size, 0, 'the dependent was released without a logger')
+  })
+
+  test('clears the dependency index once a dependency resolves', async (t) => {
+    // The secondary index is what makes releasing dependents O(1). If its
+    // entries are not removed it grows for every messageId ever seen.
+    const { processor, acked } = createProcessor(t)
+
+    let releaseFirst
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+
+    const { processor: gated } = createProcessor(t, {
+      callback: async (content) => { if (content.hold) await firstBlocked }
+    })
+
+    const first = gated.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await gated.handle({}, makeMessage('child', { dependsOn: 'dep' }))
+
+    assert.equal(gated.pendingByDependency.size, 1, 'the dependent is indexed while it waits')
+
+    releaseFirst()
+    await first
+    await sleep(20)
+
+    assert.equal(gated.pendingByDependency.size, 0, 'the index entry is dropped, not left behind')
+    assert.equal(gated.pending.size, 0)
+
+    // The unrelated processor keeps the helper's t.after cleanup honest.
+    await processor.handle({}, makeMessage('solo'))
+    assert.deepEqual(acked, ['solo'])
+  })
+
+  test('clears the dependency index when a dependent expires instead of resolving', async (t) => {
+    // The resolve path deletes the whole index entry at once; the expiry path
+    // goes through #removePending and prunes one dependent at a time. Only
+    // this path can leave an empty Set behind for every dependency ever seen.
+    let releaseFirst
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+
+    const { processor } = createProcessor(t, {
+      staleTimeout: 80,
+      callback: async (content) => { if (content.hold) await firstBlocked }
+    })
+
+    const first = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('child', { dependsOn: 'dep' }))
+
+    assert.equal(processor.pendingByDependency.size, 1)
+
+    await sleep(200)
+
+    assert.equal(processor.pending.size, 0, 'the dependent expired')
+    assert.equal(processor.pendingByDependency.size, 0, 'and its index entry went with it')
+
+    releaseFirst()
+    await first
+  })
+
   test('dispose clears internal state', async (t) => {
     const { processor } = createProcessor(t)
 

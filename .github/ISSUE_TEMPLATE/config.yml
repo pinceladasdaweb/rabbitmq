@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/pinceladasdaweb/rabbitmq/security/advisories/new
+    about: Privately, so a fix can go out before the details are public. Never as an issue.
+  - name: Documentation
+    url: https://github.com/pinceladasdaweb/rabbitmq#readme
+    about: Every method, its options and the trade-offs behind them.
+  - name: Runnable examples
+    url: https://github.com/pinceladasdaweb/rabbitmq/tree/main/examples
+    about: 24 self-contained examples, from a basic connection to RPC and retry policies.

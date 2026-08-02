@@ -166,6 +166,14 @@ npm run test:integration
 
 Both suites also run on every push and pull request via GitHub Actions (`.github/workflows/ci.yml`), with RabbitMQ provisioned as a service container.
 
+Mutation testing grades whether those tests actually assert anything — it breaks a line in `src/` and checks that a test notices:
+
+```bash
+npm run test:mutation
+```
+
+It runs [Stryker](https://stryker-mutator.io/) over the unit suite and writes an HTML report to `reports/mutation/index.html`. Deliberately not part of CI: it is slow, and it is a gate for the person writing the tests rather than a check on the branch. A surviving mutant is a missing assertion until proven to be an equivalent mutant — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### Installing Delayed Message Plugin
 
 The RabbitMQ Delayed Message Plugin is required for using message scheduling features (`publishDelayed()`).
@@ -288,6 +296,9 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 - **prefetchCount** `{number}`: Number of messages to prefetch.
   - Default: `10`
   - Example: `1`
+- **channelRecoveryInterval** `{number}`: Base backoff in milliseconds between attempts to recreate a pool channel the broker killed (attempt N waits N × this value, 5 attempts before the slot is dropped from rotation).
+  - Default: `500`
+  - Example: `100`
 - **consumerRecoveryInterval** `{number}`: Base backoff in milliseconds between attempts to recover a consumer cancelled by the broker (attempt N waits N × this value, up to 3 attempts before `consumerLost` is emitted).
   - Default: `1000`
   - Example: `500`
@@ -1228,17 +1239,14 @@ See [examples/21 - consumer-management](examples/21%20-%20consumer-management) a
 
 ## Contributing
 
-**Use issues for everything**
+[CONTRIBUTING.md](CONTRIBUTING.md) has the setup, the commands and the rules a change has to meet — most of them are about the failure modes this library hides well, like a consumer that silently stops draining or a message settled on the wrong channel.
 
-- For a small change, just send a PR.
-- For bigger changes open an issue for discussion before sending a PR.
-- PR should have:
-  - Documentation
-  - Example (If it makes sense)
-- You can also contribute by:
-  - Reporting issues
-  - Suggesting new features or enhancements
-  - Improve/fix documentation
+The short version:
+
+- Small change: send a PR against `development`. Bigger change: open an issue first.
+- A PR carries tests that fail without it, documentation, and an example when there is a choice for the user to make.
+- Bugs and feature requests go through the [issue templates](https://github.com/pinceladasdaweb/rabbitmq/issues/new/choose). Security vulnerabilities do **not** — see [SECURITY.md](SECURITY.md).
+- Participation is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Author
 - Pedro Rogério - [Github](https://github.com/pinceladasdaweb)

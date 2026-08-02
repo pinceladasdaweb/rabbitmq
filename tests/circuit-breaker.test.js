@@ -98,6 +98,28 @@ describe('CircuitBreaker', () => {
     assert.equal(await breaker.execute(succeedingOperation), 'ok')
   })
 
+  test('reset announces the transition only when there was one to announce', async () => {
+    // reset() runs after every successful reconnection. Emitting CLOSED on an
+    // already closed breaker would tell the application the circuit just
+    // recovered, on a connection that never tripped it.
+    const breaker = new CircuitBreaker({ failureThreshold: 1, timeout: 60000 })
+    const states = []
+
+    breaker.on('stateChanged', (state) => states.push(state))
+
+    breaker.reset()
+    assert.deepEqual(states, [], 'resetting a healthy breaker says nothing')
+
+    await assert.rejects(() => breaker.execute(failingOperation), /boom/)
+    assert.deepEqual(states, ['OPEN'])
+
+    breaker.reset()
+    assert.deepEqual(states, ['OPEN', 'CLOSED'], 'recovering from OPEN is announced exactly once')
+
+    breaker.reset()
+    assert.deepEqual(states, ['OPEN', 'CLOSED'], 'and not repeated')
+  })
+
   test('getState exposes counters', async () => {
     const breaker = new CircuitBreaker({ failureThreshold: 5 })
 
