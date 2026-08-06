@@ -8,24 +8,11 @@ import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
 import CircuitBreaker from '../src/resilience/circuit-breaker.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
+import { withLiveEventLoop } from './helpers.js'
 
 const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
-
-// Node 22's test runner cancels a test whose only pending work is an unref'd
-// timer ('Promise resolution is still pending but the event loop has already
-// resolved') — and the RPC timeout timer is deliberately unref'd. A ref'd
-// interval holds the loop open while a purely timeout-driven assertion runs.
-const withLiveEventLoop = async (run) => {
-  const keepAlive = setInterval(() => {}, 50)
-
-  try {
-    return await run()
-  } finally {
-    clearInterval(keepAlive)
-  }
-}
 
 const waitFor = async (predicate, timeoutMs = 2000, label = 'condition') => {
   const start = Date.now()

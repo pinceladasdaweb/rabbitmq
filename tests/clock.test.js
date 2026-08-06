@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { test, describe } from 'node:test'
 import systemClock from '../src/utils/clock.js'
+import { withLiveEventLoop } from './helpers.js'
 
 const run = promisify(execFile)
 
@@ -18,15 +19,15 @@ describe('systemClock', () => {
     assert.ok(reported >= before && reported <= after)
   })
 
-  test('sleep() actually waits for the requested duration', async () => {
+  test('sleep() actually waits for the requested duration', () => withLiveEventLoop(async () => {
     const start = Date.now()
 
     await systemClock.sleep(25)
 
     assert.ok(Date.now() - start >= 20, 'a sleep that resolves early breaks the leaky bucket pacing')
-  })
+  }))
 
-  test('setTimeout() fires exactly once and clearTimeout() cancels it', async () => {
+  test('setTimeout() fires exactly once and clearTimeout() cancels it', () => withLiveEventLoop(async () => {
     let fired = 0
     const kept = systemClock.setTimeout(() => { fired++ }, 5)
     const cancelled = systemClock.setTimeout(() => { fired += 100 }, 5)
@@ -37,7 +38,7 @@ describe('systemClock', () => {
     await systemClock.sleep(30)
 
     assert.equal(fired, 1, 'the kept timer fired once, the cancelled one never')
-  })
+  }))
 
   test('a pending sleep does not hold the process open', async () => {
     // The leaky bucket's smoothing delay scales with queue occupancy; a ref'd
@@ -53,7 +54,7 @@ describe('systemClock', () => {
     assert.equal(stdout, '', 'the child exited on its own instead of waiting out the sleep')
   })
 
-  test('setInterval() fires repeatedly and clearInterval() stops it', async () => {
+  test('setInterval() fires repeatedly and clearInterval() stops it', () => withLiveEventLoop(async () => {
     let fired = 0
     const handle = systemClock.setInterval(() => { fired++ }, 5)
 
@@ -69,5 +70,5 @@ describe('systemClock', () => {
     await systemClock.sleep(25)
 
     assert.equal(fired, atClear, 'a cleared interval must never fire again')
-  })
+  }))
 })

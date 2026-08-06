@@ -17,6 +17,22 @@ export const recordingLogger = () => {
 
 export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Node 22's test runner cancels a test whose only pending work is an unref'd
+// timer ('Promise resolution is still pending but the event loop has already
+// resolved') — and both the RPC timeout timer and systemClock.sleep are
+// deliberately unref'd. One cancelled test takes the whole file down with
+// cancelledByParent, so a ref'd interval holds the loop open while a purely
+// timer-driven assertion runs.
+export const withLiveEventLoop = async (run) => {
+  const keepAlive = setInterval(() => {}, 50)
+
+  try {
+    return await run()
+  } finally {
+    clearInterval(keepAlive)
+  }
+}
+
 export const waitFor = async (predicate, timeoutMs = 3000, label = 'condition') => {
   const start = Date.now()
 
