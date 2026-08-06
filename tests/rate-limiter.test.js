@@ -164,6 +164,24 @@ describe('RateLimiter', () => {
       assert.equal(await limiter.checkRateLimit('key-a'), true, 'the new window starts from zero')
       assert.equal(limiter.getRemainingTokens('key-a'), 1, 'the old count was discarded, not carried over')
     })
+
+    test('a check landing after the boundary but before the sweep resets the counter in place', async (t) => {
+      // advance() lets the sweep collect the stale counter first, so the
+      // rollover above exercises the missing-entry path. jump() models the
+      // real race — a check arriving in the gap between the window boundary
+      // and the sweep's turn on the event loop — where the stale counter is
+      // still present and must be reset inside check itself.
+      const { clock, limiter } = createLimiter({ strategy: 'fixed-window', maxRequests: 2, windowMs: 1000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(await limiter.checkRateLimit('key-a', 2), true)
+
+      clock.jump(1000)
+
+      assert.equal(limiter.limiter.counters.has('key-a'), true, 'the sweep has not run yet')
+      assert.equal(await limiter.checkRateLimit('key-a'), true, 'the stale counter was reset, not trusted')
+      assert.equal(limiter.getRemainingTokens('key-a'), 1)
+    })
   })
 
   describe('sliding-window', () => {
@@ -262,6 +280,28 @@ describe('RateLimiter', () => {
   })
 
   describe('reset', () => {
+    test('restores capacity for every strategy', async (t) => {
+      // Each strategy owns its store, so each has its own reset to prove.
+      const configs = [
+        { strategy: 'token-bucket', maxRequests: 1, windowMs: 60000 },
+        { strategy: 'leaky-bucket', maxRequests: 100, windowMs: 60000, queueLimit: 1 },
+        { strategy: 'fixed-window', maxRequests: 1, windowMs: 60000 },
+        { strategy: 'sliding-window', maxRequests: 1, windowMs: 60000 }
+      ]
+
+      for (const config of configs) {
+        const { limiter } = createLimiter(config)
+        t.after(() => limiter.dispose())
+
+        assert.equal(await limiter.checkRateLimit('key-a'), true, `${config.strategy}: first request`)
+        assert.equal(await limiter.checkRateLimit('key-a'), false, `${config.strategy}: exhausted`)
+
+        limiter.reset('key-a')
+
+        assert.equal(await limiter.checkRateLimit('key-a'), true, `${config.strategy}: capacity restored`)
+      }
+    })
+
     test('restores capacity and clears a block for the key', async (t) => {
       const { limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 1, windowMs: 60000 })
       t.after(() => limiter.dispose())
@@ -497,10 +537,11 @@ describe('RateLimiter', () => {
       await limiter.checkRateLimit('key-a', 2)
       assert.equal(limiter.getStatus('key-a').remainingTokens, 0)
 
-      // The sweep also fires during this advance; either way the entry must
-      // not leak stale counts into the new window.
-      clock.advance(1000)
+      // jump() keeps the sweep from collecting the entry: this must exercise
+      // the stale-window branch inside remaining(), not the missing-entry one.
+      clock.jump(1000)
 
+      assert.equal(limiter.limiter.counters.has('key-a'), true, 'the entry is still present')
       assert.equal(limiter.getStatus('key-a').remainingTokens, 2, 'a new window starts fresh')
     })
 
@@ -598,6 +639,26 @@ describe('RateLimiter', () => {
       assert.equal(limiter.limiter.buckets.size, 0)
       assert.equal(limiter.blocked.size, 0)
       assert.equal(clock.intervals.size, 0, 'the sweep interval was cleared, not leaked')
+    })
+
+    test('empties every strategy store', async () => {
+      // Same reason as the per-strategy reset: each store has its own clear.
+      const cases = [
+        { config: { strategy: 'leaky-bucket', maxRequests: 100, windowMs: 60000, queueLimit: 2 }, storeOf: (limiter) => limiter.limiter.log.windows },
+        { config: { strategy: 'fixed-window', maxRequests: 2, windowMs: 60000 }, storeOf: (limiter) => limiter.limiter.counters },
+        { config: { strategy: 'sliding-window', maxRequests: 2, windowMs: 60000 }, storeOf: (limiter) => limiter.limiter.log.windows }
+      ]
+
+      for (const { config, storeOf } of cases) {
+        const { limiter } = createLimiter(config)
+
+        await limiter.checkRateLimit('key-a')
+        assert.equal(storeOf(limiter).size, 1, `${config.strategy}: consumption is stored`)
+
+        limiter.dispose()
+
+        assert.equal(storeOf(limiter).size, 0, `${config.strategy}: dispose emptied the store`)
+      }
     })
   })
 })

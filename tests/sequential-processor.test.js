@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
+import { ManualClock } from './helpers.js'
 import SequentialProcessor from '../src/consumers/sequential-processor.js'
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {} }
 
+// Real sleeps here are synchronization only (letting a parked handle() settle);
+// everything clock-domain — staleness, the sweep — drives a ManualClock, so no
+// test waits out a timeout for real.
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 const makeMessage = (messageId, { dependsOn, redelivered = false } = {}) => ({
@@ -193,6 +197,7 @@ describe('SequentialProcessor', () => {
 
     const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
     const consulted = []
+    const clock = new ManualClock()
 
     const { processor, nacked } = createProcessor(t, {
       staleTimeout: 80,
@@ -200,6 +205,7 @@ describe('SequentialProcessor', () => {
         if (content.hold) await firstBlocked
       },
       options: {
+        clock,
         // Answers differently per message, so a hardcoded requeue value on the
         // expiry path could not produce this result.
         shouldRequeue: (message, error) => {
@@ -216,7 +222,9 @@ describe('SequentialProcessor', () => {
     await processor.handle({}, makeMessage('fresh', { dependsOn: 'dep' }))
     await processor.handle({}, makeMessage('retried', { dependsOn: 'dep' }))
 
-    await sleep(200)
+    // The sweep fires at 80 (entries aged exactly 80 — not stale yet) and at
+    // 160, where both pending messages are past the timeout.
+    clock.advance(160)
 
     const fresh = nacked.find(entry => entry.messageId === 'fresh')
     const retried = nacked.find(entry => entry.messageId === 'retried')
@@ -233,6 +241,108 @@ describe('SequentialProcessor', () => {
 
     releaseFirst()
     await first
+  })
+
+  test('a pending message aged exactly staleTimeout is not expired yet', async (t) => {
+    // The expiry rule is strictly greater-than: at exactly staleTimeout the
+    // dependency still has this instant to arrive. The clock is seeded away
+    // from zero so age must be computed from queuedAt — a hardcoded origin
+    // would expire the entry on the very first sweep.
+    let releaseFirst
+    const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+    const clock = new ManualClock(1000)
+
+    const { processor, nacked } = createProcessor(t, {
+      staleTimeout: 100,
+      callback: async (content) => {
+        if (content.hold) await firstBlocked
+      },
+      options: { clock }
+    })
+
+    const first = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('child', { dependsOn: 'dep' }))
+
+    clock.advance(100)
+
+    assert.equal(processor.pending.size, 1, 'age == staleTimeout is still within the deadline')
+    assert.deepEqual(nacked, [])
+
+    clock.advance(100)
+
+    assert.equal(processor.pending.size, 0, 'the next sweep finds it past the deadline')
+    assert.equal(nacked.length, 1)
+
+    releaseFirst()
+    await first
+  })
+
+  test('removes a stale processing entry without releasing its dependents', async (t) => {
+    // A stale processing entry is bookkeeping only: the dependency never
+    // actually completed, so its dependents must expire under the pending
+    // rule instead of being processed as if it had succeeded.
+    const warnings = []
+    const clock = new ManualClock(1000)
+
+    const { processor, nacked, acked } = createProcessor(t, {
+      staleTimeout: 100,
+      callback: async (content) => {
+        if (content.hold) await new Promise(() => {})
+      },
+      options: { clock, logger: { ...silentLogger, warn: (line) => warnings.push(line) } }
+    })
+
+    processor.handle({ hold: true }, makeMessage('wedged'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('child', { dependsOn: 'wedged' }))
+
+    assert.equal(processor.processing.size, 1)
+
+    clock.advance(100)
+
+    assert.equal(processor.processing.size, 1, 'wedged for exactly staleTimeout is not stale yet')
+
+    clock.advance(100)
+
+    assert.equal(processor.processing.size, 0, 'the wedged entry was collected')
+    assert.ok(warnings.some(line => line.includes('wedged')), 'and the collection was reported')
+    assert.deepEqual(acked, [], 'the dependent was never processed')
+    assert.equal(nacked.length, 1, 'it expired under the pending rule')
+    assert.equal(nacked[0].messageId, 'child')
+  })
+
+  test('reports how long a message took using the clock', async (t) => {
+    // Seeded away from zero: the duration must be the delta between two clock
+    // reads, and only a nonzero start distinguishes `now - start` from any
+    // formula that ignores or misuses the start time.
+    const infos = []
+    const clock = new ManualClock(1000)
+
+    const { processor, acked } = createProcessor(t, {
+      callback: async () => clock.advance(42),
+      options: { clock, logger: { ...silentLogger, info: (line) => infos.push(line) } }
+    })
+
+    await processor.handle({}, makeMessage('timed'))
+
+    assert.deepEqual(acked, ['timed'])
+    assert.ok(infos.some(line => line.includes('in 42ms')), `the elapsed time is the clock delta (got: ${infos.join(' | ')})`)
+  })
+
+  test('sweeps every staleTimeout, capped at one minute', (t) => {
+    const short = new ManualClock()
+    const long = new ManualClock()
+
+    createProcessor(t, { staleTimeout: 500, options: { clock: short } })
+    createProcessor(t, { staleTimeout: 120000, options: { clock: long } })
+
+    const intervalOf = (clock) => [...clock.intervals.values()][0].ms
+
+    assert.equal(intervalOf(short), 500)
+    assert.equal(intervalOf(long), 60000, 'a huge staleTimeout must not starve the sweep')
   })
 
   test('processes and acks a message that carries no messageId', async (t) => {
@@ -319,10 +429,12 @@ describe('SequentialProcessor', () => {
     // this path can leave an empty Set behind for every dependency ever seen.
     let releaseFirst
     const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+    const clock = new ManualClock()
 
     const { processor } = createProcessor(t, {
       staleTimeout: 80,
-      callback: async (content) => { if (content.hold) await firstBlocked }
+      callback: async (content) => { if (content.hold) await firstBlocked },
+      options: { clock }
     })
 
     const first = processor.handle({ hold: true }, makeMessage('dep'))
@@ -332,7 +444,7 @@ describe('SequentialProcessor', () => {
 
     assert.equal(processor.pendingByDependency.size, 1)
 
-    await sleep(200)
+    clock.advance(200)
 
     assert.equal(processor.pending.size, 0, 'the dependent expired')
     assert.equal(processor.pendingByDependency.size, 0, 'and its index entry went with it')

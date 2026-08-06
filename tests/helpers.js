@@ -64,6 +64,20 @@ export class ManualClock {
     return Promise.resolve()
   }
 
+  // Moves time WITHOUT firing intervals: models work that lands after a
+  // deadline but before the timer got a turn on the event loop — e.g. a
+  // rate-limit check arriving in the gap between a window boundary and the
+  // sweep that would collect the expired counter.
+  jump (ms) {
+    this.currentTime += ms
+
+    for (const interval of this.intervals.values()) {
+      while (interval.nextAt <= this.currentTime) {
+        interval.nextAt += interval.ms
+      }
+    }
+  }
+
   advance (ms) {
     const target = this.currentTime + ms
 
