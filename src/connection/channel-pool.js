@@ -1,4 +1,4 @@
-import { setTimeout as sleep } from 'node:timers/promises'
+import systemClock from '../utils/clock.js'
 
 const MAX_REPLACE_ATTEMPTS = 5
 
@@ -7,11 +7,12 @@ class ChannelPool {
   // pool channel (attempt N waits N × this value). Configurable for the same
   // reason consumerRecoveryInterval is: five attempts at the default add up to
   // 7.5s, which is right for a broker restart and far too slow for a test.
-  constructor (connection, logger, size = 10, recoveryInterval = 500) {
+  constructor (connection, logger, size = 10, recoveryInterval = 500, clock = systemClock) {
     this.connection = connection
     this.logger = logger
     this.size = size
     this.recoveryInterval = recoveryInterval
+    this.clock = clock
     this.channels = []
     this.index = 0
     this.dedicatedChannels = new Map()
@@ -33,7 +34,6 @@ class ChannelPool {
     channel.on('error', (error) => {
       if (this.closed) return
 
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Channel ${index} encountered an error: ${error.message}`)
     })
 
@@ -62,20 +62,17 @@ class ChannelPool {
         }
 
         this.channels[index] = channel
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Pool channel ${index} recreated successfully`)
 
         return
       } catch (error) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to recreate pool channel ${index} (attempt ${attempt}/${MAX_REPLACE_ATTEMPTS}): ${error.message}`)
 
-        await sleep(this.recoveryInterval * attempt, undefined, { ref: false })
+        await this.clock.sleep(this.recoveryInterval * attempt)
       }
     }
 
     if (!this.closed) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Pool channel ${index} could not be recreated and its slot is out of rotation`)
     }
   }
@@ -89,7 +86,6 @@ class ChannelPool {
 
     channel.on('error', (error) => {
       if (!this.closed) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.error(`Dedicated channel ${id} encountered an error: ${error.message}`)
       }
 

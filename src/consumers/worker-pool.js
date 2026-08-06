@@ -29,7 +29,6 @@ class WorkerPool {
     })
 
     worker.on('error', (error) => {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.error(`Worker ${workerId} error: ${error.message}`)
     })
 
@@ -45,7 +44,6 @@ class WorkerPool {
       if (this.terminated) return
 
       if (code !== 0) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.error(`Worker ${workerId} exited with code: ${code}`)
       }
 
@@ -53,11 +51,9 @@ class WorkerPool {
 
       if (respawns < this.maxRespawns) {
         this.respawnCounts.set(workerId, respawns + 1)
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.warn(`Respawning worker ${workerId} (attempt ${respawns + 1}/${this.maxRespawns})`)
         this.#spawn(workerId)
       } else {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.error(`Worker ${workerId} exceeded the respawn limit (${this.maxRespawns}) and will not be recreated`)
 
         if (this.workers.size === 0) {
@@ -159,7 +155,6 @@ class WorkerPool {
       try {
         await worker.terminate()
       } catch (error) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.warn(`Failed to terminate worker: ${error.message}`)
       }
     }

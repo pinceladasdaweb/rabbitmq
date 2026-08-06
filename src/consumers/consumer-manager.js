@@ -1,6 +1,6 @@
 import WorkerPool from './worker-pool.js'
+import systemClock from '../utils/clock.js'
 import describeError from '../utils/describe-error.js'
-import { setTimeout as sleep } from 'node:timers/promises'
 import SequentialProcessor from './sequential-processor.js'
 
 class ConsumerManager {
@@ -9,6 +9,7 @@ class ConsumerManager {
     this.codec = context.codec
     this.circuitBreaker = context.circuitBreaker
     this.prefetchCount = context.prefetchCount
+    this.clock = context.clock ?? systemClock
     // Base backoff between attempts to recover a broker-cancelled consumer
     // (attempt N waits N * this value).
     this.recoveryInterval = context.consumerRecoveryInterval ?? 1000
@@ -48,7 +49,6 @@ class ConsumerManager {
 
       msg.__ackSettled = true
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to ${action} message: ${error.message}`)
     }
   }
@@ -72,7 +72,6 @@ class ConsumerManager {
       this.#settlementChannel(message).ack(message)
       message.__ackSettled = true
     } catch (err) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to acknowledge message: ${err.message}`)
 
       throw err
@@ -86,7 +85,6 @@ class ConsumerManager {
       this.#settlementChannel(message).nack(message, false, requeue)
       message.__ackSettled = true
     } catch (err) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to negatively acknowledge message: ${err.message}`)
 
       throw err
@@ -212,7 +210,6 @@ class ConsumerManager {
 
     if (!consumerInfo || consumerInfo.cancelled) return
 
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.warn(`Consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
     this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag })
 
@@ -220,7 +217,7 @@ class ConsumerManager {
     let knownEpoch = consumerInfo.epoch
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await sleep(this.recoveryInterval * attempt)
+      await this.clock.sleep(this.recoveryInterval * attempt)
 
       const currentInfo = this.activeConsumers.get(consumerId)
 
@@ -234,20 +231,17 @@ class ConsumerManager {
       try {
         await this.runSetup(currentInfo)
 
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Consumer for queue ${currentInfo.queueName} recovered after broker cancellation`)
         this.emit('consumerRecovered', { queueName: currentInfo.queueName, consumerTag: currentInfo.consumerTag })
 
         return
       } catch (error) {
         knownEpoch = currentInfo.epoch
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to recover consumer for queue ${currentInfo.queueName} (attempt ${attempt}/${maxAttempts}): ${error.message}`)
       }
     }
 
     this.#dropConsumer(consumerId, consumerInfo)
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.error(`Consumer for queue ${consumerInfo.queueName} could not be recovered and was removed`)
     this.emit('consumerLost', { queueName: consumerInfo.queueName })
   }
@@ -291,7 +285,6 @@ class ConsumerManager {
           // describeError, not error.message: a handler can throw null or a
           // string, and a crash here would leave the delivery unsettled
           // forever — no ack, no nack, no redelivery until the channel dies.
-          // Stryker disable next-line StringLiteral: log phrasing is not contract
           this.logger.error(`Error processing message: ${describeError(error)}`)
 
           // The retry policy governs every failure in the pipeline, decode
@@ -319,7 +312,6 @@ class ConsumerManager {
 
       return consumer
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to subscribe to queue ${queueName}: ${error.message}`)
 
       throw error
@@ -366,6 +358,7 @@ class ConsumerManager {
           logger: this.logger,
           staleTimeout,
           shouldRequeue,
+          clock: this.clock,
           onSuccess: (message) => {
             if (!noAck) {
               this.settleAck(message, channel, 'ack')
@@ -403,7 +396,6 @@ class ConsumerManager {
         await consumerInfo.channel.cancel(consumerTag)
       }
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
     }
 
@@ -415,7 +407,6 @@ class ConsumerManager {
     }
 
     this.#dropConsumer(consumerId, consumerInfo)
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.info(`Unsubscribed consumer ${consumerTag} from queue ${consumerInfo.queueName}`)
 
     return true
@@ -433,7 +424,7 @@ class ConsumerManager {
     } = options
 
     let currentPrefetch = initialPrefetch
-    let lastOptimizationTime = Date.now()
+    let lastOptimizationTime = this.clock.now()
     let processingTimes = []
     let consumerId = null
     let knownEpoch = null
@@ -444,10 +435,8 @@ class ConsumerManager {
       // or a successfully processed message would be nacked to the DLQ.
       try {
         await consumerInfo.channel.prefetch(currentPrefetch)
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Adjusted prefetch to: ${currentPrefetch}`)
       } catch (error) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to adjust prefetch to ${currentPrefetch}: ${error.message}`)
       }
     }
@@ -468,7 +457,7 @@ class ConsumerManager {
         }
       }
 
-      const now = Date.now()
+      const now = this.clock.now()
       const elapsed = now - lastOptimizationTime
 
       if (elapsed < optimizationInterval || processingTimes.length === 0) return
@@ -493,12 +482,12 @@ class ConsumerManager {
     }
 
     const wrappedCallback = async (content, message) => {
-      const startTime = Date.now()
+      const startTime = this.clock.now()
 
       try {
         await callback(content, message)
       } finally {
-        processingTimes.push(Date.now() - startTime)
+        processingTimes.push(this.clock.now() - startTime)
       }
 
       await optimizePrefetch()
@@ -563,10 +552,8 @@ class ConsumerManager {
       try {
         await this.runSetup(consumerInfo)
 
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Consumer ${consumerId} for queue ${consumerInfo.queueName} recreated successfully`)
       } catch (error) {
-        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.error(`Failed to recreate consumer for queue ${consumerInfo.queueName}: ${error.message}`)
       }
     })

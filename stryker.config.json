@@ -15,6 +15,13 @@
   "mutate": [
     "src/**/*.js"
   ],
+  "plugins": [
+    "@stryker-mutator/*",
+    "./stryker-log-strings-ignorer.js"
+  ],
+  "ignorers": [
+    "log-strings"
+  ],
   "coverageAnalysis": "all",
   "reporters": [
     "json",

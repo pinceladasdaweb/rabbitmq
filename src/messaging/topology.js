@@ -22,10 +22,8 @@ class Topology {
         exchange.options || { durable: true }
       )
 
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.info(`Exchange ${exchange.name} configured successfully`)
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to setup exchange: ${error.message}`)
 
       throw error
@@ -37,7 +35,6 @@ class Topology {
 
     await channel.assertExchange(this.deadLetterExchange, 'direct', { durable: true })
 
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.info(`Dead letter exchange '${this.deadLetterExchange}' setup completed`)
   }
 
@@ -61,10 +58,8 @@ class Topology {
       await channel.assertQueue(deadLetterQueue, { durable: true })
       await channel.bindQueue(deadLetterQueue, this.deadLetterExchange, deadLetterQueue)
 
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.info(`Queue '${queueName}' and its dead letter queue '${deadLetterQueue}' created successfully`)
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to create queue '${queueName}' with dead letter queue: ${error.message}`)
 
       throw error
@@ -122,7 +117,6 @@ class Topology {
       })
     })
 
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.info(`Message moved to dead letter queue: ${reason}`)
   }
 
@@ -135,7 +129,6 @@ class Topology {
       ...options.exchangeOptions
     })
 
-    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.info(`Delay exchange '${this.delayExchange}' setup completed`)
   }
 
@@ -147,10 +140,8 @@ class Topology {
         throw new Error('Delay plugin is not enabled on the RabbitMQ server')
       }
 
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.info('Delay plugin is enabled and ready to use')
     } catch (error) {
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to setup delay plugin: ${error.message}`)
 
       throw error

@@ -38,7 +38,8 @@ export class ManualClock {
   constructor (start = 0) {
     this.currentTime = start
     this.intervals = new Map()
-    this.nextIntervalId = 1
+    this.timeouts = new Map()
+    this.nextTimerId = 1
     this.sleeps = []
   }
 
@@ -47,7 +48,7 @@ export class ManualClock {
   }
 
   setInterval (fn, ms) {
-    const id = this.nextIntervalId++
+    const id = this.nextTimerId++
 
     this.intervals.set(id, { fn, ms, nextAt: this.currentTime + ms })
 
@@ -56,6 +57,18 @@ export class ManualClock {
 
   clearInterval (handle) {
     if (handle) this.intervals.delete(handle.id)
+  }
+
+  setTimeout (fn, ms) {
+    const id = this.nextTimerId++
+
+    this.timeouts.set(id, { fn, at: this.currentTime + ms })
+
+    return { id, unref: () => {} }
+  }
+
+  clearTimeout (handle) {
+    if (handle) this.timeouts.delete(handle.id)
   }
 
   sleep (ms) {
@@ -81,23 +94,28 @@ export class ManualClock {
   advance (ms) {
     const target = this.currentTime + ms
 
-    // Fire due intervals in timestamp order, with now() set to each firing
+    // Fire due timers in timestamp order, with now() set to each firing
     // time — an interval crossing several periods fires once per period, as
-    // the real timer would.
+    // the real timer would; a timeout fires once and is gone.
     for (;;) {
       let earliest = null
 
       for (const interval of this.intervals.values()) {
-        if (interval.nextAt <= target && (!earliest || interval.nextAt < earliest.nextAt)) {
-          earliest = interval
+        if (interval.nextAt <= target && (!earliest || interval.nextAt < earliest.dueAt)) {
+          earliest = { dueAt: interval.nextAt, fire: () => { interval.nextAt += interval.ms; interval.fn() } }
+        }
+      }
+
+      for (const [id, timeout] of this.timeouts) {
+        if (timeout.at <= target && (!earliest || timeout.at < earliest.dueAt)) {
+          earliest = { dueAt: timeout.at, fire: () => { this.timeouts.delete(id); timeout.fn() } }
         }
       }
 
       if (!earliest) break
 
-      this.currentTime = earliest.nextAt
-      earliest.nextAt += earliest.ms
-      earliest.fn()
+      this.currentTime = earliest.dueAt
+      earliest.fire()
     }
 
     this.currentTime = target
