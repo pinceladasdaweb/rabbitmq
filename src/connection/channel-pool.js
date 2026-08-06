@@ -33,6 +33,7 @@ class ChannelPool {
     channel.on('error', (error) => {
       if (this.closed) return
 
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Channel ${index} encountered an error: ${error.message}`)
     })
 
@@ -61,10 +62,12 @@ class ChannelPool {
         }
 
         this.channels[index] = channel
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Pool channel ${index} recreated successfully`)
 
         return
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to recreate pool channel ${index} (attempt ${attempt}/${MAX_REPLACE_ATTEMPTS}): ${error.message}`)
 
         await sleep(this.recoveryInterval * attempt, undefined, { ref: false })
@@ -72,6 +75,7 @@ class ChannelPool {
     }
 
     if (!this.closed) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Pool channel ${index} could not be recreated and its slot is out of rotation`)
     }
   }
@@ -85,6 +89,7 @@ class ChannelPool {
 
     channel.on('error', (error) => {
       if (!this.closed) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.error(`Dedicated channel ${id} encountered an error: ${error.message}`)
       }
 

@@ -32,6 +32,7 @@ class SequentialProcessor {
     const dependencyUnresolved = dependsOn && (this.processing.has(dependsOn) || this.pending.has(dependsOn))
 
     if (messageId && dependencyUnresolved) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.info(`Message ${messageId} waiting for dependency ${dependsOn}`)
       this.pending.set(messageId, { content, message, dependsOn, queuedAt: this.clock.now() })
       this.#indexPending(messageId, dependsOn)
@@ -81,6 +82,7 @@ class SequentialProcessor {
         const processingTime = this.clock.now() - this.processing.get(messageId).startTime
 
         this.processing.delete(messageId)
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.info(`Successfully processed message ${messageId} in ${processingTime}ms`)
       }
 
@@ -99,6 +101,7 @@ class SequentialProcessor {
       // describeError tolerates a handler throwing null or a string; reading
       // .message here used to crash the catch and skip onFailure entirely,
       // leaving the message unacknowledged (issue #18).
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${describeError(error)}`)
       this.onFailure(message, error, requeue)
     }
@@ -116,6 +119,7 @@ class SequentialProcessor {
 
       if (!pendingData) continue
 
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.info(`Processing dependent message ${pendingId}`)
 
       this.pending.delete(pendingId)
@@ -131,6 +135,7 @@ class SequentialProcessor {
     // the rule below and are settled under the subscription's retry policy.
     for (const [messageId, data] of this.processing.entries()) {
       if (now - data.startTime > this.staleTimeout) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.warn(`Removing stale processing entry for message ${messageId}`)
         this.processing.delete(messageId)
       }
@@ -146,6 +151,7 @@ class SequentialProcessor {
         const error = new Error(`Dependency ${data.dependsOn} was never resolved`)
         const requeue = this.shouldRequeue(data.message, error)
 
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger?.warn(`Pending message ${messageId} timed out waiting for ${data.dependsOn}. ${requeue ? 'Requeueing' : 'Dead-lettering'}`)
         this.onFailure(data.message, error, requeue)
       }

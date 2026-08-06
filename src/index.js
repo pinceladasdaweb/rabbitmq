@@ -121,11 +121,13 @@ class RabbitMQ extends EventEmitter {
 
   #setupRateLimiterEvents () {
     this.#rateLimiter.on('limited', ({ key, strategy }) => {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.warn(`Rate limit exceeded for ${key} using ${strategy} strategy`)
       this.emit('rateLimited', { key, strategy })
     })
 
     this.#rateLimiter.on('blocked', ({ key, remainingTime }) => {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.warn(`Key ${key} is blocked. Remaining time: ${remainingTime}ms`)
       this.emit('rateBlocked', { key, remainingTime })
     })
@@ -137,14 +139,17 @@ class RabbitMQ extends EventEmitter {
     this.#shutdownHandlersInstalled = true
 
     const gracefulShutdown = async (signal) => {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info(`Received ${signal}. Starting graceful shutdown...`)
 
       try {
         await this.disconnect()
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.info('Disconnected from RabbitMQ successfully.')
 
         if (exitProcess) process.exit(0)
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.error(`Error during graceful shutdown: ${error.message}`)
 
         if (exitProcess) process.exit(1)
@@ -214,6 +219,7 @@ class RabbitMQ extends EventEmitter {
 
       this.emit('reconnected')
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.error(`Failed to restore state after reconnection: ${error.message}`)
       this.emit('reconnectError', error)
     }
@@ -350,6 +356,7 @@ class RabbitMQ extends EventEmitter {
         this.#channelPool = null
       }
 
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info('Disconnecting from RabbitMQ...')
 
       await this.#connection.disconnect()
@@ -359,11 +366,13 @@ class RabbitMQ extends EventEmitter {
       // No message-substring filtering here: it used to swallow genuine
       // broker errors whose text happened to contain 'Channel closed'.
       // Expected channel-teardown noise is already silenced in ChannelPool.
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.warn(`Error during disconnection: ${error.message}`)
 
       try {
         await this.#connection.disconnect()
       } catch (disconnectError) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.warn(`Error during final disconnection attempt: ${disconnectError.message}`)
       }
     }
@@ -395,6 +404,7 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#exchange = { name, type, options }
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info(`Exchange set to ${name} (${type})`)
   }
 
@@ -429,6 +439,7 @@ class RabbitMQ extends EventEmitter {
       const cachedMessage = this.#cache.get(cacheKey)
 
       if (cachedMessage !== undefined) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.info(`Cache hit for key: ${cacheKey}`)
 
         return cachedMessage
@@ -450,6 +461,7 @@ class RabbitMQ extends EventEmitter {
       const ttl = options.cacheTTL || this.#cache.options?.stdTTL
 
       this.#cache.set(cacheKey, message, ttl)
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info(`Cached message for key: ${cacheKey}, TTL: ${ttl}s`)
     }
 
@@ -517,6 +529,7 @@ class RabbitMQ extends EventEmitter {
       try {
         await processor(message)
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.error(`Error processing dead letter message: ${describeError(error)}`)
 
         // Rethrown so this behaves like every other subscription: swallowing
@@ -531,6 +544,7 @@ class RabbitMQ extends EventEmitter {
       }
     }, options)
 
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info(`Started processing dead letter queue: ${deadLetterQueueName}`)
 
     return consumer
@@ -552,6 +566,7 @@ class RabbitMQ extends EventEmitter {
 
   setCompression (useCompression) {
     this.#codec.useCompression = useCompression
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info(`Message compression ${useCompression ? 'enabled' : 'disabled'}`)
   }
 
@@ -561,6 +576,7 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#codec.compressionThreshold = threshold
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info(`Compression threshold set to ${threshold} bytes`)
   }
 
@@ -570,6 +586,7 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#codec.serializer = serializer
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info('Custom serializer set')
   }
 
@@ -579,6 +596,7 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#codec.deserializer = deserializer
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info('Custom deserializer set')
   }
 
@@ -624,11 +642,13 @@ class RabbitMQ extends EventEmitter {
 
   invalidateCache (routingKey) {
     this.#requireCache().del(this.#cacheKey(routingKey))
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info(`Cache invalidated for key: ${this.#cacheKey(routingKey)}`)
   }
 
   clearCache () {
     this.#requireCache().flushAll()
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.#logger.info('Entire cache cleared')
   }
 }

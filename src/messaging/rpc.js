@@ -246,6 +246,7 @@ class Rpc {
       const settled = this.#settlePending(correlationId, (pending) => pending.reject(error))
 
       if (!settled) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`RPC publish to ${routingKey} failed after the request already settled: ${error.message}`)
       }
     })
@@ -277,6 +278,7 @@ class Rpc {
 
       if (!replyTo) {
         // Not an RPC message: process it normally, there is nowhere to reply.
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Message on RPC queue ${queueName} has no replyTo property — processed without a reply`)
         await handler(content, message)
 
@@ -311,11 +313,13 @@ class Rpc {
       try {
         await this.#publishReply(replyTo, correlationId, result)
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.error(`Failed to publish RPC reply on queue ${queueName}: ${error.message}`)
 
         try {
           await this.#publishReply(replyTo, correlationId, { message: `Failed to publish RPC reply: ${error.message}` }, { 'x-rpc-error': true })
         } catch (envelopeError) {
+          // Stryker disable next-line StringLiteral: log phrasing is not contract
           this.logger.error(`Failed to publish RPC error envelope on queue ${queueName}: ${envelopeError.message}`)
         }
       }

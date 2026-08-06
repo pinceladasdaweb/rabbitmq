@@ -126,6 +126,7 @@ class Publisher {
     })
 
     retryPolicy.on('retry', ({ attempt, error }) => {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.warn(`Operation failed, retrying (${attempt}/${attempts}): ${error.message}`)
     })
 
@@ -176,6 +177,7 @@ class Publisher {
         this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
       ))
 
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.info(`Batch of ${messages.length} messages published to ${routingKey}`)
     }
 
@@ -197,6 +199,7 @@ class Publisher {
     try {
       await this.circuitBreaker.execute(publishOperation)
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to publish message asynchronously: ${error.message}`)
 
       throw error
@@ -220,12 +223,14 @@ class Publisher {
         await this.publishFireAndForget(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed, { 'x-async-batch': true }))
       }
 
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.info(`Batch of ${messages.length} messages published asynchronously.`)
     }
 
     try {
       await this.circuitBreaker.execute(publishOperation)
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to publish batch asynchronously: ${error.message}`)
 
       throw error

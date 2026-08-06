@@ -53,6 +53,7 @@ class MessageCodec {
 
       return { content: compressed, compressed: true }
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.warn(`Failed to compress message: ${error.message}. Sending uncompressed.`)
 
       return { content: buffer, compressed: false }
@@ -67,6 +68,7 @@ class MessageCodec {
     try {
       return await gunzip(buffer)
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger?.error(`Failed to decompress message: ${error.message}`)
 
       throw error

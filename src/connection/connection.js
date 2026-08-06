@@ -81,6 +81,7 @@ class RabbitMQConnection extends EventEmitter {
 
   async #doConnect () {
     if (this.#connectionState === 'connected' && this.#connection) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info('Already connected to RabbitMQ.')
 
       return this.#connection
@@ -103,17 +104,20 @@ class RabbitMQConnection extends EventEmitter {
         })
 
         this.#connection.on('error', (err) => {
+          // Stryker disable next-line StringLiteral: log phrasing is not contract
           this.#logger.error(`Connection error: ${err.message}`)
         })
 
         this.#connection.on('close', () => {
           if (!this.#isShuttingDown) {
+            // Stryker disable next-line StringLiteral: log phrasing is not contract
             this.#logger.error('RabbitMQ connection closed unexpectedly.')
             this.#connection = null
             this.startReconnection()
           }
         })
 
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.info(`Successfully connected to RabbitMQ cluster node: ${endpoint}`)
         this.#clearReconnectTimeout()
         this.#isReconnecting = false
@@ -123,6 +127,7 @@ class RabbitMQConnection extends EventEmitter {
 
         return this.#connection
       } catch (err) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.error(`Failed to connect to RabbitMQ cluster node ${this.#endpoints[this.#currentEndpointIndex]}: ${err.message}`)
         this.#currentEndpointIndex = (this.#currentEndpointIndex + 1) % this.#endpoints.length
       }
@@ -157,6 +162,7 @@ class RabbitMQConnection extends EventEmitter {
     this.#clearReconnectTimeout()
 
     if (this.#maxReconnectAttempts !== Infinity && this.#reconnectAttempt >= this.#maxReconnectAttempts) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.error(`Max reconnect attempts (${this.#maxReconnectAttempts}) reached. Giving up.`)
       this.#isReconnecting = false
       this.#setConnectionState('failed')
@@ -171,8 +177,10 @@ class RabbitMQConnection extends EventEmitter {
     )
 
     if (this.#maxReconnectAttempts === Infinity) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info(`Connection attempt ${this.#reconnectAttempt + 1} in ${delay}ms (will try indefinitely)`)
     } else {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info(`Reconnection attempt ${this.#reconnectAttempt + 1}/${this.#maxReconnectAttempts} in ${delay}ms`)
     }
 
@@ -206,6 +214,7 @@ class RabbitMQConnection extends EventEmitter {
     this.#clearReconnectTimeout()
 
     if (this.#connectionState === 'disconnected') {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.#logger.info('Already disconnected from RabbitMQ.')
 
       return
@@ -220,8 +229,10 @@ class RabbitMQConnection extends EventEmitter {
 
         await this.#connection.close()
 
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.info('RabbitMQ connection closed gracefully.')
       } catch (err) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.#logger.info('RabbitMQ connection closed.')
       } finally {
         this.#connection = null

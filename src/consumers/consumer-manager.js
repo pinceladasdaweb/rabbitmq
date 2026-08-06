@@ -48,6 +48,7 @@ class ConsumerManager {
 
       msg.__ackSettled = true
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to ${action} message: ${error.message}`)
     }
   }
@@ -71,6 +72,7 @@ class ConsumerManager {
       this.#settlementChannel(message).ack(message)
       message.__ackSettled = true
     } catch (err) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to acknowledge message: ${err.message}`)
 
       throw err
@@ -84,6 +86,7 @@ class ConsumerManager {
       this.#settlementChannel(message).nack(message, false, requeue)
       message.__ackSettled = true
     } catch (err) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to negatively acknowledge message: ${err.message}`)
 
       throw err
@@ -209,6 +212,7 @@ class ConsumerManager {
 
     if (!consumerInfo || consumerInfo.cancelled) return
 
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.warn(`Consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
     this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag })
 
@@ -230,17 +234,20 @@ class ConsumerManager {
       try {
         await this.runSetup(currentInfo)
 
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Consumer for queue ${currentInfo.queueName} recovered after broker cancellation`)
         this.emit('consumerRecovered', { queueName: currentInfo.queueName, consumerTag: currentInfo.consumerTag })
 
         return
       } catch (error) {
         knownEpoch = currentInfo.epoch
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to recover consumer for queue ${currentInfo.queueName} (attempt ${attempt}/${maxAttempts}): ${error.message}`)
       }
     }
 
     this.#dropConsumer(consumerId, consumerInfo)
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.error(`Consumer for queue ${consumerInfo.queueName} could not be recovered and was removed`)
     this.emit('consumerLost', { queueName: consumerInfo.queueName })
   }
@@ -284,6 +291,7 @@ class ConsumerManager {
           // describeError, not error.message: a handler can throw null or a
           // string, and a crash here would leave the delivery unsettled
           // forever — no ack, no nack, no redelivery until the channel dies.
+          // Stryker disable next-line StringLiteral: log phrasing is not contract
           this.logger.error(`Error processing message: ${describeError(error)}`)
 
           // The retry policy governs every failure in the pipeline, decode
@@ -311,6 +319,7 @@ class ConsumerManager {
 
       return consumer
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.error(`Failed to subscribe to queue ${queueName}: ${error.message}`)
 
       throw error
@@ -324,6 +333,7 @@ class ConsumerManager {
       // side effect would apply it again on the redelivery. Opt into
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
       createProcessor: ({ channel, noAck }) => async (content, msg) => {
         await callback(content, msg)
@@ -345,6 +355,7 @@ class ConsumerManager {
       // processed, so the retry can break the very ordering this method
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
       createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
@@ -392,6 +403,7 @@ class ConsumerManager {
         await consumerInfo.channel.cancel(consumerTag)
       }
     } catch (error) {
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
     }
 
@@ -403,6 +415,7 @@ class ConsumerManager {
     }
 
     this.#dropConsumer(consumerId, consumerInfo)
+    // Stryker disable next-line StringLiteral: log phrasing is not contract
     this.logger.info(`Unsubscribed consumer ${consumerTag} from queue ${consumerInfo.queueName}`)
 
     return true
@@ -431,8 +444,10 @@ class ConsumerManager {
       // or a successfully processed message would be nacked to the DLQ.
       try {
         await consumerInfo.channel.prefetch(currentPrefetch)
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Adjusted prefetch to: ${currentPrefetch}`)
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.warn(`Failed to adjust prefetch to ${currentPrefetch}: ${error.message}`)
       }
     }
@@ -548,8 +563,10 @@ class ConsumerManager {
       try {
         await this.runSetup(consumerInfo)
 
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.info(`Consumer ${consumerId} for queue ${consumerInfo.queueName} recreated successfully`)
       } catch (error) {
+        // Stryker disable next-line StringLiteral: log phrasing is not contract
         this.logger.error(`Failed to recreate consumer for queue ${consumerInfo.queueName}: ${error.message}`)
       }
     })
