@@ -338,6 +338,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
     - **strategy** `{string}`: Rate limiting strategy ('token-bucket', 'leaky-bucket', 'fixed-window', 'sliding-window').
       - Default: `'token-bucket'`
       - All strategies track limits **per rate-limit key** (the routing key by default, or `options.rateLimitKey`).
+      - An unknown strategy name throws at construction time, so a typo can never become an unlimited limiter.
       - `'leaky-bucket'` smooths bursts instead of rejecting: accepted requests are delayed proportionally to the queue occupancy of that key, and only rejected once the occupancy exceeds `queueLimit`.
     - **queueLimit** `{number}`: Maximum queue occupancy for the leaky-bucket strategy.
       - Default: `1000`

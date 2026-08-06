@@ -1,6 +1,19 @@
 import { EventEmitter } from 'node:events'
-import { setTimeout as sleep } from 'node:timers/promises'
+import systemClock from '../utils/clock.js'
+import TokenBucketStrategy from './strategies/token-bucket.js'
+import LeakyBucketStrategy from './strategies/leaky-bucket.js'
+import FixedWindowStrategy from './strategies/fixed-window.js'
+import SlidingWindowStrategy from './strategies/sliding-window.js'
 
+const STRATEGIES = {
+  'token-bucket': TokenBucketStrategy,
+  'leaky-bucket': LeakyBucketStrategy,
+  'fixed-window': FixedWindowStrategy,
+  'sliding-window': SlidingWindowStrategy
+}
+
+// Orchestrates one strategy: owns key blocking, event emission and the
+// periodic sweep. All algorithm state lives in the strategy object.
 class RateLimiter extends EventEmitter {
   constructor (options = {}) {
     super()
@@ -9,19 +22,29 @@ class RateLimiter extends EventEmitter {
     this.strategy = options.strategy || 'token-bucket'
     this.burstable = options.burstable || false
     this.burstLimit = options.burstLimit || this.maxRequests * 1.5
-    this.requests = new Map()
-    this.buckets = new Map()
-    this.blocked = new Map()
-    this.logger = options.logger
-
-    this.tokenRefillRate = this.maxRequests / (this.windowMs / 1000)
-    this.tokenBucketSize = this.burstable ? this.burstLimit : this.maxRequests
-
-    this.leakRateMs = this.windowMs / this.maxRequests
-    this.leakyQueues = new Map()
     this.queueLimit = options.queueLimit || 1000
+    this.logger = options.logger
+    this.clock = options.clock || systemClock
+    this.blocked = new Map()
 
-    this.cleanupInterval = setInterval(() => this.#cleanup(), Math.min(this.windowMs / 10, 60000))
+    const Strategy = STRATEGIES[this.strategy]
+
+    // Failing closed at construction: a typo'd strategy must never become an
+    // unlimited limiter, and surfacing it at boot beats surfacing it on the
+    // first rate-limited publish in production.
+    if (!Strategy) {
+      throw new Error(`Unknown rate limiting strategy: ${this.strategy}`)
+    }
+
+    this.limiter = new Strategy({
+      maxRequests: this.maxRequests,
+      windowMs: this.windowMs,
+      burstable: this.burstable,
+      burstLimit: this.burstLimit,
+      queueLimit: this.queueLimit
+    }, this.clock)
+
+    this.cleanupInterval = this.clock.setInterval(() => this.#cleanup(), Math.min(this.windowMs / 10, 60000))
 
     // Unref'd so a limiter nobody disposed cannot keep the process alive. Note
     // this is not covered by a unit test: every test disposes its limiter, so
@@ -31,58 +54,12 @@ class RateLimiter extends EventEmitter {
     }
   }
 
-  // Sliding-window stores keep a time-ordered entry list plus a running
-  // total; expired entries are evicted from the front — O(evicted) per
-  // check instead of a full filter+reduce scan of the window.
-  #getWindowData (store, key) {
-    let windowData = store.get(key)
-
-    if (!windowData) {
-      windowData = { entries: [], total: 0 }
-      store.set(key, windowData)
-    }
-
-    return windowData
-  }
-
-  #evictExpired (windowData, now) {
-    while (windowData.entries.length > 0 && now - windowData.entries[0].timestamp > this.windowMs) {
-      windowData.total -= windowData.entries.shift().cost
-    }
-  }
-
+  // The sweep is what keeps memory flat for high-cardinality keys; without it
+  // every key ever seen is retained forever.
   #cleanup () {
-    const now = Date.now()
+    const now = this.clock.now()
 
-    for (const [key, data] of this.requests) {
-      if (data.windowStart !== undefined) {
-        const currentWindowStart = Math.floor(now / this.windowMs) * this.windowMs
-
-        if (data.windowStart !== currentWindowStart) {
-          this.requests.delete(key)
-        }
-      } else if (Array.isArray(data.entries)) {
-        this.#evictExpired(data, now)
-
-        if (data.entries.length === 0) {
-          this.requests.delete(key)
-        }
-      }
-    }
-
-    for (const [key, bucket] of this.buckets) {
-      if (now - bucket.lastRefill > this.windowMs * 2) {
-        this.buckets.delete(key)
-      }
-    }
-
-    for (const [key, windowData] of this.leakyQueues) {
-      this.#evictExpired(windowData, now)
-
-      if (windowData.entries.length === 0) {
-        this.leakyQueues.delete(key)
-      }
-    }
+    this.limiter.cleanup(now)
 
     for (const [key, expiresAt] of this.blocked) {
       if (now >= expiresAt) {
@@ -93,7 +70,7 @@ class RateLimiter extends EventEmitter {
   }
 
   async checkRateLimit (key, cost = 1) {
-    const now = Date.now()
+    const now = this.clock.now()
     const blockedUntil = this.blocked.get(key)
 
     if (blockedUntil !== undefined) {
@@ -107,196 +84,50 @@ class RateLimiter extends EventEmitter {
       }
     }
 
-    switch (this.strategy) {
-      case 'token-bucket':
-        return this.tokenBucketCheck(key, cost)
-      case 'leaky-bucket':
-        return this.leakyBucketCheck(key, cost)
-      case 'fixed-window':
-        return this.fixedWindowCheck(key, cost)
-      case 'sliding-window':
-        return this.slidingWindowCheck(key, cost)
-      default:
-        throw new Error(`Unknown rate limiting strategy: ${this.strategy}`)
-    }
-  }
+    const allowed = await this.limiter.check(key, cost, now)
 
-  #getBucket (key) {
-    const now = Date.now()
-    let bucket = this.buckets.get(key)
-
-    if (!bucket) {
-      bucket = { tokens: this.tokenBucketSize, lastRefill: now }
-      this.buckets.set(key, bucket)
-
-      return bucket
+    if (!allowed) {
+      this.emit('limited', { key, strategy: this.strategy })
     }
 
-    const tokensToAdd = ((now - bucket.lastRefill) / 1000) * this.tokenRefillRate
-
-    if (tokensToAdd > 0) {
-      bucket.tokens = Math.min(this.tokenBucketSize, bucket.tokens + tokensToAdd)
-      bucket.lastRefill = now
-    }
-
-    return bucket
-  }
-
-  tokenBucketCheck (key, cost) {
-    const bucket = this.#getBucket(key)
-
-    if (bucket.tokens >= cost) {
-      bucket.tokens -= cost
-
-      return true
-    }
-
-    this.emit('limited', { key, strategy: 'token-bucket' })
-
-    return false
-  }
-
-  // Leaky bucket with smoothing: accepts the request and delays it in
-  // proportion to that key's queue occupancy, spreading bursts over time.
-  // Rejects only when the occupancy (sum of costs) exceeds queueLimit.
-  async leakyBucketCheck (key, cost) {
-    const now = Date.now()
-    const windowData = this.#getWindowData(this.leakyQueues, key)
-
-    this.#evictExpired(windowData, now)
-
-    if (windowData.total + cost > this.queueLimit) {
-      this.emit('limited', { key, strategy: 'leaky-bucket' })
-
-      return false
-    }
-
-    const waitTime = Math.max(0, windowData.total * this.leakRateMs)
-
-    windowData.entries.push({ timestamp: now, cost })
-    windowData.total += cost
-
-    if (waitTime > 0) {
-      await sleep(waitTime)
-    }
-
-    return true
-  }
-
-  fixedWindowCheck (key, cost) {
-    const windowStart = Math.floor(Date.now() / this.windowMs) * this.windowMs
-    const keyData = this.requests.get(key) || { count: 0, windowStart }
-
-    if (keyData.windowStart !== windowStart) {
-      keyData.count = 0
-      keyData.windowStart = windowStart
-    }
-
-    if (keyData.count + cost <= this.maxRequests) {
-      keyData.count += cost
-      this.requests.set(key, keyData)
-
-      return true
-    }
-
-    this.emit('limited', { key, strategy: 'fixed-window' })
-
-    return false
-  }
-
-  slidingWindowCheck (key, cost) {
-    const now = Date.now()
-    const windowData = this.#getWindowData(this.requests, key)
-
-    this.#evictExpired(windowData, now)
-
-    if (windowData.total + cost <= this.maxRequests) {
-      windowData.entries.push({ timestamp: now, cost })
-      windowData.total += cost
-
-      return true
-    }
-
-    this.emit('limited', { key, strategy: 'sliding-window' })
-
-    return false
+    return allowed
   }
 
   blockKey (key, duration = this.windowMs) {
-    this.blocked.set(key, Date.now() + duration)
+    this.blocked.set(key, this.clock.now() + duration)
     this.emit('key-blocked', { key, duration })
   }
 
   getRemainingTokens (key) {
-    const now = Date.now()
-
-    switch (this.strategy) {
-      case 'token-bucket':
-        return Math.floor(this.#getBucket(key).tokens)
-
-      case 'leaky-bucket': {
-        const windowData = this.leakyQueues.get(key)
-
-        if (!windowData) return this.queueLimit
-
-        this.#evictExpired(windowData, now)
-
-        return this.queueLimit - windowData.total
-      }
-
-      case 'fixed-window': {
-        const keyData = this.requests.get(key)
-        const windowStart = Math.floor(now / this.windowMs) * this.windowMs
-
-        if (!keyData || keyData.windowStart !== windowStart) return this.maxRequests
-
-        return this.maxRequests - keyData.count
-      }
-
-      case 'sliding-window': {
-        const windowData = this.requests.get(key)
-
-        if (!windowData) return this.maxRequests
-
-        this.#evictExpired(windowData, now)
-
-        return this.maxRequests - windowData.total
-      }
-
-      default:
-        return 0
-    }
+    return this.limiter.remaining(key, this.clock.now())
   }
 
   getStatus (key) {
+    const now = this.clock.now()
     const blockedUntil = this.blocked.get(key)
 
     return {
       strategy: this.strategy,
-      remainingTokens: this.getRemainingTokens(key),
-      isBlocked: blockedUntil !== undefined && blockedUntil > Date.now(),
+      remainingTokens: this.limiter.remaining(key, now),
+      isBlocked: blockedUntil !== undefined && blockedUntil > now,
       windowMs: this.windowMs,
       maxRequests: this.maxRequests,
       burstable: this.burstable,
-      currentTime: Date.now()
+      currentTime: now
     }
   }
 
   reset (key) {
-    this.requests.delete(key)
-    this.buckets.delete(key)
+    this.limiter.reset(key)
     this.blocked.delete(key)
-    this.leakyQueues.delete(key)
 
     this.emit('reset', { key })
   }
 
   dispose () {
-    clearInterval(this.cleanupInterval)
-    this.requests.clear()
-    this.buckets.clear()
+    this.clock.clearInterval(this.cleanupInterval)
+    this.limiter.clear()
     this.blocked.clear()
-    this.leakyQueues.clear()
   }
 }
 

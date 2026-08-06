@@ -29,6 +29,67 @@ export const waitFor = async (predicate, timeoutMs = 3000, label = 'condition') 
   throw new Error(`Timeout waiting for: ${label}`)
 }
 
+// Deterministic stand-in for src/utils/clock.js. Time only moves when the
+// test calls advance(), which also fires any interval whose turn came up —
+// so a sweep that used to need a real 900ms sleep is now a synchronous call.
+// sleep() resolves immediately and records the requested duration, letting a
+// test assert pacing (the leaky bucket's smoothing) without waiting it out.
+export class ManualClock {
+  constructor (start = 0) {
+    this.currentTime = start
+    this.intervals = new Map()
+    this.nextIntervalId = 1
+    this.sleeps = []
+  }
+
+  now () {
+    return this.currentTime
+  }
+
+  setInterval (fn, ms) {
+    const id = this.nextIntervalId++
+
+    this.intervals.set(id, { fn, ms, nextAt: this.currentTime + ms })
+
+    return { id, unref: () => {} }
+  }
+
+  clearInterval (handle) {
+    if (handle) this.intervals.delete(handle.id)
+  }
+
+  sleep (ms) {
+    this.sleeps.push(ms)
+
+    return Promise.resolve()
+  }
+
+  advance (ms) {
+    const target = this.currentTime + ms
+
+    // Fire due intervals in timestamp order, with now() set to each firing
+    // time — an interval crossing several periods fires once per period, as
+    // the real timer would.
+    for (;;) {
+      let earliest = null
+
+      for (const interval of this.intervals.values()) {
+        if (interval.nextAt <= target && (!earliest || interval.nextAt < earliest.nextAt)) {
+          earliest = interval
+        }
+      }
+
+      if (!earliest) break
+
+      this.currentTime = earliest.nextAt
+      earliest.nextAt += earliest.ms
+      earliest.fn()
+    }
+
+    this.currentTime = target
+  }
+}
+
 // Single fake channel shared by every unit test, kept deliberately faithful to
 // amqplib's ConfirmChannel contract so a lenient fake cannot green-light
 // broken production code:
