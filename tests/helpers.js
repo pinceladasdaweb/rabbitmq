@@ -17,6 +17,22 @@ export const recordingLogger = () => {
 
 export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Node 22's test runner cancels a test whose only pending work is an unref'd
+// timer ('Promise resolution is still pending but the event loop has already
+// resolved') — and both the RPC timeout timer and systemClock.sleep are
+// deliberately unref'd. One cancelled test takes the whole file down with
+// cancelledByParent, so a ref'd interval holds the loop open while a purely
+// timer-driven assertion runs.
+export const withLiveEventLoop = async (run) => {
+  const keepAlive = setInterval(() => {}, 50)
+
+  try {
+    return await run()
+  } finally {
+    clearInterval(keepAlive)
+  }
+}
+
 export const waitFor = async (predicate, timeoutMs = 3000, label = 'condition') => {
   const start = Date.now()
 
@@ -27,6 +43,99 @@ export const waitFor = async (predicate, timeoutMs = 3000, label = 'condition') 
   }
 
   throw new Error(`Timeout waiting for: ${label}`)
+}
+
+// Deterministic stand-in for src/utils/clock.js. Time only moves when the
+// test calls advance(), which also fires any interval whose turn came up —
+// so a sweep that used to need a real 900ms sleep is now a synchronous call.
+// sleep() resolves immediately and records the requested duration, letting a
+// test assert pacing (the leaky bucket's smoothing) without waiting it out.
+export class ManualClock {
+  constructor (start = 0) {
+    this.currentTime = start
+    this.intervals = new Map()
+    this.timeouts = new Map()
+    this.nextTimerId = 1
+    this.sleeps = []
+  }
+
+  now () {
+    return this.currentTime
+  }
+
+  setInterval (fn, ms) {
+    const id = this.nextTimerId++
+
+    this.intervals.set(id, { fn, ms, nextAt: this.currentTime + ms })
+
+    return { id, unref: () => {} }
+  }
+
+  clearInterval (handle) {
+    if (handle) this.intervals.delete(handle.id)
+  }
+
+  setTimeout (fn, ms) {
+    const id = this.nextTimerId++
+
+    this.timeouts.set(id, { fn, at: this.currentTime + ms })
+
+    return { id, unref: () => {} }
+  }
+
+  clearTimeout (handle) {
+    if (handle) this.timeouts.delete(handle.id)
+  }
+
+  sleep (ms) {
+    this.sleeps.push(ms)
+
+    return Promise.resolve()
+  }
+
+  // Moves time WITHOUT firing intervals: models work that lands after a
+  // deadline but before the timer got a turn on the event loop — e.g. a
+  // rate-limit check arriving in the gap between a window boundary and the
+  // sweep that would collect the expired counter.
+  jump (ms) {
+    this.currentTime += ms
+
+    for (const interval of this.intervals.values()) {
+      while (interval.nextAt <= this.currentTime) {
+        interval.nextAt += interval.ms
+      }
+    }
+  }
+
+  advance (ms) {
+    const target = this.currentTime + ms
+
+    // Fire due timers in timestamp order, with now() set to each firing
+    // time — an interval crossing several periods fires once per period, as
+    // the real timer would; a timeout fires once and is gone.
+    for (;;) {
+      let earliest = null
+
+      for (const interval of this.intervals.values()) {
+        if (interval.nextAt <= target && (!earliest || interval.nextAt < earliest.dueAt)) {
+          earliest = { dueAt: interval.nextAt, fire: () => { interval.nextAt += interval.ms; interval.fn() } }
+        }
+      }
+
+      for (const [id, timeout] of this.timeouts) {
+        if (timeout.at <= target && (!earliest || timeout.at < earliest.dueAt)) {
+          earliest = { dueAt: timeout.at, fire: () => { this.timeouts.delete(id); timeout.fn() } }
+        }
+      }
+
+      if (!earliest) break
+
+      this.currentTime = earliest.dueAt
+      earliest.fire()
+    }
+
+    this.currentTime = target
+  }
 }
 
 // Single fake channel shared by every unit test, kept deliberately faithful to

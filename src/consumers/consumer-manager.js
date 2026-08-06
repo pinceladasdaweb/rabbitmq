@@ -1,6 +1,6 @@
 import WorkerPool from './worker-pool.js'
+import systemClock from '../utils/clock.js'
 import describeError from '../utils/describe-error.js'
-import { setTimeout as sleep } from 'node:timers/promises'
 import SequentialProcessor from './sequential-processor.js'
 
 class ConsumerManager {
@@ -9,6 +9,7 @@ class ConsumerManager {
     this.codec = context.codec
     this.circuitBreaker = context.circuitBreaker
     this.prefetchCount = context.prefetchCount
+    this.clock = context.clock ?? systemClock
     // Base backoff between attempts to recover a broker-cancelled consumer
     // (attempt N waits N * this value).
     this.recoveryInterval = context.consumerRecoveryInterval ?? 1000
@@ -216,7 +217,7 @@ class ConsumerManager {
     let knownEpoch = consumerInfo.epoch
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await sleep(this.recoveryInterval * attempt)
+      await this.clock.sleep(this.recoveryInterval * attempt)
 
       const currentInfo = this.activeConsumers.get(consumerId)
 
@@ -324,6 +325,7 @@ class ConsumerManager {
       // side effect would apply it again on the redelivery. Opt into
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
       createProcessor: ({ channel, noAck }) => async (content, msg) => {
         await callback(content, msg)
@@ -345,6 +347,7 @@ class ConsumerManager {
       // processed, so the retry can break the very ordering this method
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
+      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
       createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
@@ -355,6 +358,7 @@ class ConsumerManager {
           logger: this.logger,
           staleTimeout,
           shouldRequeue,
+          clock: this.clock,
           onSuccess: (message) => {
             if (!noAck) {
               this.settleAck(message, channel, 'ack')
@@ -420,7 +424,7 @@ class ConsumerManager {
     } = options
 
     let currentPrefetch = initialPrefetch
-    let lastOptimizationTime = Date.now()
+    let lastOptimizationTime = this.clock.now()
     let processingTimes = []
     let consumerId = null
     let knownEpoch = null
@@ -453,7 +457,7 @@ class ConsumerManager {
         }
       }
 
-      const now = Date.now()
+      const now = this.clock.now()
       const elapsed = now - lastOptimizationTime
 
       if (elapsed < optimizationInterval || processingTimes.length === 0) return
@@ -478,12 +482,12 @@ class ConsumerManager {
     }
 
     const wrappedCallback = async (content, message) => {
-      const startTime = Date.now()
+      const startTime = this.clock.now()
 
       try {
         await callback(content, message)
       } finally {
-        processingTimes.push(Date.now() - startTime)
+        processingTimes.push(this.clock.now() - startTime)
       }
 
       await optimizePrefetch()

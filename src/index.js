@@ -1,4 +1,5 @@
 import Rpc from './messaging/rpc.js'
+import systemClock from './utils/clock.js'
 import describeError from './utils/describe-error.js'
 import Logger from './utils/logger.js'
 import { EventEmitter } from 'node:events'
@@ -33,6 +34,7 @@ class RabbitMQ extends EventEmitter {
   #shutdownHandlersInstalled
   #connectPromise
   #restorePromise
+  #clock
 
   constructor (options = {}) {
     super()
@@ -48,6 +50,10 @@ class RabbitMQ extends EventEmitter {
     this.#shutdownHandlersInstalled = false
     this.#connectPromise = null
     this.#restorePromise = null
+    // One clock for every time-dependent component (rate limiter sweeps,
+    // sequential staleness, recovery backoffs, RPC deadlines). Injectable so
+    // tests drive all of them from a single fake without sleeping.
+    this.#clock = options.clock ?? systemClock
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -72,6 +78,7 @@ class RabbitMQ extends EventEmitter {
 
     if (options.rateLimiter) {
       this.#rateLimiter = new RateLimiter({
+        clock: this.#clock,
         ...options.rateLimiter,
         logger: this.#logger
       })
@@ -99,6 +106,7 @@ class RabbitMQ extends EventEmitter {
     const context = {
       logger: this.#logger,
       codec: this.#codec,
+      clock: this.#clock,
       circuitBreaker: this.#circuitBreaker,
       rateLimiter: this.#rateLimiter,
       maxPriority: options.maxPriority || 10,
@@ -250,7 +258,7 @@ class RabbitMQ extends EventEmitter {
       throw new Error('No active connection to RabbitMQ')
     }
 
-    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval)
+    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval, this.#clock)
     await this.#channelPool.initialize()
   }
 
@@ -297,7 +305,7 @@ class RabbitMQ extends EventEmitter {
         this.off('reconnectFailed', onReconnectFailed)
         this.off('reconnectError', onReconnectError)
 
-        if (timer) clearTimeout(timer)
+        if (timer) this.#clock.clearTimeout(timer)
       }
 
       const onReconnected = () => {
@@ -323,7 +331,7 @@ class RabbitMQ extends EventEmitter {
       this.on('reconnectError', onReconnectError)
 
       if (options.timeout > 0) {
-        timer = setTimeout(() => {
+        timer = this.#clock.setTimeout(() => {
           cleanup()
           reject(new Error(`Timed out after ${options.timeout}ms waiting for connection`))
         }, options.timeout)

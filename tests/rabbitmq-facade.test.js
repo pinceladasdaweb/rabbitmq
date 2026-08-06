@@ -3,7 +3,7 @@ import RabbitMQ from '../src/index.js'
 import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import { installDialer } from './fake-amqp.js'
-import { createDialer, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
+import { createDialer, recordingLogger, silentLogger, sleep, waitFor, withLiveEventLoop } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 
@@ -44,21 +44,6 @@ const lastConsumer = (connection) => {
   const channels = connection.channels.filter(channel => channel.consumers.length > 0)
 
   return channels.at(-1).consumers.at(-1)
-}
-
-// Node 22's test runner cancels a test whose only pending work is an unref'd
-// timer ('Promise resolution is still pending but the event loop has already
-// resolved') — and the RPC timeout timer is deliberately unref'd. One cancelled
-// test takes the whole file down with cancelledByParent, so a ref'd interval
-// holds the loop open while a purely timeout-driven assertion runs.
-const withLiveEventLoop = async (run) => {
-  const keepAlive = setInterval(() => {}, 50)
-
-  try {
-    return await run()
-  } finally {
-    clearInterval(keepAlive)
-  }
 }
 
 const deliverTo = (consumer, payload, properties = {}) => consumer.callback({

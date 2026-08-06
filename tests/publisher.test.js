@@ -232,6 +232,53 @@ describe('Publisher publishBatch', () => {
   })
 })
 
+describe('Publisher with a serializer that throws a non-Error', () => {
+  // The serializer is user code (setSerializer). Same contract as issue #18
+  // on the consumer side: a `throw null` must not crash the library's own
+  // logging nor replace the caller's error with a TypeError.
+  const throwingCodec = { encode: async () => { throw null } } // eslint-disable-line no-throw-literal
+
+  test('publish still writes the retry log and rethrows the original value', async () => {
+    const logger = recordingLogger()
+    const { publisher } = createPublisher({ codec: throwingCodec, logger })
+
+    await assert.rejects(
+      () => publisher.publish('orders', { id: 1 }, { maxRetries: 2, retryDelay: 1 }),
+      (error) => error === null
+    )
+
+    assert.equal(logger.records.warn.length, 1, 'one retry between two attempts, and its log survived the null')
+    assert.ok(logger.records.warn[0].includes('null'), 'the log renders the thrown value')
+  })
+
+  test('publishAsync logs the failure and rethrows the original value', async () => {
+    const logger = recordingLogger()
+    const { publisher } = createPublisher({ codec: throwingCodec, logger })
+
+    await assert.rejects(
+      () => publisher.publishAsync('orders', { id: 1 }),
+      (error) => error === null,
+      'the caller must receive what the serializer threw, not a TypeError'
+    )
+
+    assert.equal(logger.records.error.length, 1)
+    assert.ok(logger.records.error[0].includes('null'))
+  })
+
+  test('publishAsyncBatch logs the failure and rethrows the original value', async () => {
+    const logger = recordingLogger()
+    const { publisher } = createPublisher({ codec: throwingCodec, logger })
+
+    await assert.rejects(
+      () => publisher.publishAsyncBatch('orders', [{ id: 1 }]),
+      (error) => error === null
+    )
+
+    assert.equal(logger.records.error.length, 1)
+    assert.ok(logger.records.error[0].includes('null'))
+  })
+})
+
 describe('Publisher fire-and-forget (publishAsync)', () => {
   test('publishes with the x-async header and resolves without a confirm', async () => {
     const { publisher, channel } = createPublisher()

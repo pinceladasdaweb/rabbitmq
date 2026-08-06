@@ -1,3 +1,4 @@
+import systemClock from '../utils/clock.js'
 import describeError from '../utils/describe-error.js'
 
 class SequentialProcessor {
@@ -11,13 +12,14 @@ class SequentialProcessor {
     // for every consumption path. Defaults to never requeueing, which is the
     // safe answer when this processor is built directly.
     this.shouldRequeue = options.shouldRequeue ?? (() => false)
+    this.clock = options.clock ?? systemClock
     this.processing = new Map()
     this.pending = new Map()
     // Secondary index (dependsOn -> Set of pending messageIds) so releasing
     // dependents after a completion is O(1) instead of a full pending scan.
     this.pendingByDependency = new Map()
 
-    this.cleanupInterval = setInterval(() => this.cleanup(), Math.min(this.staleTimeout, 60000))
+    this.cleanupInterval = this.clock.setInterval(() => this.cleanup(), Math.min(this.staleTimeout, 60000))
 
     if (typeof this.cleanupInterval.unref === 'function') {
       this.cleanupInterval.unref()
@@ -30,8 +32,20 @@ class SequentialProcessor {
     const dependencyUnresolved = dependsOn && (this.processing.has(dependsOn) || this.pending.has(dependsOn))
 
     if (messageId && dependencyUnresolved) {
+      // A second delivery of a messageId that is already parked (producer
+      // retry) must not overwrite the stored entry: the replaced delivery
+      // would never be acked or nacked and its prefetch slot would be held
+      // until the channel died. The message is already tracked, so the
+      // duplicate is acknowledged and dropped.
+      if (this.pending.has(messageId)) {
+        this.logger?.info(`Duplicate delivery of pending message ${messageId} acknowledged`)
+        this.onSuccess(message)
+
+        return
+      }
+
       this.logger?.info(`Message ${messageId} waiting for dependency ${dependsOn}`)
-      this.pending.set(messageId, { content, message, dependsOn, queuedAt: Date.now() })
+      this.pending.set(messageId, { content, message, dependsOn, queuedAt: this.clock.now() })
       this.#indexPending(messageId, dependsOn)
 
       return
@@ -67,16 +81,21 @@ class SequentialProcessor {
 
   async #process (content, message) {
     const messageId = message.properties.messageId
+    // The map entry exists for the sweep and for dependency tracking; the
+    // duration is computed from this local so a handler that outlives
+    // staleTimeout — and has its entry collected mid-flight — is still
+    // settled as the success it was, not crashed into the catch below.
+    const startTime = this.clock.now()
 
     try {
       if (messageId) {
-        this.processing.set(messageId, { startTime: Date.now() })
+        this.processing.set(messageId, { startTime })
       }
 
       await this.callback(content, message)
 
       if (messageId) {
-        const processingTime = Date.now() - this.processing.get(messageId).startTime
+        const processingTime = this.clock.now() - startTime
 
         this.processing.delete(messageId)
         this.logger?.info(`Successfully processed message ${messageId} in ${processingTime}ms`)
@@ -122,7 +141,7 @@ class SequentialProcessor {
   }
 
   cleanup () {
-    const now = Date.now()
+    const now = this.clock.now()
 
     // A stale processing entry is bookkeeping only: it does not release its
     // dependents (the dependency never actually completed) — they expire via
@@ -151,7 +170,7 @@ class SequentialProcessor {
   }
 
   dispose () {
-    clearInterval(this.cleanupInterval)
+    this.clock.clearInterval(this.cleanupInterval)
     this.processing.clear()
     this.pending.clear()
     this.pendingByDependency.clear()

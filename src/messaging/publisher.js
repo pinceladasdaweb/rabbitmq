@@ -1,3 +1,4 @@
+import describeError from '../utils/describe-error.js'
 import { compose, exponential, isRetryExhaustedError, retry } from 'breakwater'
 
 class Publisher {
@@ -126,7 +127,10 @@ class Publisher {
     })
 
     retryPolicy.on('retry', ({ attempt, error }) => {
-      this.logger.warn(`Operation failed, retrying (${attempt}/${attempts}): ${error.message}`)
+      // describeError, not error.message: the failing operation runs the
+      // user's serializer (codec.encode), which can throw a non-Error — a
+      // crash here is swallowed by breakwater and silently kills this log.
+      this.logger.warn(`Operation failed, retrying (${attempt}/${attempts}): ${describeError(error)}`)
     })
 
     return compose(retryPolicy, this.circuitBreaker.policy)
@@ -197,7 +201,9 @@ class Publisher {
     try {
       await this.circuitBreaker.execute(publishOperation)
     } catch (error) {
-      this.logger.error(`Failed to publish message asynchronously: ${error.message}`)
+      // describeError: reading .message on a non-Error thrown by the user's
+      // serializer would replace the caller's error with a TypeError.
+      this.logger.error(`Failed to publish message asynchronously: ${describeError(error)}`)
 
       throw error
     }
@@ -226,7 +232,8 @@ class Publisher {
     try {
       await this.circuitBreaker.execute(publishOperation)
     } catch (error) {
-      this.logger.error(`Failed to publish batch asynchronously: ${error.message}`)
+      // Same non-Error tolerance as publishAsync.
+      this.logger.error(`Failed to publish batch asynchronously: ${describeError(error)}`)
 
       throw error
     }

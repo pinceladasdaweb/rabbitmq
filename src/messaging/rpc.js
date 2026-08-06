@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import systemClock from '../utils/clock.js'
 import describeError from '../utils/describe-error.js'
 
 // RabbitMQ's direct reply-to pseudo-queue: consuming from it (noAck) turns the
@@ -17,6 +18,7 @@ class Rpc {
     this.getChannelPool = context.getChannelPool
     this.publisher = publisher
     this.consumers = consumers
+    this.clock = context.clock ?? systemClock
     this.pendingRequests = new Map()
     this.replyChannel = null
     this.replySetupPromise = null
@@ -37,7 +39,7 @@ class Rpc {
     if (!pending) return false
 
     this.pendingRequests.delete(correlationId)
-    clearTimeout(pending.timer)
+    this.clock.clearTimeout(pending.timer)
     settle(pending)
 
     return true
@@ -60,7 +62,7 @@ class Rpc {
 
   rejectAllPending (reason) {
     for (const [, pending] of this.pendingRequests.entries()) {
-      clearTimeout(pending.timer)
+      this.clock.clearTimeout(pending.timer)
       pending.reject(this.#rpcError('RPC_CONNECTION_LOST', `RPC request aborted: ${reason}`))
     }
 
@@ -164,7 +166,7 @@ class Rpc {
     }
 
     this.pendingRequests.delete(correlationId)
-    clearTimeout(pending.timer)
+    this.clock.clearTimeout(pending.timer)
 
     try {
       const isCompressed = Boolean(msg.properties.headers && msg.properties.headers['x-compressed'])
@@ -209,14 +211,14 @@ class Rpc {
       expiration: String(Math.ceil(timeout)),
       mandatory: true,
       ...options
-    }, compressed, { 'x-rpc-deadline': Date.now() + timeout })
+    }, compressed, { 'x-rpc-deadline': this.clock.now() + timeout })
 
     publishOptions.correlationId = correlationId
     publishOptions.replyTo = DIRECT_REPLY_QUEUE
 
     // Registered BEFORE publishing so a reply cannot outrun the bookkeeping.
     const responsePromise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer = this.clock.setTimeout(() => {
         this.pendingRequests.delete(correlationId)
         reject(this.#rpcError('RPC_TIMEOUT', `RPC request to ${routingKey} timed out after ${timeout}ms`))
       }, timeout)
@@ -269,8 +271,8 @@ class Rpc {
       // timeout inside this responder's prefetch buffer.
       const deadline = Number(message.properties.headers?.['x-rpc-deadline'])
 
-      if (deadline && Date.now() > deadline) {
-        this.logger.debug?.(`Dropping stale RPC request on queue ${queueName} (deadline exceeded by ${Date.now() - deadline}ms)`)
+      if (deadline && this.clock.now() > deadline) {
+        this.logger.debug?.(`Dropping stale RPC request on queue ${queueName} (deadline exceeded by ${this.clock.now() - deadline}ms)`)
 
         return
       }

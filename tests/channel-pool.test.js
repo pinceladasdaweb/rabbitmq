@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import { EventEmitter } from 'node:events'
 import ChannelPool from '../src/connection/channel-pool.js'
-import { FakeChannel, recordingLogger, silentLogger, waitFor as waitForCondition } from './helpers.js'
+import { FakeChannel, ManualClock, recordingLogger, silentLogger, waitFor as waitForCondition } from './helpers.js'
 
 function createFakeChannel () {
   const channel = new EventEmitter()
@@ -334,18 +334,15 @@ describe('ChannelPool', () => {
   })
 
   test('a slot whose replacement never succeeds is reported and left out of rotation', async (t) => {
-    // Exhausting all 5 attempts at the production backoff costs ~7.5s of real
-    // time, which every surviving mutant then pays during mutation testing.
-    // channelRecoveryInterval is a real option — same knob shape as
-    // consumerRecoveryInterval — so the loop runs in full on a 20ms base.
-    //
-    // Not 1ms: the elapsed assertion below is what pins `recoveryInterval *
-    // attempt`. At 1ms the arithmetic becomes unobservable and a mutated
-    // backoff survives, which is how making this test fast first weakened it.
+    // The injected clock records every requested backoff instead of waiting
+    // it out, so the loop runs at the PRODUCTION interval and the exact
+    // `recoveryInterval * attempt` sequence is pinned — a mutated multiplier,
+    // a dropped attempt or a constant delay all change the recorded list.
+    // (This test used to sleep 300ms of real time for a weaker >= bound.)
     const logger = recordingLogger()
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, logger, 1, 20)
-    const startedAt = Date.now()
+    const clock = new ManualClock()
+    const pool = new ChannelPool(connection, logger, 1, 500, clock)
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -363,13 +360,7 @@ describe('ChannelPool', () => {
     )
 
     assert.equal(pool.channels[0], null, 'the dead slot is left empty, never handed out')
-
-    // 20ms × (1+2+3+4+5) = 300ms of backoff across the five attempts. The
-    // lower bound is what keeps the backoff arithmetic honest: a mutated
-    // multiplier, a dropped attempt or a constant delay all land under it.
-    const elapsed = Date.now() - startedAt
-
-    assert.ok(elapsed >= 250, `the five attempts backed off progressively (took ${elapsed}ms)`)
+    assert.deepEqual(clock.sleeps, [500, 1000, 1500, 2000, 2500], 'five attempts, each backing off progressively')
   })
 
   test('defaults the recovery backoff to 500ms', () => {

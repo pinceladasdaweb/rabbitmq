@@ -147,6 +147,36 @@ describe('RabbitMQ lifecycle (fake dialer)', () => {
     assert.equal(dialer.connections[1].publishedOn().length, 1, 'publishing resumes on the new pool')
   })
 
+  test('a connect() whose connection dies before the restore fails loudly instead of building a dead pool', async (t) => {
+    const dialer = createDialer()
+    // The automatic timer stays out of the race so the manual connect() below
+    // owns the restore.
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 60000, maxReconnectInterval: 60000 })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    dialer.connections[0].emit('close')
+
+    // On the next dial, re-emit 'close' the moment the connection module has
+    // attached its own close listener: the connection is gone again by the
+    // time the restore asks for it. That is the gap this guard covers — a
+    // connection that drops between connect() resolving and #setupChannelPool
+    // running, where building the pool would wire every channel to a corpse.
+    dialer.onConnection = (connection) => {
+      const attach = connection.on.bind(connection)
+
+      connection.on = (event, handler) => {
+        attach(event, handler)
+
+        if (event === 'close') queueMicrotask(() => connection.emit('close'))
+      }
+    }
+
+    await assert.rejects(() => rabbit.connect(), /No active connection to RabbitMQ/)
+  })
+
   test('a manual connect() that beats the reconnection timer still recreates consumers', async (t) => {
     // Regression: recreateAll() used to hang off the 'reconnected' event, which
     // only the automatic timer emits. A user calling connect() first rebuilt
