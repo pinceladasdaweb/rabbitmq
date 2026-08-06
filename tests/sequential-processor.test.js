@@ -314,6 +314,78 @@ describe('SequentialProcessor', () => {
     assert.equal(nacked[0].messageId, 'child')
   })
 
+  test('a handler that outlives staleTimeout and then succeeds is still acked', async (t) => {
+    // Regression: the success path used to read startTime from the processing
+    // entry, which the sweep had already collected — the TypeError landed in
+    // the catch and the SUCCESSFUL message was nacked (requeued under 'once':
+    // its side effects ran twice; dead-lettered under 'none').
+    const clock = new ManualClock(1000)
+    const warnings = []
+    const infos = []
+
+    const { processor, acked, nacked } = createProcessor(t, {
+      staleTimeout: 100,
+      callback: async (content) => {
+        if (content.slow) clock.advance(300)
+      },
+      options: {
+        clock,
+        logger: { ...silentLogger, warn: (line) => warnings.push(line), info: (line) => infos.push(line) }
+      }
+    })
+
+    const slow = processor.handle({ slow: true }, makeMessage('slow-but-fine'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('waiting', { dependsOn: 'slow-but-fine' }))
+    await slow
+    await sleep(20)
+
+    assert.ok(warnings.some(line => line.includes('slow-but-fine')), 'the sweep collected the wedged entry mid-flight')
+    assert.deepEqual(nacked, [], 'nothing was treated as a failure')
+    assert.deepEqual(acked, ['slow-but-fine', 'waiting'], 'the late success is acked and still releases its dependents')
+    assert.ok(infos.some(line => line.includes('in 300ms')), 'the duration survives the entry being collected')
+  })
+
+  test('a duplicate delivery of a parked messageId is acknowledged, not swallowed', async (t) => {
+    // Regression: pending.set used to overwrite the stored entry, so the
+    // replaced delivery was never acked nor nacked — its prefetch slot was
+    // held until the channel died.
+    let releaseDep
+    const depBlocked = new Promise(resolve => { releaseDep = resolve })
+    const settled = []
+
+    const { processor } = createProcessor(t, {
+      callback: async (content) => { if (content.hold) await depBlocked },
+      options: {
+        onSuccess: (message) => settled.push({ kind: 'ack', message }),
+        onFailure: (message) => settled.push({ kind: 'nack', message })
+      }
+    })
+
+    const dep = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+
+    const firstDelivery = makeMessage('child', { dependsOn: 'dep' })
+    const duplicateDelivery = makeMessage('child', { dependsOn: 'dep' })
+
+    await processor.handle({ n: 1 }, firstDelivery)
+    await processor.handle({ n: 1 }, duplicateDelivery)
+
+    assert.deepEqual(settled, [{ kind: 'ack', message: duplicateDelivery }], 'the duplicate is settled immediately')
+
+    releaseDep()
+    await dep
+    await sleep(20)
+
+    const refs = settled.map(entry => entry.message)
+
+    assert.equal(settled.length, 3, 'every delivery got exactly one settlement')
+    assert.ok(refs.includes(firstDelivery), 'the original parked delivery was settled through its dependency')
+    assert.ok(settled.every(entry => entry.kind === 'ack'))
+  })
+
   test('reports how long a message took using the clock', async (t) => {
     // Seeded away from zero: the duration must be the delta between two clock
     // reads, and only a nonzero start distinguishes `now - start` from any
