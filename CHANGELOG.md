@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.5.2 (2026-08-06)
+
+* refactor: split the rate limiter into strategy objects with an injectable clock by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/58e041009bce5f5607590d0254efe4040bc810a7)
+* test: extend the clock seam to SequentialProcessor and close every line-coverage gap by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/869d898f1aa4b30ebd08d75fa08a83d70001b13b)
+* chore: declare log-line StringLiteral mutants out of the mutation gate by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/42ee5beb6a59294b50b0b35b0c3a5e83999d993a)
+* fix: settle late successes, duplicate parked deliveries and non-Error publish failures by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/1bc52017abc0bee168e394518c548a3d5d54b488)
+* refactor: finish the clock seam, share the window-log core, declare the log policy once by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/43279aa94a21a894f6bce20fd20ad3e88ab05065)
+* test: hold the event loop open for unref'd-timer tests on Node 22 by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/c425579e53aea4fc0702b141e16f15b8084a9dc7)
+
+
 ## 1.5.1 (2026-08-02)
 
 * fix: settle the message even when a handler throws a non-Error by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/b770912dfd465b83bb307ba7a138b5cec55bc4aa)
