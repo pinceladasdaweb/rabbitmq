@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import Rpc from '../src/messaging/rpc.js'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { test, describe } from 'node:test'
+import { test, describe, before, after } from 'node:test'
 import { EventEmitter } from 'node:events'
 import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
@@ -865,6 +865,16 @@ describe('Rpc respond()', () => {
 })
 
 describe('Rpc survivor round', () => {
+  // Node 22's test runner cancels a test whose only pending work is an
+  // unref'd timer — and every in-flight RPC request holds exactly that
+  // (its timeout timer is deliberately unref'd). One ref'd interval keeps
+  // the event loop alive for the whole suite; same mechanics as
+  // withLiveEventLoop, hoisted to describe scope.
+  let keepAlive
+
+  before(() => { keepAlive = setInterval(() => {}, 50) })
+  after(() => clearInterval(keepAlive))
+
   test('a publish failure that settles the request does not also warn about a late failure', async () => {
     const logger = recordingLogger()
     const harness = createHarness({ logger })
@@ -1106,6 +1116,12 @@ describe('Rpc survivor round', () => {
 })
 
 describe('Rpc respond() staleness', () => {
+  // Same Node 22 keep-alive as the suite above.
+  let keepAlive
+
+  before(() => { keepAlive = setInterval(() => {}, 50) })
+  after(() => clearInterval(keepAlive))
+
   const deliverRequest = async (harness, payload, headers = {}, properties = {}) => {
     const { content, compressed } = await harness.codec.encode(payload)
 
