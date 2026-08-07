@@ -98,6 +98,13 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //   - consumer-manager.js disposeAll's cancelled = true: the loop is
 //     synchronous and activeConsumers.clear() follows immediately, so no
 //     concurrent observer can see the flag between the two.
+//   - consumer-manager.js __ackSettled's `configurable: true`: the property
+//     is writable, and a non-configurable-but-writable property still
+//     accepts value changes — which is all a re-attach performs on it.
+//     Configurability only governs flag changes and deletes, which no code
+//     path performs. (__channel's configurable IS load-bearing and tested:
+//     that property is non-writable, so its re-attach value swap depends on
+//     it.)
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 
