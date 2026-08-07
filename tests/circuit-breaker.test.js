@@ -131,4 +131,31 @@ describe('CircuitBreaker', () => {
     assert.equal(state.failureCount, 1)
     assert.equal(state.successCount, 0)
   })
+
+  test('a closed breaker reports nextAttempt as the present, never undefined', () => {
+    // breakwater only stamps nextAttemptAt once the circuit opens; while
+    // closed the caller still gets a number (now), not a hole in the shape.
+    const breaker = new CircuitBreaker()
+    const before = Date.now()
+    const state = breaker.getState()
+
+    assert.ok(state.nextAttempt >= before && state.nextAttempt <= Date.now(), 'nextAttempt defaults to now while closed')
+  })
+
+  test('isolating the composed policy surfaces the ISOLATED label', async () => {
+    // The `policy` getter exists for composition; anyone holding it can call
+    // isolate(), so the state map must translate that state too.
+    const breaker = new CircuitBreaker()
+    const states = []
+
+    breaker.on('stateChanged', (state) => states.push(state))
+
+    breaker.policy.isolate()
+
+    // breakwater emits stateChange asynchronously.
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.deepEqual(states, ['ISOLATED'])
+    assert.equal(breaker.getState().state, 'ISOLATED')
+  })
 })

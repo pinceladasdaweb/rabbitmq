@@ -18,10 +18,10 @@
   ],
   "plugins": [
     "@stryker-mutator/*",
-    "./stryker-log-strings-ignorer.js"
+    "./stryker-mutation-policy.js"
   ],
   "ignorers": [
-    "log-strings"
+    "mutation-policy"
   ],
   "coverageAnalysis": "perTest",
   "reporters": [

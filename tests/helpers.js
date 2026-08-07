@@ -57,6 +57,9 @@ export class ManualClock {
     this.timeouts = new Map()
     this.nextTimerId = 1
     this.sleeps = []
+    // Timer ids whose handle had unref() called — lets a test assert that a
+    // component's periodic work cannot hold the process open.
+    this.unrefs = []
   }
 
   now () {
@@ -68,7 +71,7 @@ export class ManualClock {
 
     this.intervals.set(id, { fn, ms, nextAt: this.currentTime + ms })
 
-    return { id, unref: () => {} }
+    return { id, unref: () => this.unrefs.push(id) }
   }
 
   clearInterval (handle) {
@@ -80,7 +83,7 @@ export class ManualClock {
 
     this.timeouts.set(id, { fn, at: this.currentTime + ms })
 
-    return { id, unref: () => {} }
+    return { id, unref: () => this.unrefs.push(id) }
   }
 
   clearTimeout (handle) {

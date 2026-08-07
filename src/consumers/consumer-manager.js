@@ -325,7 +325,6 @@ class ConsumerManager {
       // side effect would apply it again on the redelivery. Opt into
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
       createProcessor: ({ channel, noAck }) => async (content, msg) => {
         await callback(content, msg)
@@ -347,7 +346,6 @@ class ConsumerManager {
       // processed, so the retry can break the very ordering this method
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
       createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
         // Recreation (reconnect): discard state tied to the previous channel.

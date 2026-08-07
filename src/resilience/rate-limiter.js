@@ -105,11 +105,12 @@ class RateLimiter extends EventEmitter {
   getStatus (key) {
     const now = this.clock.now()
     const blockedUntil = this.blocked.get(key)
+    const isBlocked = blockedUntil !== undefined && blockedUntil > now
 
     return {
       strategy: this.strategy,
       remainingTokens: this.limiter.remaining(key, now),
-      isBlocked: blockedUntil !== undefined && blockedUntil > now,
+      isBlocked,
       windowMs: this.windowMs,
       maxRequests: this.maxRequests,
       burstable: this.burstable,
