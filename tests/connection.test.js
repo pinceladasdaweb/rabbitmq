@@ -520,3 +520,225 @@ describe('RabbitMQConnection disconnect', () => {
     assert.equal(connection.getConnectionState(), 'connected')
   })
 })
+
+describe('RabbitMQConnection lifecycle guards', () => {
+  test('startReconnection works on a freshly constructed instance', (t) => {
+    // #isShuttingDown must start false: a connection that boots believing it
+    // is shutting down silently refuses to reconnect.
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer, { reconnectInterval: 60000, maxReconnectInterval: 60000 })
+
+    t.after(() => connection.disconnect())
+
+    const events = []
+
+    connection.on('disconnected', () => events.push('disconnected'))
+
+    connection.startReconnection()
+
+    assert.deepEqual(events, ['disconnected'])
+    assert.equal(connection.getConnectionState(), 'reconnecting')
+  })
+
+  test('a dial that lands after disconnect() does not resurrect reconnection on close', async (t) => {
+    // disconnect() during an in-flight dial cannot cancel it; the connection
+    // still lands and attaches its close handler. When THAT connection later
+    // closes, the shutdown flag must keep it from scheduling a reconnect —
+    // and from alarming the operator about a close they asked for.
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    let releaseDial
+    const dialGate = new Promise(resolve => { releaseDial = resolve })
+    const originalConnect = dialer.connect
+
+    dialer.connect = async (...args) => {
+      await dialGate
+
+      return originalConnect(...args)
+    }
+
+    const connection = createConnection(t, dialer, { logger })
+
+    t.after(() => connection.disconnect())
+
+    const pending = connection.connect()
+
+    await connection.disconnect()
+    releaseDial()
+    await pending
+
+    dialer.connections.at(-1).emit('close')
+    await sleep(50)
+
+    assert.equal(dialer.dials, 1, 'the post-shutdown close scheduled no reconnect dial')
+    assert.equal(
+      logger.records.error.some(line => line.includes('closed unexpectedly')),
+      false,
+      'a close during shutdown is not unexpected'
+    )
+  })
+
+  test('disconnect() during a failing dial settles the state as disconnected', async (t) => {
+    const dialer = createDialer()
+    let releaseDial
+    const dialGate = new Promise(resolve => { releaseDial = resolve })
+
+    dialer.connect = async () => {
+      await dialGate
+
+      throw new Error('unreachable')
+    }
+
+    const connection = createConnection(t, dialer)
+
+    const pending = connection.connect()
+
+    await connection.disconnect()
+    releaseDial()
+    await pending
+
+    assert.equal(connection.getConnectionState(), 'disconnected', 'a shutdown mid-dial must not leave the state at connecting')
+
+    await sleep(50)
+    assert.equal(dialer.dials, 0, 'and must not schedule reconnection')
+  })
+
+  test('after giving up, an explicit startReconnection announces a fresh cycle', async (t) => {
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer, { maxReconnectAttempts: 1 })
+
+    t.after(() => connection.disconnect())
+
+    const failed = new Promise(resolve => connection.once('reconnectFailed', resolve))
+
+    await connection.connect()
+    await failed
+
+    const events = []
+
+    connection.on('disconnected', () => events.push('disconnected'))
+
+    connection.startReconnection()
+
+    assert.deepEqual(events, ['disconnected'], 'the new cycle is announced — giving up cleared the reconnecting latch')
+    // The fresh cycle immediately re-evaluates the exhausted budget and gives
+    // up again; what matters is that it was ANNOUNCED (the latch was reset).
+    assert.equal(connection.getConnectionState(), 'failed')
+  })
+
+  test('an unlimited retry budget is announced as such', async (t) => {
+    // Which log line an operator sees is decided by the Infinity branch: the
+    // capped wording implies the client may give up, the unlimited one that
+    // it will not — telling them apart matters during an outage.
+    const logger = recordingLogger()
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer, { logger })
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    assert.ok(logger.records.info.some(line => line.includes('indefinitely')), 'the unlimited budget is stated')
+
+    const capped = recordingLogger()
+    const cappedConnection = createConnection(t, createDialer([new Error('down')]), { logger: capped, maxReconnectAttempts: 3 })
+
+    t.after(() => cappedConnection.disconnect())
+
+    await cappedConnection.connect()
+
+    assert.ok(capped.records.info.some(line => line.includes('1/3')), 'a capped budget states the ceiling')
+  })
+
+  test('a reconnect timer firing after a manual connect succeeds does not re-emit reconnected', async (t) => {
+    const dialer = createDialer([new Error('down'), 'ok'])
+    const connection = createConnection(t, dialer)
+
+    t.after(() => connection.disconnect())
+
+    const reconnects = []
+
+    connection.on('reconnected', () => reconnects.push('reconnected'))
+
+    // First dial fails and schedules a retry; the manual connect() wins the
+    // race and succeeds. The timer then fires against a connected client.
+    await connection.connect()
+    await connection.connect()
+
+    assert.equal(connection.getConnectionState(), 'connected')
+
+    await sleep(60)
+
+    assert.deepEqual(reconnects, [], 'the late timer must not announce a reconnection that never happened')
+  })
+
+  test('repeated retry cycles do not repeat the connecting state announcement', async (t) => {
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer)
+
+    t.after(() => connection.disconnect())
+
+    const states = []
+
+    connection.on('connectionStateChanged', (state) => states.push(state))
+
+    await connection.connect()
+    await waitFor(() => dialer.dials >= 3, 3000, 'two retry cycles')
+
+    assert.deepEqual(
+      states.slice(0, 3),
+      ['connecting', 'reconnecting', 'connecting'],
+      'the second retry re-enters connecting silently — the state did not change'
+    )
+    assert.equal(states.filter(state => state === 'connecting').length, 2, 'no duplicate announcements for an unchanged state')
+  })
+
+  test('disconnect() resets the reconnecting latch for the next cycle', async (t) => {
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer, { reconnectInterval: 60000, maxReconnectInterval: 60000 })
+
+    await connection.connect()
+    assert.equal(connection.getConnectionState(), 'reconnecting')
+
+    await connection.disconnect()
+
+    const events = []
+
+    connection.on('disconnected', () => events.push('disconnected'))
+
+    await connection.connect()
+
+    assert.deepEqual(events, ['disconnected'], 'the failing cycle after a disconnect is announced anew')
+
+    await connection.disconnect()
+  })
+
+  test('disconnect() on a never-connected instance changes no state', (t) => {
+    const connection = createConnection(t, createDialer())
+    const states = []
+
+    connection.on('connectionStateChanged', (state) => states.push(state))
+
+    connection.disconnect()
+
+    assert.deepEqual(states, [], 'already disconnected: announcing disconnecting/disconnected again is noise')
+  })
+
+  test('a connection that fails to close still reports the shutdown', async (t) => {
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer, { logger })
+
+    await connection.connect()
+
+    dialer.connections[0].close = async () => { throw new Error('already gone') }
+
+    await connection.disconnect()
+
+    assert.equal(connection.getConnectionState(), 'disconnected')
+    assert.ok(
+      logger.records.info.some(line => line.includes('closed')),
+      'the operator still learns the connection is gone'
+    )
+  })
+})

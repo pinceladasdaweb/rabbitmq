@@ -53,10 +53,9 @@ class RabbitMQConnection extends EventEmitter {
   }
 
   #clearReconnectTimeout () {
-    if (this.#reconnectTimeout) {
-      clearTimeout(this.#reconnectTimeout)
-      this.#reconnectTimeout = null
-    }
+    // No guard: clearTimeout tolerates null, and re-nulling is a no-op.
+    clearTimeout(this.#reconnectTimeout)
+    this.#reconnectTimeout = null
   }
 
   #buildConnectionString (endpoint) {

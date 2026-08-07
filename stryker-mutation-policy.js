@@ -38,6 +38,33 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //   - topology.js default `(() => null)` -> `() => undefined`: the only
 //     consumer feeds it into `sourceQueue || routingKey`, where null and
 //     undefined are the same falsy.
+//   - publisher.js validatePriority `priority !== undefined &&`: the
+//     `true &&` twin hands undefined to the range check, and undefined
+//     compares false against any number — same shape as the rate limiter's
+//     readability guard.
+//   - connection.js `state === 'connected' && #connection` (and its || twin):
+//     the state machine maintains state === 'connected' iff #connection is
+//     set (the close handler nulls both together, synchronously), so the two
+//     operands never disagree.
+//   - connection.js #scheduleReconnect's shutdown guard: its only caller
+//     (startReconnection) checks the same flag one synchronous statement
+//     earlier — kept as defense in depth on a private entry point.
+//   - connection.js `#maxReconnectAttempts !== Infinity &&`: the `true &&`
+//     twin asks whether attempt >= Infinity, which no attempt count ever is.
+//   - connection.js disconnect's listener stripping and the close handler's
+//     #isShuttingDown guard are a defense-in-depth PAIR: each one alone
+//     prevents the shutdown-reconnect loop, so mutating either in isolation
+//     is unobservable (and the null-connection branch is swallowed by the
+//     surrounding catch).
+//   - connection.js #doConnect's failed-dial else branch: disconnect() has
+//     already settled the state at 'disconnected' by the time a shut-down
+//     dial loop finishes, so re-setting it is deduplicated — only an
+//     interleaving where disconnect is still awaiting close() could tell
+//     the branches apart.
+//   - connection.js #attemptReconnect's connected-guard: successful connects
+//     clear the reconnect timer, so the guard only matters for the microtask
+//     race where the timer callback was already dequeued when the connect
+//     resolved — the clear and the guard are another defense-in-depth pair.
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 

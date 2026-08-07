@@ -279,6 +279,108 @@ describe('Publisher with a serializer that throws a non-Error', () => {
   })
 })
 
+describe('Publisher rate-limit accounting', () => {
+  // Each publish flavour reserves its own key namespace and pays a cost that
+  // scales with the batch. rateLimitCost 2 keeps multiplication apart from
+  // division (with the default 1 they agree), and omitting it must charge
+  // exactly 1 — not undefined.
+  const allowAll = () => {
+    const rateLimiter = { calls: [] }
+
+    rateLimiter.checkRateLimit = async (key, cost) => {
+      rateLimiter.calls.push({ key, cost })
+
+      return true
+    }
+    rateLimiter.getStatus = () => ({})
+
+    return rateLimiter
+  }
+
+  test('every flavour charges its namespaced key and batch-scaled cost', async () => {
+    const rateLimiter = allowAll()
+    const { publisher, channel } = createPublisher({ rateLimiter })
+
+    channel.confirmDelayMs = 0
+
+    await publisher.publish('orders', { n: 1 }, { rateLimitCost: 2 })
+    await publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }], { rateLimitCost: 2 })
+    await publisher.publishAsync('orders', { n: 1 }, { rateLimitCost: 2 })
+    await publisher.publishAsyncBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }], { rateLimitCost: 2 })
+    await publisher.publishDelayed('orders', { n: 1 }, 5, { rateLimitCost: 2 })
+
+    assert.deepEqual(rateLimiter.calls, [
+      { key: 'orders', cost: 2 },
+      { key: 'orders', cost: 6 },
+      { key: 'async:orders', cost: 2 },
+      { key: 'async-batch:orders', cost: 6 },
+      { key: 'delayed:orders', cost: 2 }
+    ])
+  })
+
+  test('omitting rateLimitCost charges exactly one per message', async () => {
+    const rateLimiter = allowAll()
+    const { publisher } = createPublisher({ rateLimiter })
+
+    await publisher.publishAsync('orders', { n: 1 })
+    await publisher.publishAsyncBatch('orders', [{ n: 1 }, { n: 2 }])
+    await publisher.publishDelayed('orders', { n: 1 }, 5)
+
+    assert.deepEqual(rateLimiter.calls.map(call => call.cost), [1, 2, 1])
+  })
+})
+
+describe('Publisher retry pacing', () => {
+  test('retries are spaced by retryDelay with deterministic (jitter-free) backoff', async () => {
+    // The backoff config is only observable through WHEN attempts run:
+    // jitter 'none' with initial 400 puts the second attempt ~200ms out,
+    // while breakwater's defaults (full jitter over a much smaller initial)
+    // land far under 150ms and a broken jitter value yields no delay at all.
+    const attempts = []
+    const { publisher, channel } = createPublisher()
+
+    channel.confirmErrors.push(new Error('transient'))
+
+    const originalPublish = channel.publish.bind(channel)
+
+    channel.publish = (...args) => {
+      attempts.push(Date.now())
+
+      return originalPublish(...args)
+    }
+
+    await publisher.publish('orders', { n: 1 }, { maxRetries: 2, retryDelay: 400 })
+
+    assert.equal(attempts.length, 2)
+    assert.ok(attempts[1] - attempts[0] >= 150, `the retry must respect the configured pacing (waited ${attempts[1] - attempts[0]}ms)`)
+  })
+})
+
+describe('Publisher with a debug-less logger', () => {
+  test('confirmed publishes tolerate a logger without debug', async () => {
+    // Injected loggers only promise error/warn/info; debug is reached with
+    // optional chaining precisely because it may not exist.
+    const { logger } = { logger: { info: () => {}, warn: () => {}, error: () => {} } }
+    const { publisher } = createPublisher({ logger })
+
+    await publisher.publish('orders', { n: 1 })
+    await publisher.publishDelayed('orders', { n: 1 }, 5)
+  })
+})
+
+describe('Publisher publishDelayed validation', () => {
+  test('accepts zero, rejects negatives and non-numbers', async () => {
+    const { publisher, channel } = createPublisher()
+
+    await publisher.publishDelayed('orders', { n: 1 }, 0)
+    assert.equal(channel.published[0].options.headers['x-delay'], 0, 'zero delay is a legal immediate delivery')
+
+    await assert.rejects(() => publisher.publishDelayed('orders', { n: 1 }, -1), /non-negative number/)
+    await assert.rejects(() => publisher.publishDelayed('orders', { n: 1 }, 'soon'), /non-negative number/)
+    await assert.rejects(() => publisher.publishDelayed('orders', { n: 1 }, Infinity), /non-negative number/)
+  })
+})
+
 describe('Publisher fire-and-forget (publishAsync)', () => {
   test('publishes with the x-async header and resolves without a confirm', async () => {
     const { publisher, channel } = createPublisher()
@@ -303,6 +405,13 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
     await pending
 
     assert.equal(resolved, true)
+
+    // The drain machinery attaches three one-shot listeners per stalled
+    // publish; each settled wait must remove all of them or a long-lived
+    // channel accumulates dead listeners on every buffer stall.
+    assert.equal(channel.listenerCount('drain'), 0)
+    assert.equal(channel.listenerCount('error'), 0)
+    assert.equal(channel.listenerCount('close') <= 1, true, 'only the FakeChannel constructor listener remains')
   })
 
   test('a channel close while waiting for drain rejects instead of hanging', async () => {
@@ -316,6 +425,11 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
     channel.emit('close')
 
     await assert.rejects(() => pending, /Channel closed while waiting for drain/)
+
+    // 'close' consumed its own once-listener; 'drain' and 'error' did not
+    // fire, so only an explicit cleanup removes them.
+    assert.equal(channel.listenerCount('drain'), 0, 'the unfired drain listener was cleaned up')
+    assert.equal(channel.listenerCount('error'), 0, 'the unfired error listener was cleaned up')
   })
 
   test('a channel error while waiting for drain rejects with that error', async () => {
