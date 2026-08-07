@@ -24,6 +24,32 @@ describe('logger', () => {
     assert.equal(errorMock.mock.callCount(), 1)
     assert.equal(warnMock.mock.callCount(), 1)
     assert.equal(logMock.mock.callCount(), 2)
+
+    // The level label in the line is contract-ish for anyone grepping logs:
+    // each line must carry ITS level, not an empty tag.
+    assert.match(errorMock.mock.calls[0].arguments[0], / \[error\] boom$/)
+    assert.match(warnMock.mock.calls[0].arguments[0], / \[warn\] careful$/)
+    assert.match(logMock.mock.calls[0].arguments[0], / \[info\] hello$/)
+    assert.match(logMock.mock.calls[1].arguments[0], / \[debug\] details$/)
+  })
+
+  test('at error level everything below error is suppressed', (t) => {
+    // warn/info/debug all sit above threshold 0; a broken level lookup that
+    // stops comparing (e.g. an unknown level name) would let them through.
+    const errorMock = t.mock.method(console, 'error', () => {})
+    const warnMock = t.mock.method(console, 'warn', () => {})
+    const logMock = t.mock.method(console, 'log', () => {})
+
+    const logger = createLogger('error')
+
+    logger.error('shown')
+    logger.warn('hidden')
+    logger.info('hidden')
+    logger.debug('hidden')
+
+    assert.equal(errorMock.mock.callCount(), 1)
+    assert.equal(warnMock.mock.callCount(), 0)
+    assert.equal(logMock.mock.callCount(), 0)
   })
 
   test('suppresses messages below the configured level', (t) => {
@@ -55,9 +81,10 @@ describe('logger', () => {
   })
 
   test('reads the level from LOG_LEVEL when the caller gives none', (t) => {
-    // The default parameter is `process.env.LOG_LEVEL || 'info'`. Without the
-    // environment read, setting LOG_LEVEL=debug in a deployment silently does
-    // nothing and the diagnostics people turned on never appear.
+    // The default parameter is `process.env.LOG_LEVEL` (unknown values map to
+    // info via the ?? lookup). Without the environment read, setting
+    // LOG_LEVEL=debug in a deployment silently does nothing and the
+    // diagnostics people turned on never appear.
     const previous = process.env.LOG_LEVEL
 
     process.env.LOG_LEVEL = 'debug'

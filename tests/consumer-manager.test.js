@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { FakeChannel, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
@@ -911,8 +912,12 @@ describe('ConsumerManager retryPolicy', () => {
 })
 
 describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
+  // The optimizer measures processing pace through the injected clock, so
+  // "slow processing" is a callback that advances the clock — these tests
+  // used to sleep 520ms of real time to cross the saturation threshold.
   test('raises the prefetch when processing is consistently fast', async () => {
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
       initialPrefetch: 2,
@@ -923,19 +928,20 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     assert.deepEqual(harness.channel.prefetches, [2])
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
+    clock.advance(21)
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 3000, 'prefetch raised')
   })
 
   test('lowers the prefetch when processing is consistently slow', async () => {
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
       // Above the 500ms threshold the optimizer treats the consumer as
       // saturated and backs the prefetch off.
-      await sleep(520)
+      clock.advance(520)
     }, {
       initialPrefetch: 8,
       optimizationInterval: 20,
@@ -946,7 +952,6 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     assert.deepEqual(harness.channel.prefetches, [8])
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 5000, 'prefetch lowered')
@@ -955,17 +960,17 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
   test('leaves the prefetch alone when the measured pace warrants no change', async () => {
     // Between the two thresholds (100ms fast, 500ms slow) the optimizer must
     // decide on nothing and skip the channel round-trip entirely.
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
-      await sleep(200)
+      clock.advance(200)
     }, {
       initialPrefetch: 4,
       optimizationInterval: 20
     })
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
     await deliver(harness, { n: 2 })
 
     assert.deepEqual(harness.channel.prefetches, [4], 'no adjustment was applied')
@@ -1126,5 +1131,444 @@ describe('ConsumerManager subscribeParallel', () => {
     )
 
     assert.equal(harness.manager.workerPools.size, 0, 'no pool was left registered')
+  })
+})
+
+describe('ConsumerManager survivor round', () => {
+  test('subscribe validates the queue name and the callback', async () => {
+    const harness = createManager()
+
+    await assert.rejects(() => harness.manager.subscribe('', async () => {}), /Queue name must be a non-empty string/)
+    await assert.rejects(() => harness.manager.subscribe('   ', async () => {}), /Queue name must be a non-empty string/)
+    // A non-string must hit the SAME friendly error, not a TypeError from
+    // .trim() — the typeof arm exists exactly for this input.
+    await assert.rejects(() => harness.manager.subscribe(42, async () => {}), /Queue name must be a non-empty string/)
+    await assert.rejects(() => harness.manager.subscribe('orders', 'not-a-function'), /Callback must be a function/)
+  })
+
+  test('ack controls can be re-attached to a delivery that crosses consumption paths', async () => {
+    // configurable: true is what allows a second attachAckControls on the
+    // same message object with a DIFFERENT channel and a fresh settlement
+    // state (a delivery re-entering through another consumption path).
+    // Redefining an identical descriptor never throws, so the test must
+    // actually change both values.
+    const harness = createManager()
+    const secondChannel = new FakeChannel()
+    const msg = { properties: {}, fields: {} }
+
+    harness.manager.attachAckControls(msg, harness.channel)
+    harness.manager.settleAck(msg, harness.channel, 'ack')
+
+    assert.equal(msg.__ackSettled, true)
+
+    harness.manager.attachAckControls(msg, secondChannel)
+
+    assert.equal(msg.__channel, secondChannel, 'the new delivering channel took over')
+    assert.equal(msg.__ackSettled, false, 'the re-attached delivery starts unsettled again')
+  })
+
+  test('a consumer that fails to recreate is reported, not silently dropped', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    harness.channel.consumeError = new Error('queue rebuilding')
+
+    await harness.manager.recreateAll()
+
+    assert.ok(
+      logger.records.error.some(line => line.includes('Failed to recreate consumer')),
+      'the operator can only learn about a half-recovered consumer from this line'
+    )
+  })
+
+  test('ack bookkeeping properties stay non-enumerable on the delivered message', async () => {
+    // __channel and __ackSettled ride on the raw message; if they became
+    // enumerable they would leak into every JSON.stringify/log of it.
+    const harness = createManager()
+    let delivered
+
+    await harness.manager.subscribe('orders', async (content, message) => {
+      delivered = message
+    })
+
+    await deliver(harness, { n: 1 })
+
+    assert.equal(Object.keys(delivered).some(key => key.startsWith('__')), false, 'bookkeeping must not enumerate')
+    assert.equal(delivered.__channel, harness.channel, 'but it is still reachable for settlement')
+  })
+
+  test('the sequential processor is disposed when its channel closes', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeSequential('orders', async () => {})
+
+    assert.equal(clock.intervals.size, 1, 'the processor sweep is running')
+
+    harness.channel.emit('close')
+
+    assert.equal(clock.intervals.size, 0, 'the close disposed the processor — its sweep would otherwise leak')
+  })
+
+  test('broker-cancel recovery backs off by attempt through the injected clock', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 100 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    // Recreation always fails: the recovery loop must walk its full budget.
+    harness.channel.consume = async () => { throw new Error('still down') }
+
+    await consumer.callback(null)
+
+    // The recovery loop runs detached from the delivery callback.
+    await waitFor(() => clock.sleeps.length === 3, 2000, 'recovery walked its full budget')
+
+    assert.deepEqual(clock.sleeps, [100, 200, 300], 'three attempts, linear backoff on the base interval')
+  })
+
+  test('an unsubscribe mid-recovery stops the recreation while the entry is still visible', async () => {
+    // unsubscribe marks cancelled=true and only drops the entry after its
+    // awaits; a recovery attempt landing inside that window must observe the
+    // flag and stand down instead of recreating a consumer being removed.
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 100 })
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const channelConsumer = harness.channel.consumers.at(-1)
+    const consumesBefore = harness.channel.consumers.length
+
+    let releaseCancel
+    const cancelGate = new Promise(resolve => { releaseCancel = resolve })
+
+    harness.channel.cancel = async () => { await cancelGate }
+
+    const recovery = channelConsumer.callback(null)
+    const unsubscribing = harness.manager.unsubscribe(consumer.consumerTag)
+
+    await new Promise(resolve => setImmediate(resolve))
+
+    // The recovery sweep fires while unsubscribe is parked on channel.cancel:
+    // the entry still exists, cancelled is already true.
+    clock.advance(100)
+    await new Promise(resolve => setImmediate(resolve))
+
+    releaseCancel()
+    await unsubscribing
+    await recovery
+
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation for a consumer being unsubscribed')
+    assert.equal(harness.manager.activeConsumers.size, 0)
+  })
+
+  test('unsubscribe tolerates a consumer whose channel is mid-recreation', async () => {
+    const harness = createManager()
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    harness.manager.activeConsumers.get(consumerId).channel = null
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true, 'no crash cancelling without a channel')
+    assert.equal(harness.manager.activeConsumers.size, 0)
+  })
+})
+
+describe('ConsumerManager prefetch optimizer edges', () => {
+  test('the optimizer survives the consumer entry disappearing entirely', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    const consumer = await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20
+    })
+
+    const wrapped = harness.channel.consumers.at(-1).callback
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    const ackedBefore = harness.channel.acked.length
+
+    // A late delivery races the unsubscribe: the optimizer's lookup misses.
+    await wrapped({
+      content: (await harness.codec.encode({ n: 1 })).content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 9 },
+      properties: { headers: { 'x-compressed': false } }
+    })
+
+    // The discriminator: a crash in the optimizer would land in the message
+    // pipeline's catch and settle this delivery as a NACK.
+    assert.equal(harness.channel.acked.length, ackedBefore + 1, 'the late delivery still acked')
+    assert.equal(harness.channel.nacked.length, 0)
+  })
+
+  test('an epoch change without an optimized value applies nothing', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    const consumer = await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 4,
+      optimizationInterval: 1000
+    })
+
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const applied = harness.channel.prefetches.length
+
+    // A recreation bumps the epoch; the prefetch never left its initial
+    // value, so there is nothing to re-apply.
+    harness.manager.activeConsumers.get(consumerId).epoch++
+
+    await deliver(harness, { n: 1 })
+
+    assert.equal(harness.channel.prefetches.length, applied, 'initial value: nothing to restore')
+  })
+
+  test('an optimized value is re-applied exactly once per epoch change', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    const consumer = await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20,
+      increaseFactor: 2
+    })
+
+    await deliver(harness, { n: 1 })
+    clock.advance(21)
+    await deliver(harness, { n: 2 })
+    await waitFor(() => harness.channel.prefetches.includes(4), 2000, 'raised')
+
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    harness.manager.activeConsumers.get(consumerId).epoch++
+
+    const before = harness.channel.prefetches.length
+
+    await deliver(harness, { n: 3 })
+
+    assert.equal(harness.channel.prefetches.length, before + 1, 'the recreated channel got the optimized value back')
+    assert.equal(harness.channel.prefetches.at(-1), 4)
+
+    await deliver(harness, { n: 4 })
+
+    assert.equal(harness.channel.prefetches.length, before + 1, 'no re-application while the epoch is stable')
+  })
+
+  test('average boundaries decide nothing at exactly 100ms and 500ms', async () => {
+    for (const [avg, initial] of [[100, 4], [500, 4]]) {
+      const clock = new ManualClock()
+      const harness = createManager({ clock })
+
+      await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
+        clock.advance(avg)
+      }, {
+        initialPrefetch: initial,
+        optimizationInterval: 20
+      })
+
+      await deliver(harness, { n: 1 })
+      await deliver(harness, { n: 2 })
+
+      assert.deepEqual(harness.channel.prefetches, [initial], `avg exactly ${avg}ms is the no-man's land — no adjustment`)
+    }
+  })
+
+  test('an elapsed window equal to the interval is enough to optimize', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 100,
+      increaseFactor: 2
+    })
+
+    await deliver(harness, { n: 1 })
+
+    // Exactly the interval, not a tick more.
+    clock.advance(100)
+    await deliver(harness, { n: 2 })
+
+    assert.ok(harness.channel.prefetches.includes(4), 'elapsed == interval optimizes; only strictly-less waits')
+  })
+
+  test('the average is a mean over the whole window, not a sum', async () => {
+    // Three 60ms samples accumulate in ONE optimization window (the interval
+    // only elapses on the third): mean 60 -> raise. A sum-flavoured formula
+    // (180*3, or plain 180) lands at or past the slow threshold and either
+    // stalls or LOWERS instead. Single-sample windows cannot tell these
+    // apart — sum/1 equals sum*1 — which is why the window must hold three.
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
+      clock.advance(60)
+    }, {
+      initialPrefetch: 2,
+      optimizationInterval: 1000,
+      increaseFactor: 2
+    })
+
+    await deliver(harness, { n: 1 })
+    await deliver(harness, { n: 2 })
+    clock.advance(900)
+    await deliver(harness, { n: 3 })
+
+    assert.deepEqual(harness.channel.prefetches, [2, 4], 'three fast samples mean fast')
+  })
+
+  test('the sample window resets to a clean slate after every decision', async () => {
+    // A polluted reset (anything but an empty array) poisons every later
+    // average — one junk entry turns all future sums into NaN and the
+    // optimizer silently stops adapting forever.
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
+      initialPrefetch: 2,
+      optimizationInterval: 20,
+      increaseFactor: 2
+    })
+
+    await deliver(harness, { n: 1 })
+    clock.advance(21)
+    await deliver(harness, { n: 2 })
+    await waitFor(() => harness.channel.prefetches.includes(4), 2000, 'first raise')
+
+    clock.advance(21)
+    await deliver(harness, { n: 3 })
+
+    await waitFor(() => harness.channel.prefetches.includes(8), 2000, 'the second cycle still adapts')
+  })
+})
+
+describe('ConsumerManager subscribeParallel (fake workers)', () => {
+  class FakeParallelWorker extends EventEmitter {
+    constructor (file, options, replyWith) {
+      super()
+      this.file = file
+      this.options = options
+      this.replyWith = replyWith
+      this.terminated = false
+    }
+
+    postMessage (payload) {
+      setImmediate(() => this.emit('message', this.replyWith(payload)))
+    }
+
+    async terminate () {
+      this.terminated = true
+      this.emit('exit', 0)
+    }
+  }
+
+  const createParallelHarness = (replyWith) => {
+    const harness = createManager()
+    const spawned = []
+    const createWorker = (file, options) => {
+      const worker = new FakeParallelWorker(file, options, replyWith)
+
+      spawned.push(worker)
+
+      return worker
+    }
+
+    return { ...harness, spawned, createWorker }
+  }
+
+  test('spawns the requested workers with the queue name in their workerData', async () => {
+    const harness = createParallelHarness(() => ({ success: true }))
+
+    await harness.manager.subscribeParallel('orders', 'processor.js', {
+      workerCount: 2,
+      prefetch: 10,
+      createWorker: harness.createWorker
+    })
+
+    assert.equal(harness.spawned.length, 2)
+    assert.equal(harness.spawned[0].file, 'processor.js')
+    assert.deepEqual(harness.spawned[0].options.workerData, { queueName: 'orders', workerId: 0 })
+    assert.deepEqual(harness.channel.prefetches, [20], 'prefetch scales by the pool size')
+  })
+
+  test('a worker failure nacks the message with the worker-provided reason', async () => {
+    const logger = recordingLogger()
+    const harness = createParallelHarness(() => ({ success: false, error: 'schema mismatch' }))
+
+    harness.manager.logger = logger
+
+    await harness.manager.subscribeParallel('orders', 'processor.js', {
+      workerCount: 1,
+      createWorker: harness.createWorker
+    })
+
+    await deliver(harness, { n: 1 })
+
+    assert.equal(harness.channel.nacked.length, 1, 'a failed worker result settles as a nack')
+    assert.ok(logger.records.error.some(line => line.includes('schema mismatch')), 'the worker reason surfaces')
+  })
+
+  test('a worker replying nothing usable falls back to a generic failure', async () => {
+    const logger = recordingLogger()
+    const harness = createParallelHarness(() => null)
+
+    harness.manager.logger = logger
+
+    await harness.manager.subscribeParallel('orders', 'processor.js', {
+      workerCount: 1,
+      createWorker: harness.createWorker
+    })
+
+    await deliver(harness, { n: 1 })
+
+    assert.equal(harness.channel.nacked.length, 1)
+    assert.ok(logger.records.error.some(line => line.includes('Worker processing failed')), 'the fallback reason names the culprit')
+  })
+
+  test('a failing subscribe rejects AND terminates the freshly spawned pool', async () => {
+    const harness = createParallelHarness(() => ({ success: true }))
+
+    harness.channel.consume = async () => { throw new Error('queue gone') }
+
+    await assert.rejects(
+      () => harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker: harness.createWorker }),
+      /queue gone/
+    )
+
+    assert.equal(harness.spawned[0].terminated, true, 'no orphan threads on a failed subscribe')
+  })
+
+  test('unsubscribe terminates the parallel pool; disposeAll disposes everything', async () => {
+    const clock = new ManualClock()
+    const base = createManager({ clock })
+    const spawned = []
+    const createWorker = (file, options) => {
+      const worker = new FakeParallelWorker(file, options, () => ({ success: true }))
+
+      spawned.push(worker)
+
+      return worker
+    }
+
+    const consumer = await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+
+    await base.manager.unsubscribe(consumer.consumerTag)
+
+    assert.equal(spawned[0].terminated, true, 'unsubscribe shut the pool down')
+
+    await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+    await base.manager.subscribeSequential('billing', async () => {})
+
+    assert.equal(clock.intervals.size, 1, 'one sequential sweep running')
+
+    await base.manager.disposeAll()
+
+    assert.equal(spawned[1].terminated, true, 'disposeAll shut the second pool down')
+    assert.equal(clock.intervals.size, 0, 'disposeAll disposed the sequential processor too')
+    assert.equal(base.manager.activeConsumers.size, 0)
   })
 })

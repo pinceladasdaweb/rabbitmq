@@ -73,6 +73,20 @@ describe('RateLimiter', () => {
       assert.equal(await limiter.checkRateLimit('key-a', 5), true)
       assert.equal(await limiter.checkRateLimit('key-a', 1), false)
     })
+
+    test('a clock stepping backwards never shrinks the balance', async (t) => {
+      // NTP corrections can move wall time backwards; a negative refill must
+      // be skipped, not applied.
+      const { clock, limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 10, windowMs: 1000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(await limiter.checkRateLimit('key-a', 4), true)
+      assert.equal(limiter.getRemainingTokens('key-a'), 6)
+
+      clock.currentTime -= 500
+
+      assert.equal(limiter.getRemainingTokens('key-a'), 6, 'the balance is frozen while time is behind')
+    })
   })
 
   describe('leaky-bucket', () => {
@@ -163,6 +177,22 @@ describe('RateLimiter', () => {
 
       assert.equal(await limiter.checkRateLimit('key-a'), true, 'the new window starts from zero')
       assert.equal(limiter.getRemainingTokens('key-a'), 1, 'the old count was discarded, not carried over')
+    })
+
+    test('the window a request lands in is derived from the clock, not from when the key was first seen', async (t) => {
+      // Seeded away from zero and advanced by less than a window: both checks
+      // must land in the SAME epoch-anchored window. A broken windowStart
+      // formula assigns each instant its own window and never limits anyone.
+      const clock = new ManualClock(5000)
+      const limiter = new RateLimiter({ strategy: 'fixed-window', maxRequests: 2, windowMs: 1000, clock })
+      t.after(() => limiter.dispose())
+
+      assert.equal(await limiter.checkRateLimit('key-a', 2), true)
+
+      clock.advance(1)
+
+      assert.equal(limiter.getRemainingTokens('key-a'), 0, 'one tick later is still the same window')
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'so the key is still limited')
     })
 
     test('a check landing after the boundary but before the sweep resets the counter in place', async (t) => {
@@ -342,6 +372,30 @@ describe('RateLimiter', () => {
   })
 
   describe('cleanup sweep', () => {
+    test('unrefs its interval so an undisposed limiter cannot hold the process open', (t) => {
+      const { clock, limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
+      t.after(() => limiter.dispose())
+
+      assert.equal(clock.unrefs.length, 1, 'the sweep handle was unref\'d')
+    })
+
+    test('tolerates a timer implementation whose handles have no unref', () => {
+      // Injectable clocks may hand back bare handles; the guard must probe
+      // for unref instead of assuming it (calling undefined would throw).
+      const bare = new ManualClock()
+      const originalSetInterval = bare.setInterval.bind(bare)
+
+      bare.setInterval = (fn, ms) => {
+        const { id } = originalSetInterval(fn, ms)
+
+        return { id }
+      }
+
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000, clock: bare })
+
+      limiter.dispose()
+    })
+
     test('runs every windowMs / 10, capped at one minute', () => {
       const fast = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
       const slow = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 6000000 })
@@ -356,7 +410,10 @@ describe('RateLimiter', () => {
     })
 
     test('evicts a token bucket idle for more than two windows, and not before', async (t) => {
-      const { clock, limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
+      // Seeded away from zero: idleness must be the DELTA from lastRefill —
+      // with a zero origin, now - lastRefill and now + lastRefill agree.
+      const clock = new ManualClock(10000)
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000, clock })
       t.after(() => limiter.dispose())
 
       await limiter.checkRateLimit('key-a')
@@ -419,6 +476,23 @@ describe('RateLimiter', () => {
       assert.deepEqual(unblocked, ['key-a'], 'only the expired block was released')
       assert.equal(limiter.getStatus('key-b').isBlocked, true)
     })
+
+    test('a sweep landing exactly on the expiry instant releases the block', async (t) => {
+      // Expiry is inclusive (now >= expiresAt): a block whose deadline falls
+      // exactly on a sweep tick is released on that tick, not one tick later.
+      const { clock, limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
+      t.after(() => limiter.dispose())
+
+      const unblocked = []
+      limiter.on('key-unblocked', ({ key }) => unblocked.push(key))
+
+      // Sweeps fire every 100ms; the block expires exactly at the first one.
+      limiter.blockKey('key-a', 100)
+
+      clock.advance(100)
+
+      assert.deepEqual(unblocked, ['key-a'], 'the tick at the deadline is enough')
+    })
   })
 
   describe('cleanup leaves live state alone', () => {
@@ -452,7 +526,8 @@ describe('RateLimiter', () => {
     })
 
     test('keeps a token bucket that was refilled recently', async (t) => {
-      const { clock, limiter } = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
+      const clock = new ManualClock(10000)
+      const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000, clock })
       t.after(() => limiter.dispose())
 
       await limiter.checkRateLimit('key-a', 2)

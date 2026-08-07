@@ -190,7 +190,8 @@ class Rpc {
     const exchange = this.getExchange()
     const timeout = options.timeout ?? DEFAULT_TIMEOUT
 
-    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0) {
+    // Number.isFinite is type-strict, so it already rejects every non-number.
+    if (!Number.isFinite(timeout) || timeout <= 0) {
       throw new Error('RPC timeout must be a positive number of milliseconds')
     }
 

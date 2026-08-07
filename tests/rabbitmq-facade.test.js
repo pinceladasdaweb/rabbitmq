@@ -948,3 +948,242 @@ describe('RabbitMQ facade shutdown', () => {
     assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected')
   })
 })
+
+describe('RabbitMQ facade survivor round', () => {
+  test('a second reconnection cycle recreates consumers again (the restore slot is released)', async (t) => {
+    // #restoreState parks its promise in a slot released by a finally; if
+    // the release is lost, every reconnection AFTER the first reuses the
+    // completed restore and never recreates anything — consumers silently
+    // stop draining on the second drop.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    for (let cycle = 1; cycle <= 2; cycle++) {
+      const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+      dialer.connections.at(-1).emit('close')
+      await reconnected
+    }
+
+    assert.equal(dialer.connections.length, 3, 'two drops, two fresh dials')
+    assert.equal(
+      dialer.connections.at(-1).consumersOn().length,
+      1,
+      'the consumer lives on the newest connection after the SECOND recovery'
+    )
+  })
+
+  test('a manual connect() after a FAILED restore runs a fresh restore, not the cached rejection', async (t) => {
+    // #handleDisconnection clears the restore slot between cycles, so the
+    // finally-release only matters here: the restore failed (reconnectError,
+    // no pool built) and no further disconnection came along. The manual
+    // retry must get a fresh attempt — a leaked slot would hand every future
+    // connect() the same rejected promise forever.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    // The next connection refuses channels: the reconnect's restore fails
+    // before any pool exists.
+    dialer.onConnection = (connection) => {
+      connection.channelError = new Error('channels refused')
+    }
+
+    const restoreFailed = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
+    dialer.connections[0].emit('close')
+    await restoreFailed
+
+    // The broker heals; the operator retries by hand.
+    dialer.onConnection = null
+    dialer.connections.at(-1).channelError = null
+
+    await rabbit.connect()
+
+    assert.equal(
+      dialer.connections.at(-1).consumersOn().length,
+      1,
+      'the retry rebuilt the pool and recreated the consumer'
+    )
+
+    await rabbit.publish('orders-route', { n: 1 })
+  })
+
+  test('waitForConnection leaves no listeners or timer behind once it resolves', async (t) => {
+    const { ManualClock } = await import('./helpers.js')
+    const clock = new ManualClock()
+    const dialer = createDialer([new Error('down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, { clock })
+
+    t.after(() => rabbit.disconnect())
+
+    const connection = await rabbit.connect({ waitForConnection: true, timeout: 60000 })
+
+    assert.ok(connection, 'the reconnect cycle eventually satisfied the waiter')
+    assert.equal(rabbit.listenerCount('reconnected'), 0, 'the waiter unhooked itself')
+    assert.equal(rabbit.listenerCount('reconnectFailed'), 0)
+    assert.equal(rabbit.listenerCount('reconnectError'), 0)
+    assert.equal(clock.timeouts.size, 0, 'the guard timer was cleared, not left to fire')
+  })
+
+  test('disconnecting rejects in-flight RPCs naming the client as the cause', async (t) => {
+    const { rabbit, connection } = await connected(t)
+
+    const pending = rabbit.request('users.get', {}, { timeout: 60000 })
+
+    await waitFor(() => connection.publishedOn().length === 1, 2000, 'request in flight')
+
+    await rabbit.disconnect()
+
+    await assert.rejects(() => pending, (error) => {
+      assert.equal(error.code, 'RPC_CONNECTION_LOST')
+      assert.match(error.message, /client disconnected/, 'the reason tells the caller who hung up')
+
+      return true
+    })
+  })
+
+  test('disconnect on a never-connected client still announces disconnected', async (t) => {
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    const events = []
+
+    rabbit.on('disconnected', () => events.push('disconnected'))
+
+    await rabbit.disconnect()
+
+    assert.deepEqual(events, ['disconnected'], 'no pool to close is not an error — the shutdown completed')
+  })
+
+  test('graceful shutdown exits 0 on success and 1 when the teardown fails', async (t) => {
+    const exits = []
+    const exitMock = t.mock.method(process, 'exit', (code) => { exits.push(code) })
+
+    t.after(() => exitMock.mock.restore())
+
+    const happy = await connected(t)
+
+    happy.rabbit.enableGracefulShutdown({ signals: ['SIGUSR2'], exitProcess: true })
+    process.emit('SIGUSR2')
+    await waitFor(() => exits.length === 1, 2000, 'shutdown handler ran')
+
+    assert.deepEqual(exits, [0], 'a clean teardown exits 0')
+
+    const sad = await connected(t)
+
+    sad.rabbit.disconnect = async () => { throw new Error('teardown wedged') }
+    sad.rabbit.enableGracefulShutdown({ signals: ['SIGPIPE'], exitProcess: true })
+    process.emit('SIGPIPE')
+    await waitFor(() => exits.length === 2, 2000, 'failing handler ran')
+
+    // Give the harness cleanup its real disconnect back.
+    delete sad.rabbit.disconnect
+
+    assert.deepEqual(exits, [0, 1], 'a failed teardown exits 1 so the supervisor restarts the process')
+  })
+
+  test('setExchange accepts every AMQP exchange type and defaults to direct', async (t) => {
+    const { rabbit } = await connected(t)
+
+    for (const type of ['direct', 'topic', 'fanout', 'headers']) {
+      rabbit.setExchange(`x-${type}`, type)
+    }
+
+    assert.throws(() => rabbit.setExchange('x', 'x-delayed-message'), /Invalid exchange type/)
+    assert.throws(() => rabbit.setExchange('   '), /non-empty string/)
+    assert.throws(() => rabbit.setExchange(42), /non-empty string/)
+  })
+
+  test('the delay exchange inherits the type setExchange defaulted', async (t) => {
+    const { rabbit, connection } = await connected(t)
+
+    rabbit.setExchange('defaulted')
+    await rabbit.setupDelayExchange()
+
+    const assertion = connection.channels
+      .flatMap(channel => channel.assertedExchanges)
+      .find(exchange => exchange.type === 'x-delayed-message')
+
+    assert.equal(assertion.options.arguments['x-delayed-type'], 'direct', 'the defaulted type flowed through')
+  })
+
+  test('setupDelayPlugin actually probes the broker', async (t) => {
+    const { rabbit, connection } = await connected(t)
+
+    await rabbit.setupDelayPlugin()
+
+    const probes = connection.channels.flatMap(channel => channel.assertedExchanges)
+
+    assert.ok(probes.some(exchange => exchange.name === 'test.delay'), 'no probe means the check proved nothing')
+  })
+
+  test('setCompressionThreshold accepts zero and rejects negatives', async (t) => {
+    const { rabbit } = await connected(t)
+
+    rabbit.setCompressionThreshold(0)
+    assert.throws(() => rabbit.setCompressionThreshold(-1), /non-negative|Must be/i)
+  })
+})
+
+describe('RabbitMQ facade cache accounting', () => {
+  const cached = (t, extra = {}) => connected(t, {
+    useCache: true,
+    rateLimiter: { strategy: 'fixed-window', maxRequests: 1, windowMs: 60000 },
+    ...extra
+  })
+
+  test('publishWithCache works as a plain publish when the cache is disabled', async (t) => {
+    const { rabbit, connection } = await connected(t)
+
+    await rabbit.publishWithCache('route', { n: 1 })
+
+    assert.equal(connection.publishedOn().length, 1, 'no cache means every call publishes')
+    await assert.rejects(() => rabbit.getFromCache('route'), /not enabled/)
+  })
+
+  test('cache keys are scoped by exchange and routing key, never shared', async (t) => {
+    const { rabbit } = await cached(t)
+
+    await rabbit.publishWithCache('route-a', { n: 1 }, { cacheTTL: 60 })
+
+    assert.equal(await rabbit.getFromCache('route-b'), undefined, 'a different routing key must miss')
+    assert.ok(await rabbit.getFromCache('route-a'))
+  })
+
+  test('cached publishes charge the cached: rate-limit namespace', async (t) => {
+    const { rabbit } = await cached(t)
+
+    await rabbit.publishWithCache('route', { n: 1 }, { cacheTTL: 60 })
+
+    assert.equal(
+      rabbit.getRateLimitStatus('cached:route').remainingTokens,
+      0,
+      'the token came out of the cached: bucket, not the plain routing key'
+    )
+    assert.equal(rabbit.getRateLimitStatus('route').remainingTokens, 1, 'the plain bucket is untouched')
+  })
+
+  test('the cached TTL is the explicit option, falling back to the configured default', async (t) => {
+    const logger = recordingLogger()
+    const explicit = await cached(t, { logger })
+
+    await explicit.rabbit.publishWithCache('route', { n: 1 }, { cacheTTL: 5 })
+    assert.ok(logger.records.info.some(line => line.includes('TTL: 5s')), 'the explicit TTL wins')
+
+    const defaultedLogger = recordingLogger()
+    const defaulted = await cached(t, { logger: defaultedLogger })
+
+    await defaulted.rabbit.publishWithCache('route', { n: 1 })
+    assert.ok(defaultedLogger.records.info.some(line => line.includes('TTL: 60s')), 'the default stdTTL is 60s')
+  })
+})

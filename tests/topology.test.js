@@ -194,6 +194,21 @@ describe('Topology moveToDeadLetter', () => {
     await topology.moveToDeadLetter(buildMessage())
 
     assert.equal(channel.published[0].routingKey, 'orders-route_dlq')
+    assert.equal(
+      channel.published[0].options.headers['x-death-reason'],
+      'Manually moved to DLQ',
+      'the default reason still stamps a meaningful header'
+    )
+  })
+
+  test('removes its return listener once the move settles', async () => {
+    // moveToDeadLetter attaches a basic.return listener per call; leaving it
+    // behind would fire it for every later return on this shared channel.
+    const { topology, channel } = createTopology()
+
+    await topology.moveToDeadLetter(buildMessage())
+
+    assert.equal(channel.listenerCount('return'), 0, 'no listener leaked')
   })
 
   test('rejects when the broker does not confirm the publish', async () => {
@@ -253,7 +268,16 @@ describe('Topology delay exchange and plugin', () => {
     const { topology, channel } = createTopology()
 
     assert.equal(await topology.isDelayPluginEnabled(), true)
-    assert.equal(channel.assertedExchanges[0].name, 'test.delay')
+
+    // The probe's exact shape is the contract with the broker: transient
+    // (a probe must not survive a restart), typed x-delayed-message with a
+    // concrete delayed type (the plugin rejects the declare without one),
+    // and deleted under the same name it was declared.
+    assert.deepEqual(channel.assertedExchanges, [{
+      name: 'test.delay',
+      type: 'x-delayed-message',
+      options: { durable: false, arguments: { 'x-delayed-type': 'direct' } }
+    }])
     assert.deepEqual(channel.deletedExchanges, ['test.delay'])
   })
 

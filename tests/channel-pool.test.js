@@ -363,6 +363,104 @@ describe('ChannelPool', () => {
     assert.deepEqual(clock.sleeps, [500, 1000, 1500, 2000, 2500], 'five attempts, each backing off progressively')
   })
 
+  test('a stale close event from an already-replaced channel does not replace again', async () => {
+    // The same channel can emit 'close' more than once (error paths often
+    // re-emit); only the event from the CURRENT occupant of the slot may
+    // trigger a replacement, or every stale event dials one more channel.
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+
+    await pool.initialize()
+
+    const original = pool.channels[0]
+
+    original.emit('close')
+    await waitForCondition(() => pool.channels[0] && pool.channels[0] !== original, 3000, 'first replacement')
+
+    const dialed = connection.createdChannels.length
+
+    original.emit('close')
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.equal(connection.createdChannels.length, dialed, 'the stale event dialed nothing')
+  })
+
+  test('close resolves cleanly with an exhausted (null) slot in the pool', async () => {
+    // A slot whose recreation gave up holds null; close() must skip it
+    // instead of calling close on nothing.
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+
+    await pool.initialize()
+
+    connection.createConfirmChannel = async () => { throw new Error('gone') }
+    pool.channels[0].emit('close')
+
+    await waitForCondition(() => pool.channels[0] === null, 3000, 'slot exhausted')
+
+    await pool.close()
+
+    assert.deepEqual(pool.channels, [], 'teardown completed past the empty slot')
+  })
+
+  test('closing the pool mid-recovery silences the exhaustion report', async () => {
+    // The operator asked for the shutdown; reporting the interrupted recovery
+    // as a dead slot would point them at a problem that no longer exists.
+    const logger = recordingLogger()
+    const connection = createFakeConnection()
+    const clock = new ManualClock()
+    const pool = new ChannelPool(connection, logger, 1, 1, clock)
+
+    await pool.initialize()
+
+    let releaseDial
+    const dialBlocked = new Promise(resolve => { releaseDial = resolve })
+
+    connection.createConfirmChannel = async () => {
+      await dialBlocked
+
+      throw new Error('gone')
+    }
+
+    pool.channels[0].emit('close')
+
+    await pool.close()
+    releaseDial()
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.equal(
+      logger.records.error.some(line => line.includes('could not be recreated')),
+      false,
+      'an interrupted recovery is not an exhausted slot'
+    )
+  })
+
+  test('dedicated channel errors are reported while the pool is open and silenced after close', async () => {
+    const logger = recordingLogger()
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, logger, 1)
+
+    // Before initialize: dedicated channels are usable and their errors real.
+    const early = await pool.getDedicatedChannel('early')
+
+    early.emit('error', new Error('early trouble'))
+    assert.ok(logger.records.error.some(line => line.includes('early trouble')), 'a fresh pool reports dedicated errors')
+
+    await pool.initialize()
+
+    const dedicated = await pool.getDedicatedChannel('worker')
+
+    await pool.close()
+
+    dedicated.emit('error', new Error('post-close noise'))
+
+    assert.equal(
+      logger.records.error.some(line => line.includes('post-close noise')),
+      false,
+      'teardown noise stays quiet on dedicated channels too'
+    )
+  })
+
   test('defaults the recovery backoff to 500ms', () => {
     // Every other test pins the interval to keep the suite fast, which leaves
     // the production default asserted nowhere.

@@ -325,7 +325,6 @@ class ConsumerManager {
       // side effect would apply it again on the redelivery. Opt into
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
       createProcessor: ({ channel, noAck }) => async (content, msg) => {
         await callback(content, msg)
@@ -338,7 +337,10 @@ class ConsumerManager {
   }
 
   async subscribeSequential (queueName, callback, options = {}) {
-    const staleTimeout = options.staleTimeout ?? 30000
+    // No default here: SequentialProcessor owns it, and a second one (even
+    // for staleTimeout: 0, which its || also maps to the default) would be a
+    // shadowed copy that could silently drift.
+    const staleTimeout = options.staleTimeout
 
     return this.#subscribeCore(queueName, callback, options, {
       defaultPrefetch: 1,
@@ -347,7 +349,6 @@ class ConsumerManager {
       // processed, so the retry can break the very ordering this method
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
-      // Stryker disable next-line StringLiteral: log phrasing is not contract
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
       createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
@@ -460,7 +461,9 @@ class ConsumerManager {
       const now = this.clock.now()
       const elapsed = now - lastOptimizationTime
 
-      if (elapsed < optimizationInterval || processingTimes.length === 0) return
+      // No empty-samples guard: the only caller pushes its own measurement
+      // before invoking the optimizer, so the window always has at least one.
+      if (elapsed < optimizationInterval) return
 
       const avgProcessingTime = processingTimes.reduce((sum, time) => sum + time, 0) / processingTimes.length
       let newPrefetch = currentPrefetch
@@ -509,6 +512,7 @@ class ConsumerManager {
       workerCount,
       prefetch = 10,
       maxRespawns,
+      createWorker,
       ...subscribeOptions
     } = options
 
@@ -516,7 +520,10 @@ class ConsumerManager {
       workerCount,
       maxRespawns,
       workerData: { queueName },
-      logger: this.logger
+      logger: this.logger,
+      // The pool's spawn seam, threaded through so the parallel path is
+      // testable without real threads.
+      createWorker
     })
 
     const messageHandler = async (content, message) => {

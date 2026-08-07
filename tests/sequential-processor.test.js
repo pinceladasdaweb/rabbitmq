@@ -314,6 +314,100 @@ describe('SequentialProcessor', () => {
     assert.equal(nacked[0].messageId, 'child')
   })
 
+  test('a sibling expiring mid-release does not derail the release loop', async (t) => {
+    // The dependency resolves and its dependents [d1, d2] are being released
+    // in order. Processing d1 takes long enough for the sweep to expire d2 —
+    // which happens AFTER #processDependents already deleted the dependency's
+    // index entry (exercising #removePending's missing-index tolerance) and
+    // leaves the loop holding a pendingId whose entry is gone (exercising the
+    // continue guard). d1 must still be acked once and d2 dead-lettered once.
+    const clock = new ManualClock(1000)
+    let releaseDep
+    const depBlocked = new Promise(resolve => { releaseDep = resolve })
+
+    const { processor, acked, nacked } = createProcessor(t, {
+      staleTimeout: 100,
+      callback: async (content) => {
+        if (content.hold) await depBlocked
+        if (content.slow) clock.advance(250)
+      },
+      options: { clock }
+    })
+
+    const dep = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({ slow: true }, makeMessage('d1', { dependsOn: 'dep' }))
+    await processor.handle({}, makeMessage('d2', { dependsOn: 'dep' }))
+
+    releaseDep()
+    await dep
+    await sleep(30)
+
+    assert.deepEqual(acked, ['dep', 'd1'], 'the slow sibling still succeeded')
+    assert.equal(nacked.length, 1, 'the expired sibling was settled exactly once')
+    assert.equal(nacked[0].messageId, 'd2')
+    assert.equal(processor.pending.size, 0)
+    assert.equal(processor.pendingByDependency.size, 0)
+  })
+
+  test('releasing a dependency processes every dependent parked under it', async (t) => {
+    // The index entry holds a SET of dependents: registering a second one
+    // must extend the set, not replace it.
+    let releaseDep
+    const depBlocked = new Promise(resolve => { releaseDep = resolve })
+
+    const { processor, acked } = createProcessor(t, {
+      callback: async (content) => { if (content.hold) await depBlocked }
+    })
+
+    const dep = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('c1', { dependsOn: 'dep' }))
+    await processor.handle({}, makeMessage('c2', { dependsOn: 'dep' }))
+
+    releaseDep()
+    await dep
+    await sleep(20)
+
+    assert.deepEqual(acked, ['dep', 'c1', 'c2'], 'both dependents were released')
+  })
+
+  test('one dependent expiring keeps the index entry alive for its siblings', async (t) => {
+    // The expiry path prunes one dependent at a time and may only drop the
+    // index entry once the set is empty — dropping it early orphans the
+    // siblings: the dependency resolves and nobody is released.
+    const clock = new ManualClock(1000)
+    let releaseDep
+    const depBlocked = new Promise(resolve => { releaseDep = resolve })
+
+    const { processor, acked, nacked } = createProcessor(t, {
+      staleTimeout: 100,
+      callback: async (content) => { if (content.hold) await depBlocked },
+      options: { clock }
+    })
+
+    const dep = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('early', { dependsOn: 'dep' }))
+
+    // 'early' ages past the deadline while 'late' stays fresh.
+    clock.advance(150)
+    await processor.handle({}, makeMessage('late', { dependsOn: 'dep' }))
+    clock.advance(50)
+
+    assert.equal(nacked.length, 1, 'only the aged dependent expired')
+    assert.equal(nacked[0].messageId, 'early')
+
+    releaseDep()
+    await dep
+    await sleep(20)
+
+    assert.deepEqual(acked, ['dep', 'late'], 'the fresh sibling was still released on resolution')
+  })
+
   test('a handler that outlives staleTimeout and then succeeds is still acked', async (t) => {
     // Regression: the success path used to read startTime from the processing
     // entry, which the sweep had already collected — the TypeError landed in
@@ -422,8 +516,10 @@ describe('SequentialProcessor', () => {
     // without one must still run, still be acked, and leave no bookkeeping
     // entry behind — every `if (messageId)` guard has a live path both ways.
     const processed = []
+    const infos = []
     const { processor, acked } = createProcessor(t, {
-      callback: async (content) => processed.push(content)
+      callback: async (content) => processed.push(content),
+      options: { logger: { ...silentLogger, info: (line) => infos.push(line) } }
     })
 
     await processor.handle({ n: 1 }, { properties: {}, fields: {} })
@@ -431,23 +527,46 @@ describe('SequentialProcessor', () => {
     assert.deepEqual(processed, [{ n: 1 }])
     assert.deepEqual(acked, [undefined], 'onSuccess still received the message')
     assert.equal(processor.processing.size, 0, 'nothing was tracked for it')
+    assert.ok(
+      !infos.some(line => line.includes('Successfully processed')),
+      'no success log for an untracked message — "message undefined" is worse than silence'
+    )
+  })
+
+  test('a failure leaves no processing entry behind', async (t) => {
+    const { processor, nacked } = createProcessor(t, {
+      callback: async () => { throw new Error('boom') }
+    })
+
+    await processor.handle({}, makeMessage('bad'))
+
+    assert.equal(nacked.length, 1)
+    assert.equal(processor.processing.size, 0, 'the failed message was untracked by the catch')
   })
 
   test('works with no logger at all', async (t) => {
     // logger is optional and every call site guards with `?.`. Dropping one
-    // guard throws on the first message, so this exercises all four paths:
-    // parking a dependent, success, failure, and releasing the dependent.
+    // guard throws on the first message, so this exercises every logging
+    // path: parking a dependent, duplicate delivery, success, failure,
+    // releasing the dependent, and both sweep warnings (wedged processing
+    // entry and expired pending message).
     let releaseFirst
     const firstBlocked = new Promise(resolve => { releaseFirst = resolve })
+    const clock = new ManualClock(1000)
+    const settled = []
 
     const processor = new SequentialProcessor({
       callback: async (content) => {
         if (content.hold) await firstBlocked
         if (content.explode) throw new Error('boom')
       },
-      staleTimeout: 30000,
-      onSuccess: () => {},
-      onFailure: () => {}
+      staleTimeout: 100,
+      clock,
+      // The settlement KIND is what makes a crashed logging line visible:
+      // a throw inside #process lands in the catch and turns a success into
+      // a failure, which silent no-op callbacks would never surface.
+      onSuccess: (message) => settled.push({ kind: 'ack', id: message.properties.messageId }),
+      onFailure: (message) => settled.push({ kind: 'nack', id: message.properties.messageId })
     })
 
     t.after(() => processor.dispose())
@@ -455,13 +574,87 @@ describe('SequentialProcessor', () => {
     const first = processor.handle({ hold: true }, makeMessage('dep'))
 
     await sleep(20)
-    await processor.handle({}, makeMessage('waiting', { dependsOn: 'dep' }))
+    await processor.handle({}, makeMessage('early', { dependsOn: 'dep' }))
+    await processor.handle({}, makeMessage('early', { dependsOn: 'dep' }))
     await processor.handle({ explode: true }, makeMessage('bad'))
 
+    assert.deepEqual(settled, [
+      { kind: 'ack', id: 'early' },
+      { kind: 'nack', id: 'bad' }
+    ], 'the duplicate was acked and the failure nacked, logger-less')
+
+    // Both sweep paths fire logger-less: 'early' expires as a stale pending
+    // message while 'dep' is collected as a wedged processing entry.
+    clock.advance(300)
+
+    assert.equal(processor.pending.size, 0, 'the pending message expired without a logger')
+    assert.equal(processor.processing.size, 0, 'the wedged entry was collected without a logger')
+    assert.deepEqual(settled.at(-1), { kind: 'nack', id: 'early' }, 'the expiry settled the parked message')
+
+    // A fresh dependent parked right before the late resolution exercises
+    // the logger-less RELEASE path as well.
+    await processor.handle({}, makeMessage('late', { dependsOn: 'dep' }))
+
+    // Late success: the wedged handler finally resolves and must still be
+    // ACKED — a crashed success log would divert it into the catch — and its
+    // dependent must ride out with it.
     releaseFirst()
     await first
+    await sleep(20)
 
-    assert.equal(processor.pending.size, 0, 'the dependent was released without a logger')
+    const outcome = Object.fromEntries(settled.filter(e => e.id === 'dep' || e.id === 'late').map(e => [e.id, e.kind]))
+
+    assert.deepEqual(outcome, { dep: 'ack', late: 'ack' }, 'late success and its dependent are acks, not swallowed crashes')
+  })
+
+  test('releases a parked dependent without a logger', async (t) => {
+    // The release loop has its own logging line; the wedged-sweep test cannot
+    // reach it (the sweep collects the dependency entry first, so nothing is
+    // parked by the time the handler resolves).
+    let releaseDep
+    const depBlocked = new Promise(resolve => { releaseDep = resolve })
+    const settled = []
+
+    const processor = new SequentialProcessor({
+      callback: async (content) => { if (content.hold) await depBlocked },
+      onSuccess: (message) => settled.push(message.properties.messageId),
+      onFailure: () => {}
+    })
+
+    t.after(() => processor.dispose())
+
+    const dep = processor.handle({ hold: true }, makeMessage('dep'))
+
+    await sleep(20)
+    await processor.handle({}, makeMessage('child', { dependsOn: 'dep' }))
+
+    releaseDep()
+    await dep
+    await sleep(20)
+
+    assert.deepEqual(settled, ['dep', 'child'], 'the dependent was released and acked, logger-less')
+  })
+
+  test('tolerates a timer implementation whose handles have no unref', () => {
+    // Same probe as the rate limiter's: injectable clocks may hand back bare
+    // handles, and calling unref unconditionally would throw at construction.
+    const bare = new ManualClock()
+    const originalSetInterval = bare.setInterval.bind(bare)
+
+    bare.setInterval = (fn, ms) => {
+      const { id } = originalSetInterval(fn, ms)
+
+      return { id }
+    }
+
+    const processor = new SequentialProcessor({
+      callback: async () => {},
+      onSuccess: () => {},
+      onFailure: () => {},
+      clock: bare
+    })
+
+    processor.dispose()
   })
 
   test('clears the dependency index once a dependency resolves', async (t) => {

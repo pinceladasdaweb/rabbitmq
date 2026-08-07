@@ -20,6 +20,8 @@ class TokenBucketStrategy {
 
     const tokensToAdd = (now - bucket.lastRefill) * this.refillRatePerMs
 
+    // Strictly greater: zero elapsed means nothing to add, and a NEGATIVE
+    // delta (clock stepped backwards) must not shrink the balance.
     if (tokensToAdd > 0) {
       bucket.tokens = Math.min(this.bucketSize, bucket.tokens + tokensToAdd)
       bucket.lastRefill = now

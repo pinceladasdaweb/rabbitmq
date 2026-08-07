@@ -103,13 +103,12 @@ class SequentialProcessor {
 
       this.onSuccess(message)
 
-      if (messageId) {
-        await this.#processDependents(messageId)
-      }
+      // No messageId guard: nothing can ever be parked under undefined
+      // (parking requires a truthy id), so the lookup is a natural no-op.
+      await this.#processDependents(messageId)
     } catch (error) {
-      if (messageId) {
-        this.processing.delete(messageId)
-      }
+      // Unguarded for the same reason: deleting undefined is a no-op.
+      this.processing.delete(messageId)
 
       const requeue = this.shouldRequeue(message, error)
 

@@ -258,8 +258,24 @@ class RabbitMQ extends EventEmitter {
       throw new Error('No active connection to RabbitMQ')
     }
 
-    this.#channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval, this.#clock)
-    await this.#channelPool.initialize()
+    // Assigned only AFTER a successful initialize: a half-built pool left in
+    // the field would satisfy #doConnect's `if (!this.#channelPool)` gate and
+    // silently skip the restore a manual retry is asking for — leaving
+    // publishing and consumers broken until the next disconnection.
+    const channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval, this.#clock)
+
+    await channelPool.initialize()
+
+    // The connection can turn over while channels were being created (a
+    // flapping broker): a pool built on the dead connection must not clobber
+    // the one the newer recovery installed.
+    if (this.#connection.getConnection() !== connection) {
+      await channelPool.close()
+
+      throw new Error('Connection changed while the channel pool was being built')
+    }
+
+    this.#channelPool = channelPool
   }
 
   // Concurrent connect() callers share a single in-flight attempt: two
@@ -398,7 +414,9 @@ class RabbitMQ extends EventEmitter {
       throw new Error('Exchange name must be a non-empty string')
     }
 
-    if (typeof type !== 'string' || !['direct', 'topic', 'fanout', 'headers'].includes(type)) {
+    // No typeof arm: a non-string is never in the list, so includes() already
+    // rejects it with the same error.
+    if (!['direct', 'topic', 'fanout', 'headers'].includes(type)) {
       throw new Error('Invalid exchange type. Must be one of: direct, topic, fanout, headers')
     }
 

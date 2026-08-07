@@ -5,7 +5,10 @@
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 }
 
-const createLogger = (level = process.env.LOG_LEVEL || 'info') => {
+// No default on `level` beyond the env var: an unknown or missing level is
+// already mapped to info by the ?? below — a second default would be dead
+// weight (and mutation testing flagged it as such).
+const createLogger = (level = process.env.LOG_LEVEL) => {
   const threshold = LEVELS[level] ?? LEVELS.info
 
   const write = (method, levelName) => (message, ...args) => {

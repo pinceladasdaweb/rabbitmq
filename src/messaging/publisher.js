@@ -242,7 +242,9 @@ class Publisher {
   async publishDelayed (routingKey, message, delayMs, options = {}) {
     const exchange = this.getExchange()
 
-    if (typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0) {
+    // Number.isFinite is type-strict (no coercion), so it already rejects
+    // every non-number — a separate typeof check would be dead weight.
+    if (!Number.isFinite(delayMs) || delayMs < 0) {
       throw new Error('Delay must be a non-negative number of milliseconds')
     }
 
