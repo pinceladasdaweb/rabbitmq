@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 1.5.3 (2026-08-07)
+
+* perf: cut the full mutation run from 7 minutes to 4m15s by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/effdc4d9dc4a47b6207e7ce25336f279816e620f)
+* test: clear the resilience/logger/codec mutation survivors; centralize the mutation policy by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/122dbf1fd2827f4f45634e4aafe41973b9152bb6)
+* test: clear the sequential-processor, channel-pool and topology survivors by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/4972758064b48796a8621baa0c4995423f955356)
+* test: clear the publisher and connection mutation survivors by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/afd7aeb123bf9f9abd8907ed6958c17fde11b8ab)
+* test: clear the rpc and worker-pool mutation survivors; add the worker spawn seam by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/0215902c47c8a5b9abfbdfe6605bc77ca0e067d4)
+* test: clear most consumer-manager mutation survivors (44 -> 14) by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/9a7a2dbbfa838bd4cd5dfe787e478034bf862504)
+* test: keep the event loop alive for the new RPC suites on Node 22 by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/42597fbe4fa4815278e91014ecf43363fd4c3197)
+* docs: ledger the last consumer-manager survivor as a proven equivalent by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/72ddbdefd8bfa32b6b777262ef45e15761c6a484)
+* fix: fence the channel pool against a connection turnover mid-build by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/8fe40404af515d922ee49b4c24c9ecbdffb7660c)
+
+
 ## 1.5.2 (2026-08-06)
 
 * refactor: split the rate limiter into strategy objects with an injectable clock by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/58e041009bce5f5607590d0254efe4040bc810a7)
