@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { FakeChannel, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
@@ -911,8 +911,12 @@ describe('ConsumerManager retryPolicy', () => {
 })
 
 describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
+  // The optimizer measures processing pace through the injected clock, so
+  // "slow processing" is a callback that advances the clock — these tests
+  // used to sleep 520ms of real time to cross the saturation threshold.
   test('raises the prefetch when processing is consistently fast', async () => {
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {}, {
       initialPrefetch: 2,
@@ -923,19 +927,20 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     assert.deepEqual(harness.channel.prefetches, [2])
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
+    clock.advance(21)
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 3000, 'prefetch raised')
   })
 
   test('lowers the prefetch when processing is consistently slow', async () => {
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
       // Above the 500ms threshold the optimizer treats the consumer as
       // saturated and backs the prefetch off.
-      await sleep(520)
+      clock.advance(520)
     }, {
       initialPrefetch: 8,
       optimizationInterval: 20,
@@ -946,7 +951,6 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
     assert.deepEqual(harness.channel.prefetches, [8])
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
     await deliver(harness, { n: 2 })
 
     await waitFor(() => harness.channel.prefetches.includes(4), 5000, 'prefetch lowered')
@@ -955,17 +959,17 @@ describe('ConsumerManager subscribeWithOptimizedPrefetch', () => {
   test('leaves the prefetch alone when the measured pace warrants no change', async () => {
     // Between the two thresholds (100ms fast, 500ms slow) the optimizer must
     // decide on nothing and skip the channel round-trip entirely.
-    const harness = createManager()
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
 
     await harness.manager.subscribeWithOptimizedPrefetch('orders', async () => {
-      await sleep(200)
+      clock.advance(200)
     }, {
       initialPrefetch: 4,
       optimizationInterval: 20
     })
 
     await deliver(harness, { n: 1 })
-    await sleep(30)
     await deliver(harness, { n: 2 })
 
     assert.deepEqual(harness.channel.prefetches, [4], 'no adjustment was applied')

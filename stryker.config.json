@@ -9,6 +9,7 @@
     "nodeArgs": [
       "--test",
       "--test-reporter=tap",
+      "--test-timeout=2000",
       "--experimental-test-isolation=none"
     ]
   },
@@ -22,7 +23,7 @@
   "ignorers": [
     "log-strings"
   ],
-  "coverageAnalysis": "all",
+  "coverageAnalysis": "perTest",
   "reporters": [
     "json",
     "html",
@@ -34,8 +35,9 @@
   "clearTextReporter": {
     "maxTestsToLog": 1
   },
-  "concurrency": 6,
-  "timeoutMS": 5000,
+  "concurrency": 7,
+  "timeoutMS": 2500,
+  "timeoutFactor": 1,
   "thresholds": {
     "high": 90,
     "low": 80,
