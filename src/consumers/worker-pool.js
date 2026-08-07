@@ -8,6 +8,10 @@ class WorkerPool {
     this.workerData = options.workerData || {}
     this.maxRespawns = options.maxRespawns ?? 5
     this.logger = options.logger
+    // The spawn seam: real worker threads by default, injectable so the
+    // pool's bookkeeping (idle rotation, respawn budget, waiter handoff) is
+    // testable without paying thread startup per case.
+    this.createWorker = options.createWorker ?? ((file, workerOptions) => new Worker(file, workerOptions))
     this.workers = new Set()
     this.idleWorkers = []
     this.waiters = []
@@ -24,7 +28,7 @@ class WorkerPool {
   }
 
   #spawn (workerId) {
-    const worker = new Worker(this.processorFile, {
+    const worker = this.createWorker(this.processorFile, {
       workerData: { ...this.workerData, workerId }
     })
 

@@ -65,6 +65,14 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     clear the reconnect timer, so the guard only matters for the microtask
 //     race where the timer callback was already dequeued when the connect
 //     resolved — the clear and the guard are another defense-in-depth pair.
+//   - worker-pool.js acquire's `workers.has` guard and terminate's idle
+//     reset: the exit handler already removes dead workers from the idle
+//     list and the terminated flag rejects before idle is ever read, so
+//     stale idle content is unobservable — both are backstops for the same
+//     invariant the exit handler maintains.
+//   - rpc.js `connectionEpoch++` -> `--`: the epoch fence only ever tests
+//     INEQUALITY between a captured value and the current one — any change
+//     per connection loss works, direction is immaterial.
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 

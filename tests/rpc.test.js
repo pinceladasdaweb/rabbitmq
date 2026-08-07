@@ -8,7 +8,7 @@ import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
 import CircuitBreaker from '../src/resilience/circuit-breaker.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { withLiveEventLoop } from './helpers.js'
+import { ManualClock, recordingLogger, withLiveEventLoop } from './helpers.js'
 
 const silentLogger = { info () {}, warn () {}, error () {}, debug () {} }
 
@@ -75,7 +75,7 @@ class FakeChannel extends EventEmitter {
   }
 }
 
-const createHarness = ({ codecOptions = {}, logger = silentLogger } = {}) => {
+const createHarness = ({ codecOptions = {}, logger = silentLogger, context: extraContext = {} } = {}) => {
   const codec = new MessageCodec({ logger, ...codecOptions })
   const replyChannel = new FakeChannel()
   const poolChannel = new FakeChannel()
@@ -95,7 +95,8 @@ const createHarness = ({ codecOptions = {}, logger = silentLogger } = {}) => {
     getExchange: () => ({ name: 'rpc-exchange', type: 'direct' }),
     getChannel: async () => poolChannel,
     getChannelPool: () => channelPool,
-    emit: () => {}
+    emit: () => {},
+    ...extraContext
   }
 
   const publisher = new Publisher(context)
@@ -311,6 +312,9 @@ describe('Rpc request()', () => {
     await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: 0 }), /positive number/)
     await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: -5 }), /positive number/)
     await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: 'soon' }), /positive number/)
+    // NaN is a number, finite it is not: only the isFinite arm catches it.
+    await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: NaN }), /positive number/)
+    await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: Infinity }), /positive number/)
   })
 
   test('rejects with the broker error when the publish confirm fails (single attempt by default)', async () => {
@@ -446,7 +450,9 @@ describe('Rpc request()', () => {
     harness.rpc.handleConnectionLoss()
     releaseConsume()
 
-    await assert.rejects(() => first, (error) => error.code === 'RPC_CONNECTION_LOST')
+    await assert.rejects(() => first, (error) =>
+      error.code === 'RPC_CONNECTION_LOST' && /connection lost during reply consumer setup/.test(error.message)
+    )
     assert.equal(harness.rpc.replyChannel, null, 'the fenced channel must not be installed')
     // The fenced setup installed its listeners before discovering the epoch
     // had moved: abandoning the channel without detaching them would leave
@@ -855,5 +861,361 @@ describe('Rpc respond()', () => {
 
     assert.equal(reply.options.headers['x-compressed'], true, 'reply above the threshold must be compressed')
     assert.deepEqual(await harness.codec.decode(reply.content, true), bigResult)
+  })
+})
+
+describe('Rpc survivor round', () => {
+  test('a publish failure that settles the request does not also warn about a late failure', async () => {
+    const logger = recordingLogger()
+    const harness = createHarness({ logger })
+
+    harness.replyChannel.confirmErrors.push(new Error('nacked'))
+
+    await assert.rejects(() => harness.rpc.request('users.get', {}, { timeout: 2000 }), /not confirmed/)
+
+    assert.equal(
+      logger.records.warn.some(line => line.includes('already settled')),
+      false,
+      'the failure settled the pending — warning as well would be double-reporting'
+    )
+  })
+
+  test('connection-loss rejections carry the reasons callers read', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.rpc.pendingRequests.size === 1, 2000, 'request pending')
+
+    harness.rpc.handleConnectionLoss()
+
+    await assert.rejects(() => pending, (error) => {
+      assert.equal(error.code, 'RPC_CONNECTION_LOST')
+      assert.match(error.message, /connection to RabbitMQ lost/, 'the default reason names the cause')
+
+      return true
+    })
+  })
+
+  test('a close of the CURRENT reply channel rejects with its own reason', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.rpc.pendingRequests.size === 1, 2000, 'request pending')
+
+    harness.replyChannel.emit('close')
+
+    await assert.rejects(() => pending, /reply channel closed/)
+  })
+
+  test('a stale close event from a replaced reply channel leaves new pendings alone', async () => {
+    // A pool that hands out a FRESH channel per call, as a real reconnection
+    // does — the default harness reuses one instance, which would make the
+    // stale channel and its replacement indistinguishable.
+    const replyChannels = []
+    const channelPool = {
+      getDedicatedChannel: async () => {
+        const channel = new FakeChannel()
+
+        replyChannels.push(channel)
+
+        return channel
+      }
+    }
+    const harness = createHarness({ context: { getChannelPool: () => channelPool } })
+
+    const first = harness.rpc.request('users.get', { id: 1 }, { timeout: 2000 })
+
+    await waitFor(() => replyChannels.length === 1 && replyChannels[0].published.length === 1, 2000, 'first published')
+
+    // The connection turns over: pendings die with it, the channel is retired.
+    harness.rpc.handleConnectionLoss('turnover')
+    await assert.rejects(() => first, /turnover/)
+
+    const survivor = harness.rpc.request('users.get', { id: 2 }, { timeout: 2000 })
+
+    await waitFor(() => replyChannels.length === 2 && replyChannels[1].published.length === 1, 2000, 'second pending on a fresh channel')
+
+    // The old channel's own close handler was detached at turnover; the
+    // path that CAN still fire for it is the broker cancelling its consumer
+    // (a null delivery). That late cancel must not touch the new route.
+    await replyChannels[0].consumers[0].callback(null)
+    replyChannels[0].emit('close')
+    await sleep(10)
+
+    assert.equal(harness.rpc.pendingRequests.size, 1, 'the new pending survived the stale close')
+
+    const { content, compressed } = await harness.codec.encode({ ok: true })
+
+    await replyChannels[1].consumers.at(-1).callback({
+      content,
+      fields: {},
+      properties: {
+        correlationId: replyChannels[1].published[0].options.correlationId,
+        headers: { 'x-compressed': compressed }
+      }
+    })
+
+    assert.deepEqual(await survivor, { ok: true })
+  })
+
+  test('malformed basic.return events are tolerated and unroutable fields degrade gracefully', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.rpc.pendingRequests.size === 1, 2000, 'request pending')
+
+    // Emitters outside amqplib's contract must not crash the reply route.
+    harness.replyChannel.emit('return', {})
+    harness.replyChannel.emit('return', undefined)
+
+    assert.equal(harness.rpc.pendingRequests.size, 1, 'garbage returns settled nothing')
+
+    // A return that DOES match a pending but carries no fields still rejects
+    // as unroutable instead of crashing on fields.routingKey.
+    const { correlationId } = harness.replyChannel.published[0].options
+
+    harness.replyChannel.emit('return', { properties: { correlationId } })
+
+    await assert.rejects(() => pending, (error) => error.code === 'RPC_UNROUTABLE')
+  })
+
+  test('an error envelope without a message still rejects with the fallback', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'published')
+
+    // A foreign responder can flag x-rpc-error with a body that decodes to
+    // null; the requester still deserves a coded rejection, not a timeout.
+    await harness.replyChannel.consumers.at(-1).callback({
+      content: Buffer.from('null'),
+      fields: {},
+      properties: {
+        correlationId: harness.replyChannel.published[0].options.correlationId,
+        headers: { 'x-compressed': false, 'x-rpc-error': true }
+      }
+    })
+
+    await assert.rejects(() => pending, (error) => {
+      assert.equal(error.code, 'RPC_RESPONDER_ERROR')
+      assert.match(error.message, /RPC responder failed/)
+
+      return true
+    })
+  })
+
+  test('timeouts name the route and the budget in their message', async () => {
+    const harness = createHarness()
+
+    await assert.rejects(
+      () => harness.rpc.request('users.get', {}, { timeout: 20 }),
+      (error) => {
+        assert.equal(error.code, 'RPC_TIMEOUT')
+        assert.match(error.message, /users\.get.*timed out after 20ms/)
+
+        return true
+      }
+    )
+  })
+
+  test('requests are rate-limited under the rpc: namespace with their explicit cost', async () => {
+    const calls = []
+    const rateLimiter = {
+      checkRateLimit: async (key, cost) => {
+        calls.push({ key, cost })
+
+        return true
+      },
+      getStatus: () => ({})
+    }
+
+    const harness = createHarness({ context: { rateLimiter } })
+
+    const first = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'published')
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: 1 })
+    await first
+
+    const second = harness.rpc.request('users.get', {}, { timeout: 2000, rateLimitCost: 3 })
+
+    await waitFor(() => harness.replyChannel.published.length === 2, 2000, 'published again')
+    await deliverReply(harness, harness.replyChannel.published[1].options.correlationId, { ok: 2 })
+    await second
+
+    assert.deepEqual(calls, [
+      { key: 'rpc:users.get', cost: 1 },
+      { key: 'rpc:users.get', cost: 3 }
+    ])
+  })
+
+  test('requests go out transient: a queue restart must not replay stale RPCs', async () => {
+    const harness = createHarness()
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'published')
+
+    assert.equal(harness.replyChannel.published[0].options.persistent, false)
+
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
+    await pending
+  })
+
+  test('tolerates a clock whose timeout handles have no unref', async () => {
+    const bare = {
+      now: () => Date.now(),
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (handle) => clearInterval(handle),
+      setTimeout: (fn, ms) => {
+        const id = setTimeout(fn, ms)
+
+        return { id, close: () => clearTimeout(id) }
+      },
+      clearTimeout: (handle) => { if (handle) clearTimeout(handle.id) },
+      sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms))
+    }
+
+    const harness = createHarness({ context: { clock: bare } })
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'published without crashing on unref')
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
+    assert.deepEqual(await pending, { ok: true })
+  })
+
+  test('a debug-less logger survives discarded replies and stale-request drops', async () => {
+    const logger = { info: () => {}, warn: () => {}, error: () => {} }
+    const harness = createHarness({ logger })
+
+    const pending = harness.rpc.request('users.get', {}, { timeout: 2000 })
+
+    await waitFor(() => harness.replyChannel.published.length === 1, 2000, 'published')
+
+    // Unknown correlationId: the discard path logs at debug level.
+    await deliverReply(harness, 'no-such-correlation', { ok: false })
+
+    await deliverReply(harness, harness.replyChannel.published[0].options.correlationId, { ok: true })
+    assert.deepEqual(await pending, { ok: true })
+  })
+})
+
+describe('Rpc respond() staleness', () => {
+  const deliverRequest = async (harness, payload, headers = {}, properties = {}) => {
+    const { content, compressed } = await harness.codec.encode(payload)
+
+    await harness.consumerChannel.consumers.at(-1).callback({
+      content,
+      fields: { consumerTag: 'tag-1', deliveryTag: 1 },
+      properties: {
+        replyTo: 'amq.rabbitmq.reply-to',
+        correlationId: 'req-1',
+        headers: { 'x-compressed': compressed, ...headers },
+        ...properties
+      }
+    })
+  }
+
+  test('a request whose deadline is exactly now is still served', async (t) => {
+    // Staleness is strictly past-deadline: the boundary instant belongs to
+    // the requester (its own timeout fires only after this moment).
+    const clock = new ManualClock(5000)
+    const harness = createHarness({ context: { clock } })
+    const served = []
+
+    await harness.rpc.respond('rpc.queue', async (content) => {
+      served.push(content)
+
+      return { ok: true }
+    })
+
+    await deliverRequest(harness, { n: 1 }, { 'x-rpc-deadline': 5000 })
+
+    assert.deepEqual(served, [{ n: 1 }], 'deadline == now is not stale')
+  })
+
+  test('a live deadline is served and an expired one is dropped with an ack', async () => {
+    const clock = new ManualClock(5000)
+    // Debug-less on purpose: the drop path logs at debug level through
+    // optional chaining, and this logger is the reason the ?. exists.
+    const logger = { info: () => {}, warn: () => {}, error: () => {} }
+    const harness = createHarness({ logger, context: { clock } })
+    const served = []
+
+    await harness.rpc.respond('rpc.queue', async (content) => {
+      served.push(content)
+
+      return { ok: true }
+    })
+
+    await deliverRequest(harness, { fresh: true }, { 'x-rpc-deadline': 9000 })
+    await deliverRequest(harness, { stale: true }, { 'x-rpc-deadline': 4000 })
+
+    assert.deepEqual(served, [{ fresh: true }], 'only the live request reached the handler')
+    assert.equal(harness.consumerChannel.nacked.length, 0, 'a stale drop is an ack, never a nack — a crash in the drop path would dead-letter it')
+    assert.equal(harness.consumerChannel.acked.length, 2, 'both deliveries were settled')
+  })
+
+  test('failing to publish even the error envelope is reported and still acks the request', async () => {
+    const logger = recordingLogger()
+    const harness = createHarness({ logger })
+
+    await harness.rpc.respond('rpc.queue', async () => ({ ok: true }))
+
+    harness.poolChannel.confirmErrors.push(new Error('reply gone'), new Error('envelope gone'))
+
+    await deliverRequest(harness, { n: 1 }, { 'x-rpc-deadline': Date.now() + 60000 })
+
+    assert.ok(
+      logger.records.error.some(line => line.includes('Failed to publish RPC error envelope')),
+      'the double failure is the one case the operator can only learn from the log'
+    )
+    assert.equal(harness.consumerChannel.nacked.length, 0, 'the request is still acked — a DLQ replay would re-run committed side effects')
+  })
+
+  test('replies are transient, and a failed reply falls back to an error envelope', async () => {
+    const harness = createHarness()
+
+    await harness.rpc.respond('rpc.queue', async () => ({ big: 'result' }))
+
+    // First reply confirm fails; the responder must fall back to an error
+    // envelope so the requester rejects fast instead of burning its timeout.
+    harness.poolChannel.confirmErrors.push(new Error('reply route gone'))
+
+    await deliverRequest(harness, { n: 1 }, { 'x-rpc-deadline': Date.now() + 60000 })
+
+    assert.equal(harness.poolChannel.published.length, 2, 'the failed reply was followed by the envelope')
+
+    const [reply, envelope] = harness.poolChannel.published
+
+    assert.equal(reply.options.persistent, false, 'replies are transient — the requester is ephemeral by definition')
+    assert.equal(envelope.options.headers['x-rpc-error'], true)
+    assert.match(JSON.parse(envelope.content.toString()).message, /Failed to publish RPC reply/)
+  })
+
+  test('a request without headers is processed normally', async () => {
+    const harness = createHarness()
+    const served = []
+
+    await harness.rpc.respond('rpc.queue', async (content) => {
+      served.push(content)
+
+      return { ok: true }
+    })
+
+    const { content } = await harness.codec.encode({ bare: true })
+
+    await harness.consumerChannel.consumers.at(-1).callback({
+      content,
+      fields: { consumerTag: 'tag-1', deliveryTag: 1 },
+      properties: { replyTo: 'amq.rabbitmq.reply-to', correlationId: 'req-2' }
+    })
+
+    assert.deepEqual(served, [{ bare: true }], 'no headers means no deadline, not a crash')
   })
 })
