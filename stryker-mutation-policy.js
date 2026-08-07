@@ -28,6 +28,16 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     the `true &&` mutant reduces to `blockedUntil > now`, and undefined
 //     compares false against any number — the guard is semantically
 //     redundant, kept for readability over coercion arcana.
+//   - channel-pool.js getChannel's ring scan `i < length` -> `<=`: the extra
+//     iteration re-reads a slot the ring already visited — it can neither
+//     find a channel the scan missed nor change the throw.
+//   - channel-pool.js #closeChannel's `!channel || typeof close` guard: the
+//     try/catch right below already swallows the TypeError a null slot (or a
+//     close-less channel) would produce — the guard is an early exit whose
+//     removal cannot be observed.
+//   - topology.js default `(() => null)` -> `() => undefined`: the only
+//     consumer feeds it into `sourceQueue || routingKey`, where null and
+//     undefined are the same falsy.
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 

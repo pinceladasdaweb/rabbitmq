@@ -70,7 +70,10 @@ class Topology {
     // Prefer the actual source queue (resolved through the delivering
     // consumerTag); fall back to the routing-key convention for messages
     // that were not consumed through this instance.
-    const sourceQueue = this.getQueueNameByConsumerTag(message.fields?.consumerTag)
+    // Delivered messages always carry fields (the routingKey fallback below
+    // depends on it), so no optional chaining: this method takes the same
+    // stance both lines do.
+    const sourceQueue = this.getQueueNameByConsumerTag(message.fields.consumerTag)
     const deadLetterQueue = `${sourceQueue || message.fields.routingKey}_dlq`
     const channel = await this.getChannel()
 
