@@ -8,3 +8,4 @@ index.d.cts
 # Stryker mutation reports
 reports/
 .stryker-tmp/
+report.*.json

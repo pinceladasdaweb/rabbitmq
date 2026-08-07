@@ -375,7 +375,15 @@ describe('RabbitMQ lifecycle (fake dialer)', () => {
     dialer.connections[1].emit('close')
     await waitFor(() => dialer.connections.length === 3, 3000, 'second recovery connection dialed')
 
+    // The stale restore resumes, builds its pool on the dead connection and
+    // must be fenced off with a reason the operator can act on.
+    const fenced = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
     releaseChannels()
+
+    const fenceError = await fenced
+
+    assert.match(fenceError.message, /Connection changed while the channel pool was being built/)
 
     const healthy = dialer.connections[2]
 

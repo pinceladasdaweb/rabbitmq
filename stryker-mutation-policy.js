@@ -105,6 +105,34 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     path performs. (__channel's configurable IS load-bearing and tested:
 //     that property is non-writable, so its re-attach value swap depends on
 //     it.)
+//   - index.js constructor's `if (#useCache)` around cache creation: every
+//     cache consumer re-checks #useCache, so an eagerly built (unused) cache
+//     is dead weight the disconnect-close guard tolerates.
+//   - index.js checkperiod (cacheCheckPeriod || 120): node-cache's sweep
+//     cadence is internal; observing a wrong value needs real-time waits.
+//   - index.js context's `#consumers?.` arrow: the arrow only runs after the
+//     constructor finished assigning #consumers — construction order makes
+//     the optional chaining unreachable-false.
+//   - index.js connect()'s promise funnel: defense in depth over TWO inner
+//     funnels (RabbitMQConnection's own connectPromise and #restoreState's
+//     slot) — a duplicated #doConnect converges on the same dial and the
+//     pool gate skips the second restore.
+//   - index.js the stale-restore ownership check (#restorePromise ===
+//     restore -> true): reaching a non-owning finally needs a third restore
+//     caller that today's call graph cannot produce — kept per the comment
+//     in the source, three lines against silent duplicate consumers.
+//   - index.js waitForConnection's `if (timer)` -> true: both clocks
+//     tolerate clearing a null timer handle.
+//   - index.js disconnect's cache-close shape guards: @cacheable/node-cache
+//     always ships close(), and skipping it only leaves node-cache's
+//     internal (unref'd) sweep running — unobservable without real waits.
+//   - index.js disconnect's catch-retry: the primary #connection.disconnect
+//     has already run by the time anything can throw (a throwing
+//     'disconnected' listener), and the connection state machine dedups the
+//     second call — the retry exists for mid-teardown failures that the
+//     public API cannot produce deterministically.
+//   - index.js publishWithCache's `#cache.options?.stdTTL`: node-cache
+//     instances always expose options — the chain cannot miss.
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 
