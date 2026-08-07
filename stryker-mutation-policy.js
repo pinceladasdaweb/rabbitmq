@@ -70,9 +70,34 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     list and the terminated flag rejects before idle is ever read, so
 //     stale idle content is unobservable — both are backstops for the same
 //     invariant the exit handler maintains.
-//   - rpc.js `connectionEpoch++` -> `--`: the epoch fence only ever tests
-//     INEQUALITY between a captured value and the current one — any change
-//     per connection loss works, direction is immaterial.
+//   - rpc.js `connectionEpoch++` -> `--` and consumer-manager.js
+//     `consumerInfo.epoch++` -> `--`: epoch fences only ever test INEQUALITY
+//     between a captured value and the current one — direction is immaterial.
+//   - consumer-manager.js `++this.consumerSequence` -> `--`: consumer ids
+//     only need uniqueness; negative sequence numbers are as unique as
+//     positive ones.
+//   - consumer-manager.js the two `if (consumerInfo.consumerTag)` guards
+//     around consumersByTag.delete: Map.delete of an absent (undefined) key
+//     is a no-op, so forcing the branch changes nothing.
+//   - consumer-manager.js findQueueNameByTag's `if (!consumerTag)` early
+//     return: falling through hands undefined to Map.get, whose `?? null`
+//     and the ternary below produce the same null.
+//   - consumer-manager.js settleAck's 'nack' action string: any non-'ack'
+//     value routes to the nack branch; the name only feeds the failure log.
+//   - consumer-manager.js unsubscribe's `if (consumerInfo.channel)` guard:
+//     cancelling on null throws inside the try whose catch already tolerates
+//     cancel failures — forcing the branch is swallowed.
+//   - consumer-manager.js the prefetch cap operands (`current < maxPrefetch`
+//     -> true/<=, `current > minPrefetch` -> true/>=): Math.min/Math.max
+//     clamp the proposal and the newPrefetch === currentPrefetch early
+//     return discards the no-op — the guards only save the arithmetic.
+//   - consumer-manager.js subscribeParallel's `if (consumerId)`: subscribe
+//     just registered the tag, so the lookup cannot miss; the guard is
+//     defensive against a bookkeeping break that would already fail louder
+//     elsewhere.
+//   - consumer-manager.js disposeAll's cancelled = true: the loop is
+//     synchronous and activeConsumers.clear() follows immediately, so no
+//     concurrent observer can see the flag between the two.
 
 const LOG_METHODS = new Set(['info', 'warn', 'error', 'debug'])
 
