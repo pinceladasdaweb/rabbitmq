@@ -166,6 +166,15 @@ npm run test:integration
 
 Both suites also run on every push and pull request via GitHub Actions (`.github/workflows/ci.yml`), with RabbitMQ provisioned as a service container.
 
+A three-node cluster suite covers what a single broker cannot: it kills the container the client is attached to and checks that the client comes back on a surviving node with its consumers draining again.
+
+```bash
+docker compose -f docker-compose.cluster.yml up -d --wait
+npm run test:cluster
+```
+
+It also answers the question the `{ attempts: N }` retry budget depends on — whether a quorum queue's `x-delivery-count` survives a leader failover. It does: the count keeps climbing across the node change, so a failover mid-retry does not silently restart a message's budget.
+
 Mutation testing grades whether those tests actually assert anything — it breaks a line in `src/` and checks that a test notices:
 
 ```bash
