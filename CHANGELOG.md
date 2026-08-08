@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 1.6.0 (2026-08-08)
+
+* fix: keep consumer tags valid across recreations and make the restore atomic by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/b992623be00734bdee7e03bc128b5d86198e5c8e)
+* fix: recover consumers whose channel dies, and fence connect against shutdown by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/637d7db83e83e47e47358ca04c4f8e64d705a7c1)
+* fix: give every consumer resource an owner and stop leaking channels by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/fcec1c1b90bf1c1dd61d763a8bfbe4548bbaf69e)
+* ci: gate publishing on a green CI run instead of the push itself by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/8c2bf97f498f24b0cfbf8edffe0ef6bad508f846)
+* fix: isolate the plugin probe, correlate DLQ returns and retry batches per message by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/55a527221139dfbe9b5c1fb88607fb435758e9cf)
+* feat(minor): surface unroutable publishes and add a real retry budget by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2336641c6b8c9d35d262903a6c934286c01f041e)
+* fix: honour the retry budget on a quorum queue's FIRST delivery by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/6658eecca4f72bf2f18a02916dd01ab685b88fa9)
+* test: close the coverage gaps and delete the dead branches behind them by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/b6f7916f76921f879b9388ba8e53c7a3f068bdb2)
+* test: add a three-node cluster suite for failover behaviour by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/8cd679bc56143ac117a4977c7c2f6ef40d5982fa)
+* test: kill the survivors left by today's new code by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2b27697e468480b965cdbf75277c4cf5f30354ee)
+
+
 ## 1.5.3 (2026-08-07)
 
 * perf: cut the full mutation run from 7 minutes to 4m15s by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/effdc4d9dc4a47b6207e7ce25336f279816e620f)

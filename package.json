@@ -1,6 +1,6 @@
 {
   "name": "@pinceladasdaweb/rabbitmq",
-  "version": "1.5.3",
+  "version": "1.6.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -58,7 +58,7 @@
     "consumer",
     "producer"
   ],
-  "author": "Pedro Rog\u00e9rio <pinceladasdaweb@hotmail.com>",
+  "author": "Pedro Rogério <pinceladasdaweb@hotmail.com>",
   "license": "MIT",
   "description": "A robust and elegant abstraction for RabbitMQ in Node.js, featuring advanced capabilities such as circuit breaker, intelligent retries, automatic compression, and parallel processing.",
   "devDependencies": {
