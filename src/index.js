@@ -229,7 +229,10 @@ class RabbitMQ extends EventEmitter {
       // put in place — same ownership discipline as the fence itself.
       if (installedPool && this.#channelPool === installedPool) {
         this.#channelPool = null
-        await installedPool.close().catch(() => {})
+        // ChannelPool.close() swallows per-channel teardown failures by
+        // contract (pinned by its own test), so this cannot reject and mask
+        // the restore error we are about to rethrow.
+        await installedPool.close()
       }
 
       throw error
@@ -269,7 +272,7 @@ class RabbitMQ extends EventEmitter {
       const staleChannelPool = this.#channelPool
 
       this.#channelPool = null
-      staleChannelPool.close().catch(() => {})
+      staleChannelPool.close()
     }
 
     this.emit('disconnected')

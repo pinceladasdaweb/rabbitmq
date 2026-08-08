@@ -1822,3 +1822,29 @@ describe('ConsumerManager retry budget', () => {
     }
   })
 })
+
+describe('ConsumerManager recovery guards', () => {
+  test('recovering an unknown consumer id is a no-op', async () => {
+    // handleConsumerLoss is reachable from two paths that each pre-check
+    // something different; the guard covers whichever one did not.
+    const harness = createManager()
+
+    await harness.manager.handleConsumerLoss('consumer-never-registered-1', 'queue deleted')
+
+    assert.equal(harness.manager.activeConsumers.size, 0)
+  })
+
+  test('recovering a consumer already being unsubscribed stands down', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.manager.activeConsumers.get(consumerId).cancelled = true
+
+    await harness.manager.handleConsumerLoss(consumerId, 'channel closed')
+
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation for a consumer on its way out')
+  })
+})

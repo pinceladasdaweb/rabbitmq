@@ -77,10 +77,9 @@ class ChannelPool {
         const channel = await this.#createPoolChannel(index)
 
         if (this.closed) {
-          // Only give the slot back if it is still ours: the pool may have
-          // closed (and emptied the array) after we claimed it.
-          if (this.channels[index] === channel) this.channels[index] = null
-
+          // close() has already emptied `channels`, and #createPoolChannel
+          // claims no slot once the pool is closed — there is nothing to give
+          // back, only a late channel to discard.
           await this.#closeChannel(channel)
 
           return

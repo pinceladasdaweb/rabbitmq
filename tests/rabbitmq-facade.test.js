@@ -1291,3 +1291,60 @@ describe('RabbitMQ facade connect/disconnect fencing', () => {
     assert.ok(connection, 'the instance recovered instead of staying poisoned')
   })
 })
+
+describe('RabbitMQ facade teardown failures', () => {
+  test('a failed restore whose pool refuses to close still fails cleanly', async (t) => {
+    // Tearing the partial pool down is best-effort: a close that rejects must
+    // not replace the real restore error with a teardown one.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    dialer.onConnection = (connection) => {
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        const channel = await realCreate()
+
+        channel.assertExchangeError = new Error('exchange under maintenance')
+        channel.close = async () => { throw new Error('channel wedged') }
+
+        return channel
+      }
+    }
+
+    const failed = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
+    dialer.connections[0].emit('close')
+
+    const restoreError = await failed
+
+    assert.match(restoreError.message, /exchange under maintenance/, 'the real cause survives the failed teardown')
+  })
+
+  test('a disconnection whose stale pool refuses to close still recovers', async (t) => {
+    // The stale pool is closed best-effort on the way out; a rejection there
+    // must not derail the recovery that follows.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    for (const channel of dialer.connections[0].channels) {
+      channel.close = async () => { throw new Error('channel wedged') }
+    }
+
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await reconnected
+
+    assert.equal(dialer.connections.at(-1).consumersOn().length, 1, 'recovery completed despite the wedged teardown')
+  })
+})

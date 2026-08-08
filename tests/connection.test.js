@@ -772,3 +772,99 @@ describe('RabbitMQConnection shutdown fencing', () => {
     assert.equal(dialer.connections[0].closed, true, 'the orphan was closed, not leaked')
   })
 })
+
+describe('RabbitMQConnection teardown failures', () => {
+  test('an orphan dial whose close() rejects is still abandoned', async (t) => {
+    // The close is best-effort: a broker that refuses to close the connection
+    // we no longer want must not turn a clean shutdown into a rejection.
+    const dialer = createDialer()
+    let releaseDial
+    const dialGate = new Promise(resolve => { releaseDial = resolve })
+    const originalConnect = dialer.connect
+
+    dialer.connect = async (...args) => {
+      await dialGate
+
+      return originalConnect(...args)
+    }
+
+    dialer.onConnection = (connection) => {
+      connection.close = async () => { throw new Error('already gone') }
+    }
+
+    const connection = createConnection(t, dialer)
+
+    const pending = connection.connect()
+
+    await connection.disconnect()
+    releaseDial()
+
+    assert.equal(await pending, null, 'the dial still reports no connection')
+    assert.equal(connection.getConnectionState(), 'disconnected')
+    assert.equal(connection.getConnection(), null)
+  })
+})
+
+describe('RabbitMQConnection reconnect timer races', () => {
+  test('a reconnect callback already dequeued when the connect succeeded stands down', async (t) => {
+    // A successful connect clears the timer, so this guard only matters for
+    // the race where the callback had ALREADY been taken off the loop. The
+    // injected clock is what makes that instant reproducible: capture the
+    // scheduled callback, connect by hand, then run it.
+    const { ManualClock } = await import('./helpers.js')
+    const clock = new ManualClock()
+    const dialer = createDialer([new Error('down'), 'ok'])
+    const connection = createConnection(t, dialer, { clock })
+
+    t.after(() => connection.disconnect())
+
+    const reconnects = []
+
+    connection.on('reconnected', () => reconnects.push('reconnected'))
+
+    await connection.connect()
+
+    const scheduled = [...clock.timeouts.values()][0]
+
+    assert.ok(scheduled, 'the failed dial scheduled a retry')
+
+    await connection.connect()
+    assert.equal(connection.getConnectionState(), 'connected')
+
+    const dialsBefore = dialer.dials
+
+    await scheduled.fn()
+
+    assert.equal(dialer.dials, dialsBefore, 'the stale callback dialed nothing')
+    assert.deepEqual(reconnects, [], 'and announced no reconnection that never happened')
+  })
+
+  test('the reconnect backoff is exponential and capped', async (t) => {
+    // With the timer under our control the whole curve is observable, instead
+    // of inferred from one slow observation.
+    const { ManualClock } = await import('./helpers.js')
+    const clock = new ManualClock()
+    const dialer = createDialer([new Error('down')])
+    const connection = createConnection(t, dialer, {
+      clock,
+      reconnectInterval: 100,
+      maxReconnectInterval: 800
+    })
+
+    t.after(() => connection.disconnect())
+
+    const delays = []
+
+    await connection.connect()
+
+    for (let cycle = 0; cycle < 6; cycle++) {
+      const [scheduled] = [...clock.timeouts.values()]
+
+      delays.push(scheduled.at - clock.now())
+      clock.advance(scheduled.at - clock.now())
+      await sleep(5)
+    }
+
+    assert.deepEqual(delays, [100, 200, 400, 800, 800, 800], 'doubles until the ceiling, then holds')
+  })
+})

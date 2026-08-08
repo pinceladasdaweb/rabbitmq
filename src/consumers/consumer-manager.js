@@ -587,8 +587,9 @@ class ConsumerManager {
       prefetchCount: currentPrefetch
     })
 
+    // subscribe() registered this tag one line ago, so the lookup cannot miss.
     consumerId = this.findConsumerIdByTag(consumer.consumerTag)
-    knownEpoch = consumerId ? this.activeConsumers.get(consumerId).epoch : null
+    knownEpoch = this.activeConsumers.get(consumerId).epoch
 
     return consumer
   }

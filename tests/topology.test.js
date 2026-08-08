@@ -371,3 +371,49 @@ describe('Topology isolation', () => {
     assert.deepEqual(released, ['delay-probe'], 'the burnt channel was released')
   })
 })
+
+describe('Topology probe cleanup on unexpected failures', () => {
+  test('an unrelated error still releases the probe channel', async () => {
+    // The release is in a finally precisely so a rethrown error cannot leak
+    // the disposable channel back into the pool's bookkeeping.
+    const probeChannel = new FakeChannel()
+    const released = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => new FakeChannel(),
+      getChannelPool: () => ({
+        getDedicatedChannel: async () => probeChannel,
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    probeChannel.assertExchangeError = new Error('ACCESS_REFUSED - operator policy')
+
+    await assert.rejects(() => topology.isDelayPluginEnabled(), /ACCESS_REFUSED/)
+
+    assert.deepEqual(released, ['delay-probe'], 'the channel was released on the way out')
+  })
+
+  test('a successful probe with a pool releases the channel too', async () => {
+    const released = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => new FakeChannel(),
+      getChannelPool: () => ({
+        getDedicatedChannel: async () => new FakeChannel(),
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    assert.equal(await topology.isDelayPluginEnabled(), true)
+    assert.deepEqual(released, ['delay-probe'])
+  })
+})
