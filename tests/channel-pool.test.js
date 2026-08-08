@@ -490,3 +490,59 @@ describe('ChannelPool', () => {
     )
   })
 })
+
+describe('ChannelPool resource ownership', () => {
+  test('a failure mid-initialize closes the channels already created', async () => {
+    // Left open, they sit on a pool nobody owns whose `closed` is still false
+    // — so their close listeners keep dialing replacements forever.
+    const connection = createFakeConnection()
+    let created = 0
+
+    const realCreate = connection.createConfirmChannel.bind(connection)
+
+    connection.createConfirmChannel = async () => {
+      if (++created === 3) throw new Error('channel_max reached')
+
+      return realCreate()
+    }
+
+    const pool = new ChannelPool(connection, silentLogger, 5, 1, new ManualClock())
+
+    await assert.rejects(() => pool.initialize(), /channel_max reached/)
+
+    assert.equal(pool.closed, true, 'the orphan pool is marked closed so replacements stop')
+    assert.deepEqual(pool.channels, [], 'no half-built pool left behind')
+    assert.equal(
+      connection.createdChannels.every(channel => channel.closed),
+      true,
+      'every channel created before the failure was closed'
+    )
+  })
+
+  test('releaseDedicatedChannel closes it and lets the next request build a fresh one', async () => {
+    const connection = createFakeConnection()
+    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+
+    await pool.initialize()
+
+    const first = await pool.getDedicatedChannel('worker')
+
+    await pool.releaseDedicatedChannel('worker')
+
+    assert.equal(first.closed, true, 'the released channel was closed')
+
+    const second = await pool.getDedicatedChannel('worker')
+
+    assert.notEqual(second, first, 'the id is free for a fresh channel')
+
+    await pool.close()
+  })
+
+  test('releasing an unknown id is a no-op', async () => {
+    const pool = new ChannelPool(createFakeConnection(), silentLogger, 1, 1, new ManualClock())
+
+    await pool.initialize()
+    await pool.releaseDedicatedChannel('never-existed')
+    await pool.close()
+  })
+})

@@ -15,7 +15,9 @@ const createManager = (overrides = {}) => {
   const events = []
 
   const channelPool = {
-    getDedicatedChannel: async () => channel
+    released: [],
+    getDedicatedChannel: async () => channel,
+    releaseDedicatedChannel: async (id) => { channelPool.released.push(id) }
   }
 
   const context = {
@@ -1659,5 +1661,64 @@ describe('ConsumerManager channel-level loss', () => {
     harness.channel.emit('close')
 
     assert.equal(clock.intervals.size, 0, 'the dead channel took its processor with it')
+  })
+})
+
+describe('ConsumerManager resource ownership', () => {
+  test('unsubscribe releases the consumer dedicated channel', async () => {
+    // Without the release, every subscribe/unsubscribe cycle leaked one
+    // channel until the connection hit channel_max.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    assert.deepEqual(harness.channelPool.released, [consumerId], 'the channel went back to the pool')
+  })
+
+  test('unsubscribe cancels the tag the BROKER knows, not the caller alias', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    await harness.manager.recreateAll()
+
+    const currentTag = harness.channel.consumers.at(-1).consumerTag
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    assert.deepEqual(harness.channel.cancelled, [currentTag], 'cancelling the stale alias would leave it consuming')
+  })
+
+  test('giving up on a lost consumer terminates its worker pool', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+    let terminated = false
+
+    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', {
+      workerCount: 1,
+      createWorker: () => {
+        const worker = new EventEmitter()
+
+        worker.postMessage = () => {}
+        worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
+
+        return worker
+      }
+    })
+
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    // Every recreation attempt fails, so recovery walks its budget and drops
+    // the consumer — which used to leave the worker threads running forever.
+    harness.channel.consume = async () => { throw new Error('queue gone') }
+
+    await harness.manager.handleConsumerLoss(consumerId, 'queue deleted')
+
+    assert.equal(harness.manager.activeConsumers.size, 0, 'the consumer was dropped')
+    assert.equal(terminated, true, 'and its threads went with it')
+    assert.equal(harness.manager.workerPools.size, 0)
   })
 })

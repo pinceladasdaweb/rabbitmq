@@ -23,8 +23,17 @@ class ChannelPool {
     await this.close()
     this.closed = false
 
-    for (let i = 0; i < this.size; i++) {
-      this.channels.push(await this.#createPoolChannel(i))
+    try {
+      for (let i = 0; i < this.size; i++) {
+        this.channels.push(await this.#createPoolChannel(i))
+      }
+    } catch (error) {
+      // Without this the channels created so far stay open on a pool nobody
+      // owns — and since `closed` is still false, their close listeners keep
+      // dialing replacements: a zombie pool eating the connection's channels.
+      await this.close()
+
+      throw error
     }
   }
 
@@ -99,6 +108,20 @@ class ChannelPool {
     this.dedicatedChannels.set(id, channel)
 
     return channel
+  }
+
+  // A dedicated channel belongs to exactly one owner (a consumer, the RPC
+  // reply route). When that owner goes away the channel has to go with it, or
+  // every subscribe/unsubscribe cycle leaks one until the connection reaches
+  // channel_max and the broker refuses to open any more.
+  async releaseDedicatedChannel (id) {
+    const channel = this.dedicatedChannels.get(id)
+
+    if (!channel) return
+
+    this.dedicatedChannels.delete(id)
+
+    await this.#closeChannel(channel)
   }
 
   getChannel () {

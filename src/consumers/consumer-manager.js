@@ -169,7 +169,11 @@ class ConsumerManager {
     this.consumersByTag.set(consumerTag, consumerId)
   }
 
-  #dropConsumer (consumerId, consumerInfo) {
+  // The single place a consumer is removed, so it owns every resource the
+  // consumer holds. The worker pool used to be terminated only on the
+  // unsubscribe path, which left threads running (and the process unable to
+  // exit) whenever recovery gave up on a consumer instead.
+  async #dropConsumer (consumerId, consumerInfo) {
     for (const tag of consumerInfo.knownTags) {
       this.consumersByTag.delete(tag)
     }
@@ -177,6 +181,13 @@ class ConsumerManager {
     consumerInfo.knownTags.clear()
     consumerInfo.sequentialProcessor?.dispose()
     this.activeConsumers.delete(consumerId)
+
+    const workerPool = this.workerPools.get(consumerId)
+
+    if (workerPool) {
+      this.workerPools.delete(consumerId)
+      await workerPool.terminate()
+    }
   }
 
   // Every consumer (re)creation goes through here. The epoch lets concurrent
@@ -195,7 +206,7 @@ class ConsumerManager {
     try {
       return await this.runSetup(consumerInfo)
     } catch (error) {
-      this.#dropConsumer(consumerId, consumerInfo)
+      await this.#dropConsumer(consumerId, consumerInfo)
 
       throw error
     }
@@ -290,7 +301,7 @@ class ConsumerManager {
       }
     }
 
-    this.#dropConsumer(consumerId, consumerInfo)
+    await this.#dropConsumer(consumerId, consumerInfo)
     this.logger.error(`Consumer for queue ${consumerInfo.queueName} could not be recovered and was removed`)
     this.emit('consumerLost', { queueName: consumerInfo.queueName })
   }
@@ -446,20 +457,22 @@ class ConsumerManager {
 
     try {
       if (consumerInfo.channel) {
-        await consumerInfo.channel.cancel(consumerTag)
+        // The broker only knows the tag from the CURRENT consume — the caller
+        // may legitimately be holding an older alias (see #trackConsumerTag),
+        // and cancelling that one would leave the consumer running.
+        await consumerInfo.channel.cancel(consumerInfo.consumerTag)
       }
     } catch (error) {
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
     }
 
-    const workerPool = this.workerPools.get(consumerId)
+    await this.#dropConsumer(consumerId, consumerInfo)
 
-    if (workerPool) {
-      await workerPool.terminate()
-      this.workerPools.delete(consumerId)
-    }
+    // The dedicated channel exists for this consumer alone; leaving it open
+    // leaked one channel per subscribe/unsubscribe cycle until the connection
+    // hit channel_max and the broker refused every new one.
+    await this.getChannelPool()?.releaseDedicatedChannel(consumerId)
 
-    this.#dropConsumer(consumerId, consumerInfo)
     this.logger.info(`Unsubscribed consumer ${consumerTag} from queue ${consumerInfo.queueName}`)
 
     return true
