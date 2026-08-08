@@ -1,5 +1,6 @@
 import amqp from 'amqplib'
 import { EventEmitter } from 'node:events'
+import systemClock from '../utils/clock.js'
 
 class RabbitMQConnection extends EventEmitter {
   #logger
@@ -20,6 +21,7 @@ class RabbitMQConnection extends EventEmitter {
   #isShuttingDown
   #isReconnecting
   #connectPromise
+  #clock
 
   constructor (options, logger) {
     super()
@@ -42,6 +44,11 @@ class RabbitMQConnection extends EventEmitter {
     this.#isShuttingDown = false
     this.#isReconnecting = false
     this.#connectPromise = null
+    // Seam for the reconnection backoff timer. Deliberately NOT wired to the
+    // facade's clock: that one is advanced by tests to drive sweeps and
+    // staleness, and reconnection cycles must keep running on real time
+    // underneath them.
+    this.#clock = options.clock ?? systemClock
 
     if (!['amqp', 'amqps'].includes(this.#protocol)) {
       throw new Error('Invalid protocol. Must be one of: amqp, amqps')
@@ -54,7 +61,7 @@ class RabbitMQConnection extends EventEmitter {
 
   #clearReconnectTimeout () {
     // No guard: clearTimeout tolerates null, and re-nulling is a no-op.
-    clearTimeout(this.#reconnectTimeout)
+    this.#clock.clearTimeout(this.#reconnectTimeout)
     this.#reconnectTimeout = null
   }
 
@@ -95,11 +102,24 @@ class RabbitMQConnection extends EventEmitter {
       try {
         const endpoint = this.#endpoints[this.#currentEndpointIndex]
 
-        this.#connection = await amqp.connect(this.#buildConnectionString(endpoint), {
+        const connection = await amqp.connect(this.#buildConnectionString(endpoint), {
           clientProperties: {
             connection_name: this.#connectionName
           }
         })
+
+        // disconnect() cannot cancel a dial already in flight, so the dial
+        // checks back on its way in: landing after a shutdown would install a
+        // live connection nobody owns (the facade has already torn its pool
+        // down) and flip the state machine back to 'connected'.
+        if (this.#isShuttingDown) {
+          await connection.close().catch(() => {})
+          this.#setConnectionState('disconnected')
+
+          return null
+        }
+
+        this.#connection = connection
 
         this.#connection.on('error', (err) => {
           this.#logger.error(`Connection error: ${err.message}`)
@@ -150,9 +170,9 @@ class RabbitMQConnection extends EventEmitter {
     this.#scheduleReconnect()
   }
 
+  // No shutdown guard: startReconnection, the only caller, checks the same
+  // flag one synchronous statement earlier.
   #scheduleReconnect () {
-    if (this.#isShuttingDown) return
-
     this.#clearReconnectTimeout()
 
     if (this.#maxReconnectAttempts !== Infinity && this.#reconnectAttempt >= this.#maxReconnectAttempts) {
@@ -175,7 +195,7 @@ class RabbitMQConnection extends EventEmitter {
       this.#logger.info(`Reconnection attempt ${this.#reconnectAttempt + 1}/${this.#maxReconnectAttempts} in ${delay}ms`)
     }
 
-    this.#reconnectTimeout = setTimeout(() => {
+    this.#reconnectTimeout = this.#clock.setTimeout(() => {
       this.#attemptReconnect()
     }, delay)
   }

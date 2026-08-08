@@ -93,8 +93,18 @@ export interface PublishOptions {
   rateLimitKey?: string
   rateLimitCost?: number
   cacheTTL?: number
+  /**
+   * Ask the broker to hand the message back instead of dropping it when no
+   * queue is bound for the routing key. Without it an unroutable publish is
+   * discarded in silence and still confirmed, so the caller is told it
+   * succeeded; with it, the publish rejects with `code: 'UNROUTABLE'`.
+   */
+  mandatory?: boolean
   [key: string]: unknown
 }
+
+/** Values of `error.code` on errors rejected by the publish methods. */
+export type PublishErrorCode = 'RATE_LIMIT_EXCEEDED' | 'UNROUTABLE'
 
 /**
  * What happens to a message whose processing failed.
@@ -104,8 +114,14 @@ export interface PublishOptions {
  *   marked `redelivered`, or one whose error carries `retryable === false`,
  *   is dead-lettered instead. Never more than one retry, so a permanently
  *   failing message cannot hot-loop.
+ * - `{ attempts: N }`: a real budget of N deliveries, counted by the broker
+ *   through a quorum queue's `x-delivery-count`. Unlike `'once'` — which
+ *   reads the `redelivered` flag any requeue sets, including one caused by a
+ *   connection drop — this counts actual deliveries. On a classic queue the
+ *   header does not exist and the policy degrades to the `'once'` ceiling
+ *   rather than looping on a budget the broker cannot track.
  */
-export type RetryPolicy = 'none' | 'once'
+export type RetryPolicy = 'none' | 'once' | { attempts: number }
 
 /**
  * Error shape a consumer handler can throw to opt out of the subscription's

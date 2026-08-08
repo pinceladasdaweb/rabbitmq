@@ -1,0 +1,86 @@
+# A three-node RabbitMQ cluster for the cluster integration suite. Kept
+# separate from the standalone compose so the two never fight over ports, and
+# so the default `docker compose up -d` stays a single broker.
+#
+#   docker compose -f docker-compose.cluster.yml up -d --wait
+#   npm run test:cluster
+#
+# What it exists to prove, none of which a single node can:
+#   - endpoint rotation when a node goes down, and recovery of the pool and
+#     consumers on a SURVIVING node;
+#   - that a quorum queue's x-delivery-count — the counter the { attempts: N }
+#     retry budget rests on — survives a leader failover.
+#
+# The three nodes share an Erlang cookie and join into one cluster; each
+# publishes its AMQP port on the host so the client can address them
+# individually and kill one at a time.
+
+x-node: &node
+  image: 'rabbitmq:4.2-management-alpine'
+  restart: unless-stopped
+  environment: &node-env
+    RABBITMQ_ERLANG_COOKIE: cluster-test-cookie
+    RABBITMQ_DEFAULT_USER: ${RMQ_USERNAME:-admin}
+    RABBITMQ_DEFAULT_PASS: ${RMQ_PASSWORD:-admin}
+  healthcheck:
+    test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+    interval: 5s
+    timeout: 10s
+    retries: 20
+    start_period: 20s
+
+services:
+  cluster-node-1:
+    <<: *node
+    container_name: rabbitmq-cluster-1
+    hostname: rabbitmq-cluster-1
+    ports:
+      - '5681:5672'
+      - '15681:15672'
+
+  cluster-node-2:
+    <<: *node
+    container_name: rabbitmq-cluster-2
+    hostname: rabbitmq-cluster-2
+    ports:
+      - '5682:5672'
+      - '15682:15672'
+
+  cluster-node-3:
+    <<: *node
+    container_name: rabbitmq-cluster-3
+    hostname: rabbitmq-cluster-3
+    ports:
+      - '5683:5672'
+      - '15683:15672'
+
+  # Joins nodes 2 and 3 to node 1, then exits. Joining resets the joining
+  # node, so this must run once against fresh containers — which is why the
+  # nodes here keep no volumes: a cluster run always starts clean.
+  cluster-init:
+    image: 'rabbitmq:4.2-management-alpine'
+    environment:
+      <<: *node-env
+    depends_on:
+      cluster-node-1: { condition: service_healthy }
+      cluster-node-2: { condition: service_healthy }
+      cluster-node-3: { condition: service_healthy }
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -e
+        for node in rabbitmq-cluster-2 rabbitmq-cluster-3; do
+          rabbitmqctl -n "rabbit@$${node}" stop_app
+          rabbitmqctl -n "rabbit@$${node}" reset
+          rabbitmqctl -n "rabbit@$${node}" join_cluster rabbit@rabbitmq-cluster-1
+          rabbitmqctl -n "rabbit@$${node}" start_app
+        done
+
+        # Do not report success until every node actually appears in the
+        # cluster: the suite's failover tests are meaningless on a partial one.
+        until [ "$$(rabbitmqctl -n rabbit@rabbitmq-cluster-1 --formatter json cluster_status | grep -o 'rabbitmq-cluster-[0-9]' | sort -u | wc -l)" -ge 3 ]; do
+          echo 'waiting for all three nodes to join...'
+          sleep 2
+        done
+
+        echo 'cluster formed'

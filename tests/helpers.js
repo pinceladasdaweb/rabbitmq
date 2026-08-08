@@ -17,6 +17,13 @@ export const recordingLogger = () => {
 
 export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Consumer tags are unique per CONNECTION on a real broker (amq.ctag-N), not
+// per channel. Restarting the count on each fresh FakeChannel handed the
+// recreated consumer the same tag as the original — which hid the fact that
+// unsubscribe(originalTag) stops working after a reconnection from every test
+// we ever wrote. A process-wide counter is the faithful model.
+let consumerTagSequence = 0
+
 // Node 22's test runner cancels a test whose only pending work is an unref'd
 // timer ('Promise resolution is still pending but the event loop has already
 // resolved') — and both the RPC timeout timer and systemClock.sleep are
@@ -203,8 +210,16 @@ export class FakeChannel extends EventEmitter {
     this.published.push({ exchange, routingKey, content, options })
 
     if (this.returnRoutingKey) {
-      // basic.return reaches the client before the confirm, as the broker does.
-      this.emit('return', { fields: { routingKey: this.returnRoutingKey } })
+      // basic.return reaches the client before the confirm, as the broker
+      // does — and it carries the WHOLE returned message, properties and
+      // headers included. Emitting bare fields let a listener that
+      // correlates on a header look correct while never matching anything.
+      const returned = this.returnRoutingKey === routingKey
+        ? { fields: { routingKey, exchange }, properties: options, content }
+        // A return for someone else's publish on this shared channel.
+        : { fields: { routingKey: this.returnRoutingKey, exchange }, properties: { headers: {} }, content: Buffer.alloc(0) }
+
+      this.emit('return', returned)
     }
 
     if (confirmCallback) {
@@ -257,7 +272,9 @@ export class FakeChannel extends EventEmitter {
   async consume (queue, callback, options) {
     if (this.consumeError) throw this.consumeError
 
-    const consumer = { queue, callback, options, consumerTag: `tag-${++this.consumeSequence}` }
+    this.consumeSequence++
+
+    const consumer = { queue, callback, options, consumerTag: `amq.ctag-${++consumerTagSequence}` }
 
     this.consumers.push(consumer)
 

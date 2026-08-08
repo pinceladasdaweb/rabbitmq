@@ -82,7 +82,8 @@ const createHarness = ({ codecOptions = {}, logger = silentLogger, context: extr
   const consumerChannel = new FakeChannel()
 
   const channelPool = {
-    getDedicatedChannel: async (id) => (id === 'rpc-reply' ? replyChannel : consumerChannel)
+    getDedicatedChannel: async (id) => (id === 'rpc-reply' ? replyChannel : consumerChannel),
+    releaseDedicatedChannel: async () => {}
   }
 
   const context = {

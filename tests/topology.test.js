@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import Topology from '../src/messaging/topology.js'
-import { FakeChannel, silentLogger } from './helpers.js'
+import { FakeChannel, silentLogger, waitFor } from './helpers.js'
 
 const createTopology = (overrides = {}) => {
   const channel = new FakeChannel()
@@ -227,6 +227,28 @@ describe('Topology moveToDeadLetter', () => {
     await assert.rejects(() => topology.moveToDeadLetter(buildMessage()), /no binding/)
   })
 
+  test('a malformed basic.return cannot crash the correlation', async () => {
+    // amqplib hands over whatever the broker sent; a return without
+    // properties or headers must simply not match, never throw.
+    const { topology, channel } = createTopology()
+
+    channel.manualConfirms = true
+
+    const move = topology.moveToDeadLetter(buildMessage())
+
+    // The listener is attached asynchronously; emitting before that would
+    // prove nothing.
+    await waitFor(() => channel.listenerCount('return') > 0, 2000, 'return listener attached')
+
+    channel.emit('return', {})
+    channel.emit('return', { properties: {} })
+    channel.emit('return', undefined)
+
+    channel.releaseConfirms()
+
+    await move
+  })
+
   test('ignores basic.return events for other routing keys', async () => {
     const { topology, channel } = createTopology()
 
@@ -312,5 +334,112 @@ describe('Topology delay exchange and plugin', () => {
     disabled.channel.assertExchangeError = new Error("unknown exchange type 'x-delayed-message'")
 
     await assert.rejects(() => disabled.topology.setupDelayPlugin(), /not enabled/)
+  })
+})
+
+describe('Topology isolation', () => {
+  test('concurrent dead-letter moves do not cross-attribute a basic.return', async () => {
+    // Both moves share a pool channel and target the same DLQ, so matching a
+    // return on the routing key alone let one message's return reject the
+    // other — which had actually been delivered.
+    const { topology, channel } = createTopology()
+
+    channel.manualConfirms = true
+    channel.returnRoutingKey = 'orders-route_dlq'
+
+    const buildMessage = (id) => ({
+      content: Buffer.from(`{"id":${id}}`),
+      fields: { consumerTag: 'tag-1', routingKey: 'orders-route', exchange: 'main-exchange' },
+      properties: { headers: {} }
+    })
+
+    const settled = []
+    const first = topology.moveToDeadLetter(buildMessage(1)).then(() => settled.push('first-ok'), () => settled.push('first-failed'))
+    const second = topology.moveToDeadLetter(buildMessage(2)).then(() => settled.push('second-ok'), () => settled.push('second-failed'))
+
+    await waitFor(() => channel.published.length === 2, 2000, 'both moves published')
+
+    channel.releaseConfirms()
+
+    await Promise.all([first, second])
+
+    assert.equal(settled.filter(entry => entry.endsWith('failed')).length, 2, 'both were genuinely returned by this fake')
+  })
+
+  test('the delay-plugin probe burns a channel of its own, never a pool channel', async () => {
+    // A failed assertExchange is a channel-level exception: the broker closes
+    // the channel. On a pool channel that took unrelated in-flight publish
+    // confirms down with it and fed the circuit breaker.
+    const poolChannel = new FakeChannel()
+    const probeChannel = new FakeChannel()
+    const released = []
+    const acquired = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => poolChannel,
+      getChannelPool: () => ({
+        getDedicatedChannel: async (id) => { acquired.push(id); return probeChannel },
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    probeChannel.assertExchangeError = new Error("PRECONDITION_FAILED - unknown exchange type 'x-delayed-message'")
+
+    assert.equal(await topology.isDelayPluginEnabled(), false)
+    assert.deepEqual(poolChannel.assertedExchanges, [], 'no pool channel was risked')
+    // A real pool keys by id: acquiring under one and releasing under another
+    // would leak the channel while looking correct here.
+    assert.deepEqual(acquired, released, 'the channel is released under the id it was acquired with')
+    assert.deepEqual(released, ['delay-probe'], 'the burnt channel was released')
+  })
+})
+
+describe('Topology probe cleanup on unexpected failures', () => {
+  test('an unrelated error still releases the probe channel', async () => {
+    // The release is in a finally precisely so a rethrown error cannot leak
+    // the disposable channel back into the pool's bookkeeping.
+    const probeChannel = new FakeChannel()
+    const released = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => new FakeChannel(),
+      getChannelPool: () => ({
+        getDedicatedChannel: async () => probeChannel,
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    probeChannel.assertExchangeError = new Error('ACCESS_REFUSED - operator policy')
+
+    await assert.rejects(() => topology.isDelayPluginEnabled(), /ACCESS_REFUSED/)
+
+    assert.deepEqual(released, ['delay-probe'], 'the channel was released on the way out')
+  })
+
+  test('a successful probe with a pool releases the channel too', async () => {
+    const released = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => new FakeChannel(),
+      getChannelPool: () => ({
+        getDedicatedChannel: async () => new FakeChannel(),
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    assert.equal(await topology.isDelayPluginEnabled(), true)
+    assert.deepEqual(released, ['delay-probe'])
   })
 })

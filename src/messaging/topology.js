@@ -1,7 +1,10 @@
+import { randomUUID } from 'node:crypto'
+
 class Topology {
   constructor (context) {
     this.logger = context.logger
     this.getChannel = context.getChannel
+    this.getChannelPool = context.getChannelPool
     this.getExchange = context.getExchange
     this.deadLetterExchange = context.deadLetterExchange
     this.delayExchange = context.delayExchange
@@ -77,6 +80,12 @@ class Topology {
     const deadLetterQueue = `${sourceQueue || message.fields.routingKey}_dlq`
     const channel = await this.getChannel()
 
+    // Concurrent moves share a pool channel, and a basic.return only carries
+    // the routing key — matching on that alone let one message's return
+    // reject a different message that had actually been delivered. The token
+    // comes back on the returned message, so each move recognises its own.
+    const returnToken = randomUUID()
+
     const properties = {
       ...message.properties,
       persistent: true,
@@ -85,6 +94,7 @@ class Topology {
       mandatory: true,
       headers: {
         ...message.properties.headers,
+        'x-dlq-token': returnToken,
         'x-death-reason': reason,
         'x-death-time': new Date().toISOString(),
         'x-original-exchange': message.fields.exchange,
@@ -96,7 +106,7 @@ class Topology {
       let returned = false
 
       const onReturn = (returnedMessage) => {
-        if (returnedMessage.fields.routingKey === deadLetterQueue) {
+        if (returnedMessage?.properties?.headers?.['x-dlq-token'] === returnToken) {
           returned = true
         }
       }
@@ -151,10 +161,26 @@ class Topology {
     }
   }
 
-  async isDelayPluginEnabled () {
-    try {
-      const channel = await this.getChannel()
+  // The probe is EXPECTED to fail on a broker without the plugin, and a failed
+  // assertExchange is a channel-level exception: the broker closes the channel
+  // it ran on. On a pool channel that took unrelated in-flight publishes down
+  // with it and fed the circuit breaker, so the probe gets a channel of its
+  // own to burn.
+  async #probeChannel () {
+    const channelPool = this.getChannelPool?.()
 
+    if (!channelPool) return { channel: await this.getChannel(), release: async () => {} }
+
+    return {
+      channel: await channelPool.getDedicatedChannel('delay-probe'),
+      release: () => channelPool.releaseDedicatedChannel('delay-probe')
+    }
+  }
+
+  async isDelayPluginEnabled () {
+    const { channel, release } = await this.#probeChannel()
+
+    try {
       await channel.assertExchange('test.delay', 'x-delayed-message', {
         durable: false,
         arguments: { 'x-delayed-type': 'direct' }
@@ -171,6 +197,10 @@ class Topology {
       }
 
       throw error
+    } finally {
+      // The probe channel is disposable either way: on failure the broker has
+      // already closed it, on success it has served its one purpose.
+      await release()
     }
   }
 }

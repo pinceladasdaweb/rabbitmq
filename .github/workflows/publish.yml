@@ -1,8 +1,11 @@
 name: Publish package
+# Gated on CI, never on the push itself: an npm version is immutable, so it
+# must not go out while the test matrix is still running (or already red).
+# This fires only after CI for main has finished, and only if it went green.
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
 permissions:
   contents: write
   # Required for OIDC trusted publishing: npm exchanges the workflow's
@@ -17,10 +20,14 @@ jobs:
   publish-npm:
     name: Publish package on npm
     runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # workflow_run checks out the default branch by default; be explicit,
+          # since this job commits the version bump back to it.
+          ref: main
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -38,10 +45,13 @@ jobs:
       - name: Install dependencies
         run: |
           npm install
-      - name: Lint and unit tests
+      # CI already proved this commit across the whole matrix; this is the
+      # cheap last look at exactly the tree about to be packed.
+      - name: Lint, unit tests and types
         run: |
           npx standard src/ tests/
           npm test
+          npm run check:types
       - name: Bump version based on commit message
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%B)
@@ -136,7 +146,16 @@ jobs:
         run: |
           NEW_VERSION=$(node -p "require('./package.json').version")
 
-          awk "/^## ${NEW_VERSION} /{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md > /tmp/release-notes.md
+          awk -v version="## ${NEW_VERSION} " '
+            index($0, version) == 1 { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+
+          {
+            echo
+            echo "Installed with \`npm install @pinceladasdaweb/rabbitmq@${NEW_VERSION}\`, published from this workflow with provenance."
+          } >> /tmp/release-notes.md
 
           if gh release view "v$NEW_VERSION" >/dev/null 2>&1; then
             echo "Release v$NEW_VERSION already exists, skipping"

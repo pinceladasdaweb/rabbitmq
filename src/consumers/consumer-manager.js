@@ -106,11 +106,15 @@ class ConsumerManager {
   #resolveRetryPolicy (retryPolicy, defaultPolicy) {
     const policy = retryPolicy ?? defaultPolicy
 
-    if (policy !== 'none' && policy !== 'once') {
-      throw new Error(`Invalid retryPolicy '${policy}': expected 'none' or 'once'`)
-    }
+    if (policy === 'none' || policy === 'once') return policy
 
-    return policy
+    // { attempts: N } — a real budget, honoured exactly on quorum queues
+    // (see #shouldRequeue).
+    if (Number.isInteger(policy?.attempts) && policy.attempts > 0) return policy
+
+    const shown = typeof policy === 'object' && policy !== null ? JSON.stringify(policy) : String(policy)
+
+    throw new Error(`Invalid retryPolicy '${shown}': expected 'none', 'once' or { attempts: <positive integer> }`)
   }
 
   // The single place that decides whether a failed message goes back to the
@@ -125,14 +129,31 @@ class ConsumerManager {
   // Caveat of the `redelivered` flag: the broker sets it on ANY requeue, not
   // just ours. An unacked message returned to the queue after a connection
   // drop arrives redelivered too, so an infrastructure event can consume the
-  // retry budget before the handler ever fails. AMQP offers no redelivery
-  // counter on classic queues; use a quorum queue's x-delivery-count if you
-  // need a true attempt budget.
+  // retry budget before the handler ever fails. Classic queues offer no
+  // redelivery counter at all — { attempts: N } uses a quorum queue's
+  // x-delivery-count, which counts real deliveries and is immune to that.
   #shouldRequeue (message, error, retryPolicy) {
-    if (retryPolicy !== 'once') return false
+    if (retryPolicy === 'none') return false
     if (error?.retryable === false) return false
 
-    return !message.fields?.redelivered
+    if (retryPolicy === 'once') return !message.fields?.redelivered
+
+    // x-delivery-count is the number of PRIOR deliveries, so this delivery is
+    // number deliveryCount + 1: requeue while the budget still has room.
+    const deliveryCount = Number(message.properties?.headers?.['x-delivery-count'])
+
+    if (Number.isFinite(deliveryCount)) return deliveryCount + 1 < retryPolicy.attempts
+
+    // No counter. Verified against a real broker: a quorum queue OMITS the
+    // header on the first delivery and only starts sending it (at 1) from the
+    // redelivery on — so an absent header on a first delivery is normal and
+    // the budget still applies, with attempts: 1 meaning "no retry at all".
+    if (!message.fields?.redelivered) return retryPolicy.attempts > 1
+
+    // Absent on a REDELIVERY means the queue does not count at all (classic):
+    // fall back to the one-shot ceiling rather than looping forever on a
+    // budget the broker cannot track.
+    return false
   }
 
   registerConsumer (queueName, setup) {
@@ -143,6 +164,10 @@ class ConsumerManager {
       setup,
       channel: null,
       consumerTag: null,
+      // Every tag this consumer has ever answered to (see #trackConsumerTag).
+      knownTags: new Set(),
+      // The channel whose lifecycle we are already watching (#watchChannelLoss).
+      watchedChannel: null,
       cancelled: false,
       sequentialProcessor: null,
       epoch: 0
@@ -151,22 +176,39 @@ class ConsumerManager {
     return consumerId
   }
 
+  // Recreating a consumer gets a NEW tag from the broker, but the caller only
+  // ever holds the one subscribe() returned. Retiring the old tag here made
+  // unsubscribe(originalTag) silently answer false after the first
+  // reconnection, leaving the consumer (and its worker pool) running with no
+  // way to stop it — the tag it now answers to is not exposed anywhere. So
+  // every tag a consumer has held stays a valid handle for its whole life;
+  // the set is bounded by that consumer's recreation count and is dropped
+  // wholesale with it.
   #trackConsumerTag (consumerId, consumerInfo, consumerTag) {
-    if (consumerInfo.consumerTag) {
-      this.consumersByTag.delete(consumerInfo.consumerTag)
-    }
-
     consumerInfo.consumerTag = consumerTag
+    consumerInfo.knownTags.add(consumerTag)
     this.consumersByTag.set(consumerTag, consumerId)
   }
 
-  #dropConsumer (consumerId, consumerInfo) {
-    if (consumerInfo.consumerTag) {
-      this.consumersByTag.delete(consumerInfo.consumerTag)
+  // The single place a consumer is removed, so it owns every resource the
+  // consumer holds. The worker pool used to be terminated only on the
+  // unsubscribe path, which left threads running (and the process unable to
+  // exit) whenever recovery gave up on a consumer instead.
+  async #dropConsumer (consumerId, consumerInfo) {
+    for (const tag of consumerInfo.knownTags) {
+      this.consumersByTag.delete(tag)
     }
 
+    consumerInfo.knownTags.clear()
     consumerInfo.sequentialProcessor?.dispose()
     this.activeConsumers.delete(consumerId)
+
+    const workerPool = this.workerPools.get(consumerId)
+
+    if (workerPool) {
+      this.workerPools.delete(consumerId)
+      await workerPool.terminate()
+    }
   }
 
   // Every consumer (re)creation goes through here. The epoch lets concurrent
@@ -185,7 +227,7 @@ class ConsumerManager {
     try {
       return await this.runSetup(consumerInfo)
     } catch (error) {
-      this.#dropConsumer(consumerId, consumerInfo)
+      await this.#dropConsumer(consumerId, consumerInfo)
 
       throw error
     }
@@ -203,15 +245,54 @@ class ConsumerManager {
     return consumerId ? this.activeConsumers.get(consumerId).queueName : null
   }
 
+  // A consumer's dedicated channel can die on its own — a channel-level
+  // exception (PRECONDITION_FAILED, ACCESS_REFUSED) closes it while the
+  // connection stays perfectly healthy. amqplib only delivers the null
+  // message on a broker basic.cancel, never on a channel close, so without
+  // this watcher the consumer simply stopped draining its queue in silence:
+  // no cancel, no reconnection, no log.
+  //
+  // Registered per CHANNEL, not per setup: recoveries that reuse the cached
+  // channel would otherwise stack a listener each time.
+  #watchChannelLoss (consumerId, consumerInfo, channel) {
+    if (consumerInfo.watchedChannel === channel) return
+
+    consumerInfo.watchedChannel = channel
+
+    channel.once('close', () => {
+      // State tied to the dead channel goes with it either way.
+      consumerInfo.sequentialProcessor?.dispose()
+
+      const channelPool = this.getChannelPool()
+
+      // A pool teardown (disconnect, or a connection that dropped) closes
+      // every channel too; that path belongs to recreateAll, and racing it
+      // here would duplicate consumers or burn the retry budget against a
+      // broker that is not there.
+      if (!channelPool || channelPool.closed) return
+      if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
+
+      this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+    })
+  }
+
   // Broker-initiated cancellation (e.g. queue deleted): notify and try to
   // recreate the consumer with backoff; on giving up, remove it and emit consumerLost.
   async handleBrokerCancel (consumerId) {
     const consumerInfo = this.activeConsumers.get(consumerId)
 
+    if (!consumerInfo) return
+
+    return this.handleConsumerLoss(consumerId, `consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
+  }
+
+  async handleConsumerLoss (consumerId, reason) {
+    const consumerInfo = this.activeConsumers.get(consumerId)
+
     if (!consumerInfo || consumerInfo.cancelled) return
 
-    this.logger.warn(`Consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
-    this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag })
+    this.logger.warn(`Recovering consumer: ${reason}`)
+    this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag, reason })
 
     const maxAttempts = 3
     let knownEpoch = consumerInfo.epoch
@@ -241,7 +322,7 @@ class ConsumerManager {
       }
     }
 
-    this.#dropConsumer(consumerId, consumerInfo)
+    await this.#dropConsumer(consumerId, consumerInfo)
     this.logger.error(`Consumer for queue ${consumerInfo.queueName} could not be recovered and was removed`)
     this.emit('consumerLost', { queueName: consumerInfo.queueName })
   }
@@ -301,6 +382,7 @@ class ConsumerManager {
 
       consumerInfo.channel = channel
       this.#trackConsumerTag(consumerId, consumerInfo, consumer.consumerTag)
+      this.#watchChannelLoss(consumerId, consumerInfo, channel)
 
       return consumer
     })
@@ -375,8 +457,10 @@ class ConsumerManager {
           }
         })
 
+        // The channel's own teardown is handled by #watchChannelLoss, which
+        // disposes whatever processor is current — attaching a listener here
+        // would stack one more on every recovery that reuses this channel.
         consumerInfo.sequentialProcessor = processor
-        channel.on('close', () => processor.dispose())
 
         return (content, msg) => processor.handle(content, msg)
       }
@@ -394,20 +478,22 @@ class ConsumerManager {
 
     try {
       if (consumerInfo.channel) {
-        await consumerInfo.channel.cancel(consumerTag)
+        // The broker only knows the tag from the CURRENT consume — the caller
+        // may legitimately be holding an older alias (see #trackConsumerTag),
+        // and cancelling that one would leave the consumer running.
+        await consumerInfo.channel.cancel(consumerInfo.consumerTag)
       }
     } catch (error) {
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
     }
 
-    const workerPool = this.workerPools.get(consumerId)
+    await this.#dropConsumer(consumerId, consumerInfo)
 
-    if (workerPool) {
-      await workerPool.terminate()
-      this.workerPools.delete(consumerId)
-    }
+    // The dedicated channel exists for this consumer alone; leaving it open
+    // leaked one channel per subscribe/unsubscribe cycle until the connection
+    // hit channel_max and the broker refused every new one.
+    await this.getChannelPool()?.releaseDedicatedChannel(consumerId)
 
-    this.#dropConsumer(consumerId, consumerInfo)
     this.logger.info(`Unsubscribed consumer ${consumerTag} from queue ${consumerInfo.queueName}`)
 
     return true
@@ -501,8 +587,9 @@ class ConsumerManager {
       prefetchCount: currentPrefetch
     })
 
+    // subscribe() registered this tag one line ago, so the lookup cannot miss.
     consumerId = this.findConsumerIdByTag(consumer.consumerTag)
-    knownEpoch = consumerId ? this.activeConsumers.get(consumerId).epoch : null
+    knownEpoch = this.activeConsumers.get(consumerId).epoch
 
     return consumer
   }

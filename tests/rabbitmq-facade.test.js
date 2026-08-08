@@ -1018,6 +1018,81 @@ describe('RabbitMQ facade survivor round', () => {
     await rabbit.publish('orders-route', { n: 1 })
   })
 
+  test('the tag subscribe() returned still cancels the consumer after a reconnection', async (t) => {
+    // The broker issues a fresh tag on recreation and the caller has no way to
+    // learn it — the old behavior retired the original tag, so unsubscribe
+    // answered false and the consumer (plus its worker pool) kept running.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    const consumer = await rabbit.subscribe('orders', async () => {})
+    const originalTag = consumer.consumerTag
+
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await reconnected
+
+    const liveConsumer = dialer.connections.at(-1).consumersOn()[0]
+
+    assert.notEqual(liveConsumer.consumerTag, originalTag, 'the broker really did issue a new tag')
+    assert.equal(await rabbit.unsubscribe(originalTag), true, 'the caller-held tag must still work')
+    assert.equal(dialer.connections.at(-1).channels.some(channel => channel.cancelled.length > 0), true, 'the cancel reached the broker')
+  })
+
+  test('a restore that fails AFTER the pool was built is retried in full', async (t) => {
+    // The pool is only half the restore. Leaving it installed after
+    // ensureExchange/recreateAll failed satisfied #doConnect's gate, so the
+    // retry resolved as a success onto an instance with no exchange and no
+    // consumers.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    let exchangeSick = true
+
+    dialer.onConnection = (connection) => {
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        const channel = await realCreate()
+
+        if (exchangeSick) channel.assertExchangeError = new Error('exchange under maintenance')
+
+        return channel
+      }
+    }
+
+    const restoreFailed = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
+    dialer.connections[0].emit('close')
+    await restoreFailed
+
+    exchangeSick = false
+
+    for (const connection of dialer.connections) {
+      for (const channel of connection.channels) channel.assertExchangeError = null
+    }
+
+    await rabbit.connect()
+    await sleep(30)
+
+    const live = dialer.connections.at(-1)
+
+    assert.equal(live.consumersOn().length, 1, 'the retry recreated the consumer')
+    assert.ok(live.channels.some(channel => channel.assertedExchanges.length > 0), 'and asserted the exchange')
+
+    await rabbit.publish('orders-route', { n: 1 })
+  })
+
   test('waitForConnection leaves no listeners or timer behind once it resolves', async (t) => {
     const { ManualClock } = await import('./helpers.js')
     const clock = new ManualClock()
@@ -1185,5 +1260,91 @@ describe('RabbitMQ facade cache accounting', () => {
 
     await defaulted.rabbit.publishWithCache('route', { n: 1 })
     assert.ok(defaultedLogger.records.info.some(line => line.includes('TTL: 60s')), 'the default stdTTL is 60s')
+  })
+})
+
+describe('RabbitMQ facade connect/disconnect fencing', () => {
+  test('disconnect() aborts a waitForConnection instead of hanging it forever', async (t) => {
+    // The wait lives on reconnection cycles that disconnect() ends, so nothing
+    // would ever settle it — and since #connectPromise is only released in its
+    // finally, EVERY later connect() would get the same dead promise.
+    const dialer = createDialer([new Error('down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 60000, maxReconnectInterval: 60000 })
+
+    t.after(() => rabbit.disconnect())
+
+    // The handler is attached up front: a rejection sitting unhandled for even
+    // one tick takes the whole test process down with it.
+    const waiting = rabbit.connect({ waitForConnection: true }).then(() => null, (error) => error)
+
+    await sleep(20)
+    await rabbit.disconnect()
+
+    const error = await waiting
+
+    assert.match(error.message, /Connection wait aborted/)
+
+    // The funnel must be usable again: a fresh connect() gets a fresh attempt
+    // instead of the dead promise the aborted wait left behind.
+    const connection = await rabbit.connect()
+
+    assert.ok(connection, 'the instance recovered instead of staying poisoned')
+  })
+})
+
+describe('RabbitMQ facade teardown failures', () => {
+  test('a failed restore whose pool refuses to close still fails cleanly', async (t) => {
+    // Tearing the partial pool down is best-effort: a close that rejects must
+    // not replace the real restore error with a teardown one.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    dialer.onConnection = (connection) => {
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        const channel = await realCreate()
+
+        channel.assertExchangeError = new Error('exchange under maintenance')
+        channel.close = async () => { throw new Error('channel wedged') }
+
+        return channel
+      }
+    }
+
+    const failed = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
+    dialer.connections[0].emit('close')
+
+    const restoreError = await failed
+
+    assert.match(restoreError.message, /exchange under maintenance/, 'the real cause survives the failed teardown')
+  })
+
+  test('a disconnection whose stale pool refuses to close still recovers', async (t) => {
+    // The stale pool is closed best-effort on the way out; a rejection there
+    // must not derail the recovery that follows.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    for (const channel of dialer.connections[0].channels) {
+      channel.close = async () => { throw new Error('channel wedged') }
+    }
+
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await reconnected
+
+    assert.equal(dialer.connections.at(-1).consumersOn().length, 1, 'recovery completed despite the wedged teardown')
   })
 })

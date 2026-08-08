@@ -821,3 +821,62 @@ describe('RabbitMQ rate limiting and DLQ processing (fake dialer)', () => {
     assert.deepEqual(consumerChannel.nacked.map(n => n.requeue), [false], 'the crashing one is settled, not requeued')
   })
 })
+
+describe('RabbitMQ stale restore teardown', () => {
+  test('a stale restore failing late must not tear down the live pool', async (t) => {
+    // The interleaving the ownership check in #doRestoreState exists for: a
+    // restore installs its pool, stalls, gets superseded by a newer restore
+    // that installs ITS pool — and only then fails. Tearing down "the pool"
+    // at that point would take the live one with it and leave the client
+    // unable to publish, with nothing left to trigger another recovery.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, { channelPoolSize: 1 })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    let releaseExchange
+    const exchangeGate = new Promise(resolve => { releaseExchange = resolve })
+
+    // Only the FIRST recovery connection stalls, then fails, in ensureExchange.
+    dialer.onConnection = (connection) => {
+      if (dialer.connections.length !== 2) return
+
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        const channel = await realCreate()
+
+        channel.assertExchange = async () => {
+          await exchangeGate
+
+          throw new Error('stale restore lost the exchange')
+        }
+
+        return channel
+      }
+    }
+
+    dialer.connections[0].emit('close')
+    await waitFor(() => dialer.connections.length === 2, 3000, 'first recovery connection')
+    await sleep(50)
+
+    // Second drop while that restore is parked inside ensureExchange.
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    dialer.connections[1].emit('close')
+    await waitFor(() => dialer.connections.length === 3, 3000, 'second recovery connection')
+    await reconnected
+
+    // The stale restore now fails, long after a newer one took over.
+    releaseExchange()
+    await sleep(80)
+
+    // The proof is a working client, not a field: publishing needs the pool
+    // the newer restore installed to still be there.
+    await rabbit.publish('orders-route', { survived: true })
+
+    assert.equal(dialer.connections.at(-1).publishedOn().length, 1, 'the live pool was left alone')
+  })
+})

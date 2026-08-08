@@ -31,6 +31,9 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //   - channel-pool.js getChannel's ring scan `i < length` -> `<=`: the extra
 //     iteration re-reads a slot the ring already visited — it can neither
 //     find a channel the scan missed nor change the throw.
+//   - channel-pool.js releaseDedicatedChannel's `if (!channel) return`:
+//     deleting an absent Map key is a no-op and #closeChannel guards its own
+//     null, so forcing the branch changes nothing observable.
 //   - channel-pool.js #closeChannel's `!channel || typeof close` guard: the
 //     try/catch right below already swallows the TypeError a null slot (or a
 //     close-less channel) would produce — the guard is an early exit whose
@@ -95,6 +98,19 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     just registered the tag, so the lookup cannot miss; the guard is
 //     defensive against a bookkeeping break that would already fail louder
 //     elsewhere.
+//   - consumer-manager.js #resolveRetryPolicy's `policy?.attempts` and the
+//     `policy !== null` arm of its error rendering: `retryPolicy ?? default`
+//     runs first and every default is a non-null string, so policy is never
+//     nullish by the time either is evaluated.
+//   - consumer-manager.js #shouldRequeue's `message.properties?.` and
+//     `message.fields?.`: the consume pipeline dereferences msg.properties
+//     unguarded several lines earlier (reading the compression header) and
+//     amqplib always delivers fields, so neither can be absent by the time
+//     the retry decision runs.
+//   - consumer-manager.js #shouldRequeue's `retryPolicy === 'none'` early
+//     return: falling through reaches the budget branch, where 'none'.attempts
+//     is undefined and `undefined > 1` is false — the same no-requeue answer
+//     by a longer road.
 //   - consumer-manager.js disposeAll's cancelled = true: the loop is
 //     synchronous and activeConsumers.clear() follows immediately, so no
 //     concurrent observer can see the flag between the two.

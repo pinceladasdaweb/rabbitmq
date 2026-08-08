@@ -647,3 +647,100 @@ describe('RabbitMQ integration', { skip: !RUN_INTEGRATION && 'set RABBITMQ_INTEG
     }
   })
 })
+
+// The retry budget rests entirely on a broker-side counter, so a fake can only
+// ever agree with whatever we assumed. It cost us: the first version shipped
+// believing x-delivery-count starts at 0 on the first delivery. The broker
+// omits the header entirely until the redelivery, which made { attempts: 1 }
+// retry once instead of never.
+describe('RabbitMQ quorum queue retry budget', { skip: !RUN_INTEGRATION && 'set RABBITMQ_INTEGRATION=1 (requires a running broker)' }, () => {
+  const QUORUM_EXCHANGE = 'integration-quorum-exchange'
+  const QUORUM_ROUTE = 'quorum-route'
+
+  const withBudget = async (queueName, attempts, run) => {
+    const client = new RabbitMQ({
+      username: USERNAME,
+      password: PASSWORD,
+      endpoints: [`${HOST}:${AMQP_PORT}`],
+      connectionName: `quorum-${attempts}`,
+      exchange: { name: QUORUM_EXCHANGE, type: 'direct' },
+      logger: silentLogger
+    })
+
+    await client.connect()
+
+    const channel = await client.getChannel()
+
+    await channel.deleteQueue(queueName).catch(() => {})
+    await channel.deleteQueue(`${queueName}_dlq`).catch(() => {})
+    await client.setupDeadLetterExchange()
+    await client.createQueue(queueName, { arguments: { 'x-queue-type': 'quorum' } })
+    await channel.bindQueue(queueName, QUORUM_EXCHANGE, QUORUM_ROUTE)
+
+    try {
+      return await run(client, channel)
+    } finally {
+      await channel.deleteQueue(queueName).catch(() => {})
+      await channel.deleteQueue(`${queueName}_dlq`).catch(() => {})
+      await client.disconnect()
+    }
+  }
+
+  test('{ attempts: 3 } delivers a failing message exactly three times', async () => {
+    await withBudget('integration-quorum-3', 3, async (client) => {
+      const deliveries = []
+
+      await client.subscribe('integration-quorum-3', async (content, message) => {
+        deliveries.push(message.properties.headers?.['x-delivery-count'] ?? 'absent')
+
+        throw new Error('always fails')
+      }, { retryPolicy: { attempts: 3 } })
+
+      await client.publish(QUORUM_ROUTE, { n: 1 })
+
+      await waitFor(() => deliveries.length >= 3, 15000, 'three deliveries')
+      await sleep(1000)
+
+      assert.equal(deliveries.length, 3, 'the budget is a ceiling, not a suggestion')
+      assert.deepEqual(deliveries, ['absent', 1, 2], 'the header appears only from the redelivery on')
+    })
+  })
+
+  test('{ attempts: 1 } delivers exactly once, never retrying', async () => {
+    // This is the case the fake got wrong: with no header on the first
+    // delivery, a naive fallback treats it as a classic queue and retries.
+    await withBudget('integration-quorum-1', 1, async (client) => {
+      let deliveries = 0
+
+      await client.subscribe('integration-quorum-1', async () => {
+        deliveries++
+
+        throw new Error('always fails')
+      }, { retryPolicy: { attempts: 1 } })
+
+      await client.publish(QUORUM_ROUTE, { n: 1 })
+
+      await waitFor(() => deliveries >= 1, 15000, 'first delivery')
+      await sleep(1500)
+
+      assert.equal(deliveries, 1, 'a budget of one must behave exactly like none')
+    })
+  })
+
+  test('an unroutable mandatory publish is reported instead of vanishing', async () => {
+    // No binding exists for this key, so the broker would silently drop it.
+    await withBudget('integration-quorum-unroutable', 1, async (client) => {
+      await assert.rejects(
+        () => client.publish('no-binding-for-this-key', { n: 1 }, { mandatory: true, maxRetries: 1 }),
+        (error) => {
+          assert.equal(error.code, 'UNROUTABLE')
+
+          return true
+        }
+      )
+
+      // And without mandatory the broker's silent drop is still the contract.
+      await client.publish('no-binding-for-this-key', { n: 1 })
+    })
+  })
+})

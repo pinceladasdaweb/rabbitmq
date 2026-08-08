@@ -35,6 +35,7 @@ class RabbitMQ extends EventEmitter {
   #connectPromise
   #restorePromise
   #clock
+  #connectionWaiters
 
   constructor (options = {}) {
     super()
@@ -54,6 +55,7 @@ class RabbitMQ extends EventEmitter {
     // sequential staleness, recovery backoffs, RPC deadlines). Injectable so
     // tests drive all of them from a single fake without sleeping.
     this.#clock = options.clock ?? systemClock
+    this.#connectionWaiters = new Set()
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -206,10 +208,35 @@ class RabbitMQ extends EventEmitter {
     return this.#restorePromise
   }
 
+  // The whole restore is one unit: #doConnect gates on `!this.#channelPool`,
+  // so "pool present" has to mean "state fully restored". Leaving the pool
+  // behind after a later step failed satisfied that gate with the exchange
+  // unasserted and the consumers never recreated — a retried connect()
+  // resolved as a success onto a half-dead instance. On failure the pool goes
+  // back to null so the next attempt genuinely retries.
   async #doRestoreState () {
-    await this.#setupChannelPool()
-    await this.#topology.ensureExchange()
-    await this.#consumers.recreateAll()
+    let installedPool = null
+
+    try {
+      installedPool = await this.#setupChannelPool()
+
+      await this.#topology.ensureExchange()
+      await this.#consumers.recreateAll()
+    } catch (error) {
+      // Only tear down the pool THIS restore installed: a stale restore
+      // failing late (the flapping-broker case, fenced inside
+      // #setupChannelPool) must not clear the pool a newer restore already
+      // put in place — same ownership discipline as the fence itself.
+      if (installedPool && this.#channelPool === installedPool) {
+        this.#channelPool = null
+        // ChannelPool.close() swallows per-channel teardown failures by
+        // contract (pinned by its own test), so this cannot reject and mask
+        // the restore error we are about to rethrow.
+        await installedPool.close()
+      }
+
+      throw error
+    }
 
     // Failures accumulated against the previous connection say nothing
     // about the fresh one — do not keep publishing blocked after recovery.
@@ -245,7 +272,7 @@ class RabbitMQ extends EventEmitter {
       const staleChannelPool = this.#channelPool
 
       this.#channelPool = null
-      staleChannelPool.close().catch(() => {})
+      staleChannelPool.close()
     }
 
     this.emit('disconnected')
@@ -276,6 +303,8 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#channelPool = channelPool
+
+    return channelPool
   }
 
   // Concurrent connect() callers share a single in-flight attempt: two
@@ -316,13 +345,25 @@ class RabbitMQ extends EventEmitter {
     return new Promise((resolve, reject) => {
       let timer = null
 
+      const abort = (error) => {
+        cleanup()
+        reject(error)
+      }
+
       const cleanup = () => {
         this.off('reconnected', onReconnected)
         this.off('reconnectFailed', onReconnectFailed)
         this.off('reconnectError', onReconnectError)
+        this.#connectionWaiters.delete(abort)
 
         if (timer) this.#clock.clearTimeout(timer)
       }
+
+      // disconnect() stops the reconnection cycles this promise is waiting on,
+      // so without an explicit abort it would never settle — and since
+      // #connectPromise is only released in its finally, EVERY later connect()
+      // would receive the same dead promise.
+      this.#connectionWaiters.add(abort)
 
       const onReconnected = () => {
         cleanup()
@@ -356,6 +397,12 @@ class RabbitMQ extends EventEmitter {
   }
 
   async disconnect () {
+    // Before anything else: whoever is parked in connect({ waitForConnection })
+    // is waiting for a reconnection cycle this shutdown is about to end.
+    for (const abort of [...this.#connectionWaiters]) {
+      abort(new Error('Connection wait aborted: the client was disconnected'))
+    }
+
     try {
       this.#rpc.handleConnectionLoss('client disconnected')
 

@@ -15,7 +15,9 @@ const createManager = (overrides = {}) => {
   const events = []
 
   const channelPool = {
-    getDedicatedChannel: async () => channel
+    released: [],
+    getDedicatedChannel: async () => channel,
+    releaseDedicatedChannel: async (id) => { channelPool.released.push(id) }
   }
 
   const context = {
@@ -31,7 +33,7 @@ const createManager = (overrides = {}) => {
     ...overrides
   }
 
-  return { manager: new ConsumerManager(context), channel, codec, events }
+  return { manager: new ConsumerManager(context), channel, channelPool, codec, events }
 }
 
 const deliver = async (harness, payload, properties = {}) => {
@@ -376,7 +378,11 @@ describe('ConsumerManager lifecycle', () => {
     assert.equal(await harness.manager.unsubscribe('unknown-tag'), false)
   })
 
-  test('recreateAll re-runs every setup and re-tracks the new consumer tags', async () => {
+  test('recreateAll re-runs every setup and keeps the original tag valid', async () => {
+    // The caller only ever holds the tag subscribe() returned. Retiring it on
+    // recreation made unsubscribe(originalTag) answer false after the first
+    // reconnection, with no way to learn the new tag — so every tag the
+    // consumer has held stays a valid handle for its whole life.
     const harness = createManager()
 
     const consumer = await harness.manager.subscribe('orders', async () => {})
@@ -387,9 +393,21 @@ describe('ConsumerManager lifecycle', () => {
 
     const newTag = harness.channel.consumers.at(-1).consumerTag
 
-    assert.notEqual(newTag, consumer.consumerTag)
+    assert.notEqual(newTag, consumer.consumerTag, 'the broker issued a fresh tag')
     assert.equal(harness.manager.findQueueNameByTag(newTag), 'orders')
-    assert.equal(harness.manager.findQueueNameByTag(consumer.consumerTag), null, 'stale tag dropped')
+    assert.equal(harness.manager.findQueueNameByTag(consumer.consumerTag), 'orders', 'the original tag still resolves')
+  })
+
+  test('unsubscribe with the original tag still works after a recreation', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    await harness.manager.recreateAll()
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true, 'the caller-held tag must still cancel')
+    assert.equal(harness.manager.activeConsumers.size, 0)
+    assert.equal(harness.manager.consumersByTag.size, 0, 'every alias went with the consumer')
   })
 
   test('recreateAll survives a consumer that fails to recreate', async () => {
@@ -1570,5 +1588,337 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     assert.equal(spawned[1].terminated, true, 'disposeAll shut the second pool down')
     assert.equal(clock.intervals.size, 0, 'disposeAll disposed the sequential processor too')
     assert.equal(base.manager.activeConsumers.size, 0)
+  })
+})
+
+describe('ConsumerManager channel-level loss', () => {
+  test('a dedicated channel closing on a live connection recovers the consumer', async () => {
+    // amqplib delivers the null message only on a broker basic.cancel, never
+    // on a channel close — so a channel-level exception (PRECONDITION_FAILED,
+    // ACCESS_REFUSED) used to kill the consumer in total silence while the
+    // connection stayed healthy.
+    const clock = new ManualClock()
+    const logger = recordingLogger()
+    const harness = createManager({ clock, logger, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.channel.emit('close')
+    clock.advance(10)
+
+    await waitFor(() => harness.channel.consumers.length > consumesBefore, 2000, 'consumer recreated')
+
+    assert.ok(
+      logger.records.warn.some(line => line.includes('closed unexpectedly')),
+      'the loss is reported with a reason naming the channel'
+    )
+    assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer survived')
+  })
+
+  test('the pool tearing down does NOT trigger per-channel recovery', async () => {
+    // disconnect() and connection loss close every channel; that path belongs
+    // to recreateAll. Racing it here would duplicate consumers or burn the
+    // retry budget against a broker that is not there.
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.channelPool.closed = true
+    harness.channel.emit('close')
+    clock.advance(100)
+    await sleep(20)
+
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation while the pool is closing')
+  })
+
+  test('recoveries that reuse the channel do not stack close listeners', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const baseline = harness.channel.listenerCount('close')
+
+    await harness.manager.recreateAll()
+    await harness.manager.recreateAll()
+
+    assert.equal(harness.channel.listenerCount('close'), baseline, 'one watcher per channel, not per setup')
+  })
+
+  test('a sequential consumer disposes its processor when the channel dies', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeSequential('orders', async () => {})
+
+    assert.equal(clock.intervals.size, 1, 'the processor sweep is running')
+
+    harness.channelPool.closed = true
+    harness.channel.emit('close')
+
+    assert.equal(clock.intervals.size, 0, 'the dead channel took its processor with it')
+  })
+})
+
+describe('ConsumerManager resource ownership', () => {
+  test('unsubscribe releases the consumer dedicated channel', async () => {
+    // Without the release, every subscribe/unsubscribe cycle leaked one
+    // channel until the connection hit channel_max.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    assert.deepEqual(harness.channelPool.released, [consumerId], 'the channel went back to the pool')
+  })
+
+  test('unsubscribe cancels the tag the BROKER knows, not the caller alias', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    await harness.manager.recreateAll()
+
+    const currentTag = harness.channel.consumers.at(-1).consumerTag
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    assert.deepEqual(harness.channel.cancelled, [currentTag], 'cancelling the stale alias would leave it consuming')
+  })
+
+  test('giving up on a lost consumer terminates its worker pool', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+    let terminated = false
+
+    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', {
+      workerCount: 1,
+      createWorker: () => {
+        const worker = new EventEmitter()
+
+        worker.postMessage = () => {}
+        worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
+
+        return worker
+      }
+    })
+
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    // Every recreation attempt fails, so recovery walks its budget and drops
+    // the consumer — which used to leave the worker threads running forever.
+    harness.channel.consume = async () => { throw new Error('queue gone') }
+
+    await harness.manager.handleConsumerLoss(consumerId, 'queue deleted')
+
+    assert.equal(harness.manager.activeConsumers.size, 0, 'the consumer was dropped')
+    assert.equal(terminated, true, 'and its threads went with it')
+    assert.equal(harness.manager.workerPools.size, 0)
+  })
+})
+
+describe('ConsumerManager retry budget', () => {
+  const deliverWithCount = async (harness, deliveryCount, redelivered) => {
+    const { content, compressed } = await harness.codec.encode({ n: 1 })
+    const consumer = harness.channel.consumers.at(-1)
+
+    await consumer.callback({
+      content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered },
+      properties: {
+        headers: {
+          'x-compressed': compressed,
+          ...(deliveryCount === undefined ? {} : { 'x-delivery-count': deliveryCount })
+        }
+      }
+    })
+  }
+
+  test('{ attempts: N } spends a real budget from the quorum-queue delivery count', async () => {
+    // The redelivered flag is set by ANY requeue, including a connection drop,
+    // so it cannot express "three tries". x-delivery-count counts actual
+    // deliveries and is immune to that.
+    //
+    // Verified against a real broker: the header is ABSENT on the first
+    // delivery and starts at 1 on the redelivery — undefined here is delivery
+    // number one, not a missing feature.
+    for (const [deliveryCount, expected] of [[undefined, true], [1, true], [2, false], [7, false]]) {
+      const harness = createManager()
+
+      await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+        retryPolicy: { attempts: 3 }
+      })
+
+      await deliverWithCount(harness, deliveryCount, deliveryCount !== undefined)
+
+      assert.equal(
+        harness.channel.nacked.at(-1).requeue,
+        expected,
+        `delivery number ${(deliveryCount ?? 0) + 1} of a 3-attempt budget`
+      )
+    }
+  })
+
+  test('{ attempts: 1 } never requeues, matching none', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+      retryPolicy: { attempts: 1 }
+    })
+
+    // First delivery of a quorum queue: no header yet, and the budget of one
+    // must still mean no retry.
+    await deliverWithCount(harness, undefined, false)
+
+    assert.equal(harness.channel.nacked.at(-1).requeue, false)
+  })
+
+  test('on a classic queue the budget degrades to the one-shot ceiling', async () => {
+    // A REDELIVERY with no counter is the giveaway: quorum queues always send
+    // one from the second delivery on. Honouring a budget the broker cannot
+    // track would hot-loop the message forever.
+    for (const [redelivered, expected] of [[false, true], [true, false]]) {
+      const harness = createManager()
+
+      await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+        retryPolicy: { attempts: 5 }
+      })
+
+      await deliverWithCount(harness, undefined, redelivered)
+
+      assert.equal(harness.channel.nacked.at(-1).requeue, expected)
+    }
+  })
+
+  test('a budget still respects error.retryable === false', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      const error = new Error('malformed payload')
+      error.retryable = false
+
+      throw error
+    }, { retryPolicy: { attempts: 5 } })
+
+    await deliverWithCount(harness, undefined, false)
+
+    assert.equal(harness.channel.nacked.at(-1).requeue, false, 'the handler opted out of the retry')
+  })
+
+  test('a malformed budget is rejected at subscribe time', async () => {
+    const harness = createManager()
+
+    for (const policy of [{ attempts: 0 }, { attempts: -1 }, { attempts: 1.5 }, { attempts: 'three' }, {}]) {
+      await assert.rejects(
+        () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: policy }),
+        /Invalid retryPolicy/
+      )
+    }
+  })
+})
+
+describe('ConsumerManager recovery guards', () => {
+  test('recovering an unknown consumer id is a no-op', async () => {
+    // handleConsumerLoss is reachable from two paths that each pre-check
+    // something different; the guard covers whichever one did not.
+    const harness = createManager()
+
+    await harness.manager.handleConsumerLoss('consumer-never-registered-1', 'queue deleted')
+
+    assert.equal(harness.manager.activeConsumers.size, 0)
+  })
+
+  test('recovering a consumer already being unsubscribed stands down', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.manager.activeConsumers.get(consumerId).cancelled = true
+
+    await harness.manager.handleConsumerLoss(consumerId, 'channel closed')
+
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation for a consumer on its way out')
+  })
+})
+
+describe('ConsumerManager guards on partial inputs', () => {
+  test('a delivery without properties or fields is still settled', async () => {
+    // amqplib hands over what the broker sent; a message missing either shape
+    // must not crash the retry decision on its way to being nacked.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+      retryPolicy: { attempts: 3 }
+    })
+
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ n: 1 })
+
+    await consumer.callback({ content, fields: {}, properties: {} })
+
+    assert.equal(harness.channel.nacked.length, 1, 'the bare delivery was settled')
+    assert.equal(harness.channel.nacked[0].requeue, true, 'and the budget still applied to it')
+  })
+
+  test('a malformed retry policy names what it received', async () => {
+    // The message is the only thing the caller has to work with at subscribe
+    // time; "[object Object]" would send them hunting.
+    const harness = createManager()
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: { attempts: 0 } }),
+      /Invalid retryPolicy '\{"attempts":0\}'/
+    )
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'twice' }),
+      /Invalid retryPolicy 'twice'/
+    )
+  })
+
+  test('a close from a channel the consumer already replaced triggers no recovery', async () => {
+    // The watcher fires per channel; after a recreation moved the consumer to
+    // a new one, the old channel's close is stale news.
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const staleChannel = harness.channel
+    const consumerId = harness.manager.findConsumerIdByTag(harness.channel.consumers.at(-1).consumerTag)
+
+    // Move the consumer onto a different channel, as a recreation would.
+    harness.manager.activeConsumers.get(consumerId).channel = new FakeChannel()
+
+    const consumesBefore = staleChannel.consumers.length
+
+    staleChannel.emit('close')
+    clock.advance(100)
+    await sleep(20)
+
+    assert.equal(staleChannel.consumers.length, consumesBefore, 'the stale channel recreated nothing')
+  })
+
+  test('unsubscribing while disconnected does not crash on the missing pool', async () => {
+    // The pool is gone during recovery; releasing a channel back to it has to
+    // tolerate that rather than throwing over a consumer being removed.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    let pool = harness.channelPool
+
+    harness.manager.getChannelPool = () => pool
+    pool = null
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true)
+    assert.equal(harness.manager.activeConsumers.size, 0, 'the consumer was still removed')
   })
 })

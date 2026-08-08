@@ -23,13 +23,32 @@ class ChannelPool {
     await this.close()
     this.closed = false
 
-    for (let i = 0; i < this.size; i++) {
-      this.channels.push(await this.#createPoolChannel(i))
+    try {
+      for (let i = 0; i < this.size; i++) {
+        await this.#createPoolChannel(i)
+      }
+    } catch (error) {
+      // Without this the channels created so far stay open on a pool nobody
+      // owns — and since `closed` is still false, their close listeners keep
+      // dialing replacements: a zombie pool eating the connection's channels.
+      await this.close()
+
+      throw error
     }
   }
 
   async #createPoolChannel (index) {
     const channel = await this.connection.createConfirmChannel()
+
+    // The slot is claimed BEFORE any further await: the close guard below
+    // recognises its channel by slot identity, so a channel dying while the
+    // caller was still awaiting used to be installed permanently dead — its
+    // close event had already decided the slot was not its own, and no
+    // further one would ever come. A closed pool claims nothing: close()
+    // already emptied the array and writing into it would resurrect it.
+    if (!this.closed) {
+      this.channels[index] = channel
+    }
 
     channel.on('error', (error) => {
       if (this.closed) return
@@ -56,12 +75,14 @@ class ChannelPool {
         const channel = await this.#createPoolChannel(index)
 
         if (this.closed) {
+          // close() has already emptied `channels`, and #createPoolChannel
+          // claims no slot once the pool is closed — there is nothing to give
+          // back, only a late channel to discard.
           await this.#closeChannel(channel)
 
           return
         }
 
-        this.channels[index] = channel
         this.logger.info(`Pool channel ${index} recreated successfully`)
 
         return
@@ -99,6 +120,20 @@ class ChannelPool {
     this.dedicatedChannels.set(id, channel)
 
     return channel
+  }
+
+  // A dedicated channel belongs to exactly one owner (a consumer, the RPC
+  // reply route). When that owner goes away the channel has to go with it, or
+  // every subscribe/unsubscribe cycle leaks one until the connection reaches
+  // channel_max and the broker refuses to open any more.
+  async releaseDedicatedChannel (id) {
+    const channel = this.dedicatedChannels.get(id)
+
+    if (!channel) return
+
+    this.dedicatedChannels.delete(id)
+
+    await this.#closeChannel(channel)
   }
 
   getChannel () {
