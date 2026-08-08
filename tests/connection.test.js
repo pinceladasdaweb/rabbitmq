@@ -742,3 +742,33 @@ describe('RabbitMQConnection lifecycle guards', () => {
     )
   })
 })
+
+describe('RabbitMQConnection shutdown fencing', () => {
+  test('a dial that SUCCEEDS after disconnect() is closed, not installed', async (t) => {
+    // disconnect() cannot cancel a dial already in flight. Without the check
+    // on the way in, the connection lands live and unowned — the facade has
+    // already torn its pool down — and the state machine reports 'connected'.
+    const dialer = createDialer()
+    let releaseDial
+    const dialGate = new Promise(resolve => { releaseDial = resolve })
+    const originalConnect = dialer.connect
+
+    dialer.connect = async (...args) => {
+      await dialGate
+
+      return originalConnect(...args)
+    }
+
+    const connection = createConnection(t, dialer)
+
+    const pending = connection.connect()
+
+    await connection.disconnect()
+    releaseDial()
+
+    assert.equal(await pending, null, 'the dial reports no connection')
+    assert.equal(connection.getConnectionState(), 'disconnected', 'the shutdown stands')
+    assert.equal(connection.getConnection(), null, 'nothing was installed')
+    assert.equal(dialer.connections[0].closed, true, 'the orphan was closed, not leaked')
+  })
+})

@@ -1262,3 +1262,32 @@ describe('RabbitMQ facade cache accounting', () => {
     assert.ok(defaultedLogger.records.info.some(line => line.includes('TTL: 60s')), 'the default stdTTL is 60s')
   })
 })
+
+describe('RabbitMQ facade connect/disconnect fencing', () => {
+  test('disconnect() aborts a waitForConnection instead of hanging it forever', async (t) => {
+    // The wait lives on reconnection cycles that disconnect() ends, so nothing
+    // would ever settle it — and since #connectPromise is only released in its
+    // finally, EVERY later connect() would get the same dead promise.
+    const dialer = createDialer([new Error('down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, { reconnectInterval: 60000, maxReconnectInterval: 60000 })
+
+    t.after(() => rabbit.disconnect())
+
+    // The handler is attached up front: a rejection sitting unhandled for even
+    // one tick takes the whole test process down with it.
+    const waiting = rabbit.connect({ waitForConnection: true }).then(() => null, (error) => error)
+
+    await sleep(20)
+    await rabbit.disconnect()
+
+    const error = await waiting
+
+    assert.match(error.message, /Connection wait aborted/)
+
+    // The funnel must be usable again: a fresh connect() gets a fresh attempt
+    // instead of the dead promise the aborted wait left behind.
+    const connection = await rabbit.connect()
+
+    assert.ok(connection, 'the instance recovered instead of staying poisoned')
+  })
+})

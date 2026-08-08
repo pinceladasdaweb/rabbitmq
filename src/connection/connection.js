@@ -95,11 +95,24 @@ class RabbitMQConnection extends EventEmitter {
       try {
         const endpoint = this.#endpoints[this.#currentEndpointIndex]
 
-        this.#connection = await amqp.connect(this.#buildConnectionString(endpoint), {
+        const connection = await amqp.connect(this.#buildConnectionString(endpoint), {
           clientProperties: {
             connection_name: this.#connectionName
           }
         })
+
+        // disconnect() cannot cancel a dial already in flight, so the dial
+        // checks back on its way in: landing after a shutdown would install a
+        // live connection nobody owns (the facade has already torn its pool
+        // down) and flip the state machine back to 'connected'.
+        if (this.#isShuttingDown) {
+          await connection.close().catch(() => {})
+          this.#setConnectionState('disconnected')
+
+          return null
+        }
+
+        this.#connection = connection
 
         this.#connection.on('error', (err) => {
           this.#logger.error(`Connection error: ${err.message}`)

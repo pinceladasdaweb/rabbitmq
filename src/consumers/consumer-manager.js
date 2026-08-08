@@ -145,6 +145,8 @@ class ConsumerManager {
       consumerTag: null,
       // Every tag this consumer has ever answered to (see #trackConsumerTag).
       knownTags: new Set(),
+      // The channel whose lifecycle we are already watching (#watchChannelLoss).
+      watchedChannel: null,
       cancelled: false,
       sequentialProcessor: null,
       epoch: 0
@@ -211,15 +213,54 @@ class ConsumerManager {
     return consumerId ? this.activeConsumers.get(consumerId).queueName : null
   }
 
+  // A consumer's dedicated channel can die on its own — a channel-level
+  // exception (PRECONDITION_FAILED, ACCESS_REFUSED) closes it while the
+  // connection stays perfectly healthy. amqplib only delivers the null
+  // message on a broker basic.cancel, never on a channel close, so without
+  // this watcher the consumer simply stopped draining its queue in silence:
+  // no cancel, no reconnection, no log.
+  //
+  // Registered per CHANNEL, not per setup: recoveries that reuse the cached
+  // channel would otherwise stack a listener each time.
+  #watchChannelLoss (consumerId, consumerInfo, channel) {
+    if (consumerInfo.watchedChannel === channel) return
+
+    consumerInfo.watchedChannel = channel
+
+    channel.once('close', () => {
+      // State tied to the dead channel goes with it either way.
+      consumerInfo.sequentialProcessor?.dispose()
+
+      const channelPool = this.getChannelPool()
+
+      // A pool teardown (disconnect, or a connection that dropped) closes
+      // every channel too; that path belongs to recreateAll, and racing it
+      // here would duplicate consumers or burn the retry budget against a
+      // broker that is not there.
+      if (!channelPool || channelPool.closed) return
+      if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
+
+      this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+    })
+  }
+
   // Broker-initiated cancellation (e.g. queue deleted): notify and try to
   // recreate the consumer with backoff; on giving up, remove it and emit consumerLost.
   async handleBrokerCancel (consumerId) {
     const consumerInfo = this.activeConsumers.get(consumerId)
 
+    if (!consumerInfo) return
+
+    return this.handleConsumerLoss(consumerId, `consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
+  }
+
+  async handleConsumerLoss (consumerId, reason) {
+    const consumerInfo = this.activeConsumers.get(consumerId)
+
     if (!consumerInfo || consumerInfo.cancelled) return
 
-    this.logger.warn(`Consumer for queue ${consumerInfo.queueName} was cancelled by the broker`)
-    this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag })
+    this.logger.warn(`Recovering consumer: ${reason}`)
+    this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag, reason })
 
     const maxAttempts = 3
     let knownEpoch = consumerInfo.epoch
@@ -309,6 +350,7 @@ class ConsumerManager {
 
       consumerInfo.channel = channel
       this.#trackConsumerTag(consumerId, consumerInfo, consumer.consumerTag)
+      this.#watchChannelLoss(consumerId, consumerInfo, channel)
 
       return consumer
     })
@@ -383,8 +425,10 @@ class ConsumerManager {
           }
         })
 
+        // The channel's own teardown is handled by #watchChannelLoss, which
+        // disposes whatever processor is current — attaching a listener here
+        // would stack one more on every recovery that reuses this channel.
         consumerInfo.sequentialProcessor = processor
-        channel.on('close', () => processor.dispose())
 
         return (content, msg) => processor.handle(content, msg)
       }

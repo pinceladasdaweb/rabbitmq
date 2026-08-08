@@ -35,6 +35,7 @@ class RabbitMQ extends EventEmitter {
   #connectPromise
   #restorePromise
   #clock
+  #connectionWaiters
 
   constructor (options = {}) {
     super()
@@ -54,6 +55,7 @@ class RabbitMQ extends EventEmitter {
     // sequential staleness, recovery backoffs, RPC deadlines). Injectable so
     // tests drive all of them from a single fake without sleeping.
     this.#clock = options.clock ?? systemClock
+    this.#connectionWaiters = new Set()
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -340,13 +342,25 @@ class RabbitMQ extends EventEmitter {
     return new Promise((resolve, reject) => {
       let timer = null
 
+      const abort = (error) => {
+        cleanup()
+        reject(error)
+      }
+
       const cleanup = () => {
         this.off('reconnected', onReconnected)
         this.off('reconnectFailed', onReconnectFailed)
         this.off('reconnectError', onReconnectError)
+        this.#connectionWaiters.delete(abort)
 
         if (timer) this.#clock.clearTimeout(timer)
       }
+
+      // disconnect() stops the reconnection cycles this promise is waiting on,
+      // so without an explicit abort it would never settle — and since
+      // #connectPromise is only released in its finally, EVERY later connect()
+      // would receive the same dead promise.
+      this.#connectionWaiters.add(abort)
 
       const onReconnected = () => {
         cleanup()
@@ -380,6 +394,12 @@ class RabbitMQ extends EventEmitter {
   }
 
   async disconnect () {
+    // Before anything else: whoever is parked in connect({ waitForConnection })
+    // is waiting for a reconnection cycle this shutdown is about to end.
+    for (const abort of [...this.#connectionWaiters]) {
+      abort(new Error('Connection wait aborted: the client was disconnected'))
+    }
+
     try {
       this.#rpc.handleConnectionLoss('client disconnected')
 

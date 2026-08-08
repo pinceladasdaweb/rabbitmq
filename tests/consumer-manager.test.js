@@ -31,7 +31,7 @@ const createManager = (overrides = {}) => {
     ...overrides
   }
 
-  return { manager: new ConsumerManager(context), channel, codec, events }
+  return { manager: new ConsumerManager(context), channel, channelPool, codec, events }
 }
 
 const deliver = async (harness, payload, properties = {}) => {
@@ -1586,5 +1586,78 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     assert.equal(spawned[1].terminated, true, 'disposeAll shut the second pool down')
     assert.equal(clock.intervals.size, 0, 'disposeAll disposed the sequential processor too')
     assert.equal(base.manager.activeConsumers.size, 0)
+  })
+})
+
+describe('ConsumerManager channel-level loss', () => {
+  test('a dedicated channel closing on a live connection recovers the consumer', async () => {
+    // amqplib delivers the null message only on a broker basic.cancel, never
+    // on a channel close — so a channel-level exception (PRECONDITION_FAILED,
+    // ACCESS_REFUSED) used to kill the consumer in total silence while the
+    // connection stayed healthy.
+    const clock = new ManualClock()
+    const logger = recordingLogger()
+    const harness = createManager({ clock, logger, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.channel.emit('close')
+    clock.advance(10)
+
+    await waitFor(() => harness.channel.consumers.length > consumesBefore, 2000, 'consumer recreated')
+
+    assert.ok(
+      logger.records.warn.some(line => line.includes('closed unexpectedly')),
+      'the loss is reported with a reason naming the channel'
+    )
+    assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer survived')
+  })
+
+  test('the pool tearing down does NOT trigger per-channel recovery', async () => {
+    // disconnect() and connection loss close every channel; that path belongs
+    // to recreateAll. Racing it here would duplicate consumers or burn the
+    // retry budget against a broker that is not there.
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    harness.channelPool.closed = true
+    harness.channel.emit('close')
+    clock.advance(100)
+    await sleep(20)
+
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation while the pool is closing')
+  })
+
+  test('recoveries that reuse the channel do not stack close listeners', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const baseline = harness.channel.listenerCount('close')
+
+    await harness.manager.recreateAll()
+    await harness.manager.recreateAll()
+
+    assert.equal(harness.channel.listenerCount('close'), baseline, 'one watcher per channel, not per setup')
+  })
+
+  test('a sequential consumer disposes its processor when the channel dies', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeSequential('orders', async () => {})
+
+    assert.equal(clock.intervals.size, 1, 'the processor sweep is running')
+
+    harness.channelPool.closed = true
+    harness.channel.emit('close')
+
+    assert.equal(clock.intervals.size, 0, 'the dead channel took its processor with it')
   })
 })
