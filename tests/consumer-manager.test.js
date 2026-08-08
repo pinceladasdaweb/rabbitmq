@@ -376,7 +376,11 @@ describe('ConsumerManager lifecycle', () => {
     assert.equal(await harness.manager.unsubscribe('unknown-tag'), false)
   })
 
-  test('recreateAll re-runs every setup and re-tracks the new consumer tags', async () => {
+  test('recreateAll re-runs every setup and keeps the original tag valid', async () => {
+    // The caller only ever holds the tag subscribe() returned. Retiring it on
+    // recreation made unsubscribe(originalTag) answer false after the first
+    // reconnection, with no way to learn the new tag — so every tag the
+    // consumer has held stays a valid handle for its whole life.
     const harness = createManager()
 
     const consumer = await harness.manager.subscribe('orders', async () => {})
@@ -387,9 +391,21 @@ describe('ConsumerManager lifecycle', () => {
 
     const newTag = harness.channel.consumers.at(-1).consumerTag
 
-    assert.notEqual(newTag, consumer.consumerTag)
+    assert.notEqual(newTag, consumer.consumerTag, 'the broker issued a fresh tag')
     assert.equal(harness.manager.findQueueNameByTag(newTag), 'orders')
-    assert.equal(harness.manager.findQueueNameByTag(consumer.consumerTag), null, 'stale tag dropped')
+    assert.equal(harness.manager.findQueueNameByTag(consumer.consumerTag), 'orders', 'the original tag still resolves')
+  })
+
+  test('unsubscribe with the original tag still works after a recreation', async () => {
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    await harness.manager.recreateAll()
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true, 'the caller-held tag must still cancel')
+    assert.equal(harness.manager.activeConsumers.size, 0)
+    assert.equal(harness.manager.consumersByTag.size, 0, 'every alias went with the consumer')
   })
 
   test('recreateAll survives a consumer that fails to recreate', async () => {

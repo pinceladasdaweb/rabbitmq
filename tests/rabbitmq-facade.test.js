@@ -1018,6 +1018,81 @@ describe('RabbitMQ facade survivor round', () => {
     await rabbit.publish('orders-route', { n: 1 })
   })
 
+  test('the tag subscribe() returned still cancels the consumer after a reconnection', async (t) => {
+    // The broker issues a fresh tag on recreation and the caller has no way to
+    // learn it — the old behavior retired the original tag, so unsubscribe
+    // answered false and the consumer (plus its worker pool) kept running.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    const consumer = await rabbit.subscribe('orders', async () => {})
+    const originalTag = consumer.consumerTag
+
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    dialer.connections[0].emit('close')
+    await reconnected
+
+    const liveConsumer = dialer.connections.at(-1).consumersOn()[0]
+
+    assert.notEqual(liveConsumer.consumerTag, originalTag, 'the broker really did issue a new tag')
+    assert.equal(await rabbit.unsubscribe(originalTag), true, 'the caller-held tag must still work')
+    assert.equal(dialer.connections.at(-1).channels.some(channel => channel.cancelled.length > 0), true, 'the cancel reached the broker')
+  })
+
+  test('a restore that fails AFTER the pool was built is retried in full', async (t) => {
+    // The pool is only half the restore. Leaving it installed after
+    // ensureExchange/recreateAll failed satisfied #doConnect's gate, so the
+    // retry resolved as a success onto an instance with no exchange and no
+    // consumers.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    let exchangeSick = true
+
+    dialer.onConnection = (connection) => {
+      const realCreate = connection.createConfirmChannel.bind(connection)
+
+      connection.createConfirmChannel = async () => {
+        const channel = await realCreate()
+
+        if (exchangeSick) channel.assertExchangeError = new Error('exchange under maintenance')
+
+        return channel
+      }
+    }
+
+    const restoreFailed = new Promise(resolve => rabbit.once('reconnectError', resolve))
+
+    dialer.connections[0].emit('close')
+    await restoreFailed
+
+    exchangeSick = false
+
+    for (const connection of dialer.connections) {
+      for (const channel of connection.channels) channel.assertExchangeError = null
+    }
+
+    await rabbit.connect()
+    await sleep(30)
+
+    const live = dialer.connections.at(-1)
+
+    assert.equal(live.consumersOn().length, 1, 'the retry recreated the consumer')
+    assert.ok(live.channels.some(channel => channel.assertedExchanges.length > 0), 'and asserted the exchange')
+
+    await rabbit.publish('orders-route', { n: 1 })
+  })
+
   test('waitForConnection leaves no listeners or timer behind once it resolves', async (t) => {
     const { ManualClock } = await import('./helpers.js')
     const clock = new ManualClock()

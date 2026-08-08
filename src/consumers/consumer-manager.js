@@ -143,6 +143,8 @@ class ConsumerManager {
       setup,
       channel: null,
       consumerTag: null,
+      // Every tag this consumer has ever answered to (see #trackConsumerTag).
+      knownTags: new Set(),
       cancelled: false,
       sequentialProcessor: null,
       epoch: 0
@@ -151,20 +153,26 @@ class ConsumerManager {
     return consumerId
   }
 
+  // Recreating a consumer gets a NEW tag from the broker, but the caller only
+  // ever holds the one subscribe() returned. Retiring the old tag here made
+  // unsubscribe(originalTag) silently answer false after the first
+  // reconnection, leaving the consumer (and its worker pool) running with no
+  // way to stop it — the tag it now answers to is not exposed anywhere. So
+  // every tag a consumer has held stays a valid handle for its whole life;
+  // the set is bounded by that consumer's recreation count and is dropped
+  // wholesale with it.
   #trackConsumerTag (consumerId, consumerInfo, consumerTag) {
-    if (consumerInfo.consumerTag) {
-      this.consumersByTag.delete(consumerInfo.consumerTag)
-    }
-
     consumerInfo.consumerTag = consumerTag
+    consumerInfo.knownTags.add(consumerTag)
     this.consumersByTag.set(consumerTag, consumerId)
   }
 
   #dropConsumer (consumerId, consumerInfo) {
-    if (consumerInfo.consumerTag) {
-      this.consumersByTag.delete(consumerInfo.consumerTag)
+    for (const tag of consumerInfo.knownTags) {
+      this.consumersByTag.delete(tag)
     }
 
+    consumerInfo.knownTags.clear()
     consumerInfo.sequentialProcessor?.dispose()
     this.activeConsumers.delete(consumerId)
   }

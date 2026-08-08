@@ -206,10 +206,32 @@ class RabbitMQ extends EventEmitter {
     return this.#restorePromise
   }
 
+  // The whole restore is one unit: #doConnect gates on `!this.#channelPool`,
+  // so "pool present" has to mean "state fully restored". Leaving the pool
+  // behind after a later step failed satisfied that gate with the exchange
+  // unasserted and the consumers never recreated — a retried connect()
+  // resolved as a success onto a half-dead instance. On failure the pool goes
+  // back to null so the next attempt genuinely retries.
   async #doRestoreState () {
-    await this.#setupChannelPool()
-    await this.#topology.ensureExchange()
-    await this.#consumers.recreateAll()
+    let installedPool = null
+
+    try {
+      installedPool = await this.#setupChannelPool()
+
+      await this.#topology.ensureExchange()
+      await this.#consumers.recreateAll()
+    } catch (error) {
+      // Only tear down the pool THIS restore installed: a stale restore
+      // failing late (the flapping-broker case, fenced inside
+      // #setupChannelPool) must not clear the pool a newer restore already
+      // put in place — same ownership discipline as the fence itself.
+      if (installedPool && this.#channelPool === installedPool) {
+        this.#channelPool = null
+        await installedPool.close().catch(() => {})
+      }
+
+      throw error
+    }
 
     // Failures accumulated against the previous connection say nothing
     // about the fresh one — do not keep publishing blocked after recovery.
@@ -276,6 +298,8 @@ class RabbitMQ extends EventEmitter {
     }
 
     this.#channelPool = channelPool
+
+    return channelPool
   }
 
   // Concurrent connect() callers share a single in-flight attempt: two
