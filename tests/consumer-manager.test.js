@@ -1744,19 +1744,23 @@ describe('ConsumerManager retry budget', () => {
     // The redelivered flag is set by ANY requeue, including a connection drop,
     // so it cannot express "three tries". x-delivery-count counts actual
     // deliveries and is immune to that.
-    for (const [deliveryCount, expected] of [[0, true], [1, true], [2, false], [7, false]]) {
+    //
+    // Verified against a real broker: the header is ABSENT on the first
+    // delivery and starts at 1 on the redelivery — undefined here is delivery
+    // number one, not a missing feature.
+    for (const [deliveryCount, expected] of [[undefined, true], [1, true], [2, false], [7, false]]) {
       const harness = createManager()
 
       await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
         retryPolicy: { attempts: 3 }
       })
 
-      await deliverWithCount(harness, deliveryCount, deliveryCount > 0)
+      await deliverWithCount(harness, deliveryCount, deliveryCount !== undefined)
 
       assert.equal(
         harness.channel.nacked.at(-1).requeue,
         expected,
-        `delivery number ${deliveryCount + 1} of a 3-attempt budget`
+        `delivery number ${(deliveryCount ?? 0) + 1} of a 3-attempt budget`
       )
     }
   })
@@ -1768,14 +1772,17 @@ describe('ConsumerManager retry budget', () => {
       retryPolicy: { attempts: 1 }
     })
 
-    await deliverWithCount(harness, 0, false)
+    // First delivery of a quorum queue: no header yet, and the budget of one
+    // must still mean no retry.
+    await deliverWithCount(harness, undefined, false)
 
     assert.equal(harness.channel.nacked.at(-1).requeue, false)
   })
 
   test('on a classic queue the budget degrades to the one-shot ceiling', async () => {
-    // No x-delivery-count header: honouring a budget the broker cannot track
-    // would hot-loop the message forever.
+    // A REDELIVERY with no counter is the giveaway: quorum queues always send
+    // one from the second delivery on. Honouring a budget the broker cannot
+    // track would hot-loop the message forever.
     for (const [redelivered, expected] of [[false, true], [true, false]]) {
       const harness = createManager()
 
@@ -1799,7 +1806,7 @@ describe('ConsumerManager retry budget', () => {
       throw error
     }, { retryPolicy: { attempts: 5 } })
 
-    await deliverWithCount(harness, 0, false)
+    await deliverWithCount(harness, undefined, false)
 
     assert.equal(harness.channel.nacked.at(-1).requeue, false, 'the handler opted out of the retry')
   })

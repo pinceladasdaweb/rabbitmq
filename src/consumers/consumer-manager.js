@@ -142,11 +142,18 @@ class ConsumerManager {
     // number deliveryCount + 1: requeue while the budget still has room.
     const deliveryCount = Number(message.properties?.headers?.['x-delivery-count'])
 
-    // No counter means a classic queue: fall back to the one-shot ceiling
-    // rather than looping forever on a budget the broker cannot track.
-    if (!Number.isFinite(deliveryCount)) return !message.fields?.redelivered
+    if (Number.isFinite(deliveryCount)) return deliveryCount + 1 < retryPolicy.attempts
 
-    return deliveryCount + 1 < retryPolicy.attempts
+    // No counter. Verified against a real broker: a quorum queue OMITS the
+    // header on the first delivery and only starts sending it (at 1) from the
+    // redelivery on — so an absent header on a first delivery is normal and
+    // the budget still applies, with attempts: 1 meaning "no retry at all".
+    if (!message.fields?.redelivered) return retryPolicy.attempts > 1
+
+    // Absent on a REDELIVERY means the queue does not count at all (classic):
+    // fall back to the one-shot ceiling rather than looping forever on a
+    // budget the broker cannot track.
+    return false
   }
 
   registerConsumer (queueName, setup) {
