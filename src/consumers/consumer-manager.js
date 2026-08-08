@@ -106,11 +106,15 @@ class ConsumerManager {
   #resolveRetryPolicy (retryPolicy, defaultPolicy) {
     const policy = retryPolicy ?? defaultPolicy
 
-    if (policy !== 'none' && policy !== 'once') {
-      throw new Error(`Invalid retryPolicy '${policy}': expected 'none' or 'once'`)
-    }
+    if (policy === 'none' || policy === 'once') return policy
 
-    return policy
+    // { attempts: N } — a real budget, honoured exactly on quorum queues
+    // (see #shouldRequeue).
+    if (Number.isInteger(policy?.attempts) && policy.attempts > 0) return policy
+
+    const shown = typeof policy === 'object' && policy !== null ? JSON.stringify(policy) : String(policy)
+
+    throw new Error(`Invalid retryPolicy '${shown}': expected 'none', 'once' or { attempts: <positive integer> }`)
   }
 
   // The single place that decides whether a failed message goes back to the
@@ -125,14 +129,24 @@ class ConsumerManager {
   // Caveat of the `redelivered` flag: the broker sets it on ANY requeue, not
   // just ours. An unacked message returned to the queue after a connection
   // drop arrives redelivered too, so an infrastructure event can consume the
-  // retry budget before the handler ever fails. AMQP offers no redelivery
-  // counter on classic queues; use a quorum queue's x-delivery-count if you
-  // need a true attempt budget.
+  // retry budget before the handler ever fails. Classic queues offer no
+  // redelivery counter at all — { attempts: N } uses a quorum queue's
+  // x-delivery-count, which counts real deliveries and is immune to that.
   #shouldRequeue (message, error, retryPolicy) {
-    if (retryPolicy !== 'once') return false
+    if (retryPolicy === 'none') return false
     if (error?.retryable === false) return false
 
-    return !message.fields?.redelivered
+    if (retryPolicy === 'once') return !message.fields?.redelivered
+
+    // x-delivery-count is the number of PRIOR deliveries, so this delivery is
+    // number deliveryCount + 1: requeue while the budget still has room.
+    const deliveryCount = Number(message.properties?.headers?.['x-delivery-count'])
+
+    // No counter means a classic queue: fall back to the one-shot ceiling
+    // rather than looping forever on a budget the broker cannot track.
+    if (!Number.isFinite(deliveryCount)) return !message.fields?.redelivered
+
+    return deliveryCount + 1 < retryPolicy.attempts
   }
 
   registerConsumer (queueName, setup) {

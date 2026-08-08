@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import describeError from '../utils/describe-error.js'
 import { compose, exponential, isRetryExhaustedError, retry } from 'breakwater'
 
@@ -74,6 +75,49 @@ class Publisher {
         }
       })
     })
+  }
+
+  // A publish the broker cannot route is DROPPED IN SILENCE: the confirm still
+  // arrives, so the caller is told everything went fine while the message went
+  // nowhere. `mandatory` makes the broker hand it back as a basic.return
+  // instead, and this turns that into an error the caller can act on.
+  //
+  // The token correlates the return with this exact publish: a pool channel
+  // carries many, and matching on the routing key alone would let one
+  // publish's return fail another that was delivered.
+  async publishRoutable (channel, exchangeName, routingKey, content, options) {
+    if (!options.mandatory) {
+      return this.publishOnChannel(channel, exchangeName, routingKey, content, options)
+    }
+
+    const token = randomUUID()
+    const guarded = { ...options, headers: { ...options.headers, 'x-publish-token': token } }
+    let returned = false
+
+    const onReturn = (returnedMessage) => {
+      if (returnedMessage?.properties?.headers?.['x-publish-token'] === token) {
+        returned = true
+      }
+    }
+
+    channel.on('return', onReturn)
+
+    try {
+      await this.publishOnChannel(channel, exchangeName, routingKey, content, guarded)
+
+      // basic.return reaches the client before the confirm, but give the loop
+      // one turn so onReturn has definitely run.
+      await new Promise(resolve => setImmediate(resolve))
+    } finally {
+      channel.off('return', onReturn)
+    }
+
+    if (returned) {
+      const error = new Error(`Message to '${routingKey}' was returned by the broker: no queue is bound for that routing key on exchange '${exchangeName}'`)
+      error.code = 'UNROUTABLE'
+
+      throw error
+    }
   }
 
   async publishFireAndForget (channel, exchangeName, routingKey, content, options) {
@@ -155,7 +199,7 @@ class Publisher {
       const channel = await this.getChannel()
       const { content, compressed } = await this.codec.encode(message)
 
-      await this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
+      await this.publishRoutable(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
 
       this.logger.debug?.('Message published and confirmed')
     }
@@ -188,7 +232,7 @@ class Publisher {
       const attempts = [...unconfirmed].map(async (index) => {
         const { content, compressed } = prepared[index]
 
-        await this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
+        await this.publishRoutable(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
 
         unconfirmed.delete(index)
       })
@@ -272,7 +316,7 @@ class Publisher {
       const channel = await this.getChannel()
       const { content, compressed } = await this.codec.encode(message)
 
-      await this.publishOnChannel(channel, this.delayExchange, routingKey, content, this.buildOptions(options, compressed, { 'x-delay': delayMs }))
+      await this.publishRoutable(channel, this.delayExchange, routingKey, content, this.buildOptions(options, compressed, { 'x-delay': delayMs }))
 
       this.logger.debug?.(`Delayed message published (${delayMs}ms) and confirmed`)
     }

@@ -560,3 +560,64 @@ describe('Publisher publishBatch retry granularity', () => {
     assert.equal(channel.published.length, 2)
   })
 })
+
+describe('Publisher unroutable detection', () => {
+  test('an unroutable mandatory publish rejects with UNROUTABLE instead of vanishing', async () => {
+    // Without mandatory the broker drops it and still confirms: the caller is
+    // told everything went fine while the message went nowhere.
+    const { publisher, channel } = createPublisher()
+
+    channel.returnRoutingKey = 'orders'
+
+    await assert.rejects(
+      () => publisher.publish('orders', { id: 1 }, { mandatory: true, maxRetries: 1 }),
+      (error) => {
+        assert.equal(error.code, 'UNROUTABLE')
+        assert.match(error.message, /no queue is bound/)
+        assert.match(error.message, /main-exchange/, 'the exchange is named so the binding can be found')
+
+        return true
+      }
+    )
+  })
+
+  test('without mandatory the publish resolves, as the broker reports it', async () => {
+    // The silent drop is the broker's contract; the point of the option is
+    // that the caller can now opt out of it.
+    const { publisher, channel } = createPublisher()
+
+    channel.returnRoutingKey = 'orders'
+
+    await publisher.publish('orders', { id: 1 })
+  })
+
+  test('a routable mandatory publish resolves and leaves no return listener', async () => {
+    const { publisher, channel } = createPublisher()
+
+    await publisher.publish('orders', { id: 1 }, { mandatory: true })
+
+    assert.equal(channel.published.length, 1)
+    assert.equal(channel.listenerCount('return'), 0, 'one listener per publish, removed on settle')
+  })
+
+  test("another publish's return does not fail this one", async () => {
+    // Pool channels carry many publishes; matching on the routing key alone
+    // let one message's return reject a message that had been delivered.
+    const { publisher, channel } = createPublisher()
+
+    channel.returnRoutingKey = 'someone-else'
+
+    await publisher.publish('orders', { id: 1 }, { mandatory: true })
+  })
+
+  test('publishDelayed surfaces an unroutable delayed message too', async () => {
+    const { publisher, channel } = createPublisher()
+
+    channel.returnRoutingKey = 'orders'
+
+    await assert.rejects(
+      () => publisher.publishDelayed('orders', { id: 1 }, 10, { mandatory: true, maxRetries: 1 }),
+      (error) => error.code === 'UNROUTABLE'
+    )
+  })
+})

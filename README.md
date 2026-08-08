@@ -771,6 +771,25 @@ All examples share their connection settings through [examples/config.mjs](examp
 
 ### Message Consumption
 
+#### Unroutable publishes (`mandatory`)
+
+A message published to a routing key with **no queue bound to it** is discarded by the broker — and the publisher confirm still arrives, so the publish resolves and the caller is told everything went fine. Nothing is logged, because nothing failed as far as AMQP is concerned.
+
+Pass `mandatory: true` and the broker hands the message back instead; the publish then rejects with `code: 'UNROUTABLE'`:
+
+```javascript
+try {
+  await rabbitMQ.publish('orders.typo', order, { mandatory: true })
+} catch (error) {
+  if (error.code === 'UNROUTABLE') {
+    // The routing key reaches no queue: a missing binding or a typo,
+    // not a broker failure.
+  }
+}
+```
+
+Available on `publish`, `publishBatch` and `publishDelayed`. RPC requests already publish `mandatory` and surface the same condition as `RPC_UNROUTABLE`.
+
 #### Failure policy (`retryPolicy`)
 
 Every subscribe method accepts `retryPolicy`, which decides what happens to a message whose processing threw:
@@ -779,6 +798,20 @@ Every subscribe method accepts `retryPolicy`, which decides what happens to a me
 | --- | --- |
 | `'none'` | Nack without requeue — the message goes straight to the DLQ. No retries. |
 | `'once'` | A first delivery is requeued and retried. A delivery already marked `redelivered` is dead-lettered instead, so a permanently failing message can never hot-loop. |
+| `{ attempts: N }` | A real budget of **N deliveries**, counted by the broker through a quorum queue's `x-delivery-count`. |
+
+##### Why `{ attempts: N }` needs a quorum queue
+
+`'once'` reads the `redelivered` flag, and the broker sets that on **any** requeue — including one caused by a connection drop, which has nothing to do with your handler. So an infrastructure blip can spend the retry before the message ever fails.
+
+Quorum queues carry `x-delivery-count`, a real counter of deliveries, and `{ attempts: N }` uses it: exactly N tries, no matter how many reconnections happen in between. On a classic queue the header does not exist, so the policy degrades to the `'once'` ceiling rather than looping forever on a budget the broker cannot track.
+
+```javascript
+await rabbitMQ.createQueue('payments', { arguments: { 'x-queue-type': 'quorum' } })
+
+// Three real attempts, then the DLQ.
+await rabbitMQ.subscribe('payments', handlePayment, { retryPolicy: { attempts: 3 } })
+```
 
 Defaults preserve each method's historical behaviour:
 

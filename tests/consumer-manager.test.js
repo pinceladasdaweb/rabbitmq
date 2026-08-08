@@ -1722,3 +1722,96 @@ describe('ConsumerManager resource ownership', () => {
     assert.equal(harness.manager.workerPools.size, 0)
   })
 })
+
+describe('ConsumerManager retry budget', () => {
+  const deliverWithCount = async (harness, deliveryCount, redelivered) => {
+    const { content, compressed } = await harness.codec.encode({ n: 1 })
+    const consumer = harness.channel.consumers.at(-1)
+
+    await consumer.callback({
+      content,
+      fields: { consumerTag: consumer.consumerTag, deliveryTag: 1, redelivered },
+      properties: {
+        headers: {
+          'x-compressed': compressed,
+          ...(deliveryCount === undefined ? {} : { 'x-delivery-count': deliveryCount })
+        }
+      }
+    })
+  }
+
+  test('{ attempts: N } spends a real budget from the quorum-queue delivery count', async () => {
+    // The redelivered flag is set by ANY requeue, including a connection drop,
+    // so it cannot express "three tries". x-delivery-count counts actual
+    // deliveries and is immune to that.
+    for (const [deliveryCount, expected] of [[0, true], [1, true], [2, false], [7, false]]) {
+      const harness = createManager()
+
+      await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+        retryPolicy: { attempts: 3 }
+      })
+
+      await deliverWithCount(harness, deliveryCount, deliveryCount > 0)
+
+      assert.equal(
+        harness.channel.nacked.at(-1).requeue,
+        expected,
+        `delivery number ${deliveryCount + 1} of a 3-attempt budget`
+      )
+    }
+  })
+
+  test('{ attempts: 1 } never requeues, matching none', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+      retryPolicy: { attempts: 1 }
+    })
+
+    await deliverWithCount(harness, 0, false)
+
+    assert.equal(harness.channel.nacked.at(-1).requeue, false)
+  })
+
+  test('on a classic queue the budget degrades to the one-shot ceiling', async () => {
+    // No x-delivery-count header: honouring a budget the broker cannot track
+    // would hot-loop the message forever.
+    for (const [redelivered, expected] of [[false, true], [true, false]]) {
+      const harness = createManager()
+
+      await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+        retryPolicy: { attempts: 5 }
+      })
+
+      await deliverWithCount(harness, undefined, redelivered)
+
+      assert.equal(harness.channel.nacked.at(-1).requeue, expected)
+    }
+  })
+
+  test('a budget still respects error.retryable === false', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      const error = new Error('malformed payload')
+      error.retryable = false
+
+      throw error
+    }, { retryPolicy: { attempts: 5 } })
+
+    await deliverWithCount(harness, 0, false)
+
+    assert.equal(harness.channel.nacked.at(-1).requeue, false, 'the handler opted out of the retry')
+  })
+
+  test('a malformed budget is rejected at subscribe time', async () => {
+    const harness = createManager()
+
+    for (const policy of [{ attempts: 0 }, { attempts: -1 }, { attempts: 1.5 }, { attempts: 'three' }, {}]) {
+      await assert.rejects(
+        () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: policy }),
+        /Invalid retryPolicy/
+      )
+    }
+  })
+})
