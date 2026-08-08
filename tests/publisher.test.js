@@ -533,3 +533,30 @@ describe('Publisher publishDelayed', () => {
     assert.equal(published.options.headers['x-delay'], 5000)
   })
 })
+
+describe('Publisher publishBatch retry granularity', () => {
+  test('a retry republishes only the messages the broker did not confirm', async () => {
+    // Resending the whole batch delivered every already-confirmed message
+    // again — consumers saw duplicates of messages that never failed.
+    const { publisher, channel } = createPublisher()
+
+    // Three publishes go out; the second confirm fails.
+    channel.confirmErrors.push(null, new Error('nacked'), null)
+
+    await publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }, { n: 3 }], { maxRetries: 2, retryDelay: 1 })
+
+    assert.equal(channel.published.length, 4, 'three first attempts plus exactly one retry')
+
+    const payloads = channel.published.map(entry => JSON.parse(entry.content.toString()).n)
+
+    assert.deepEqual(payloads, [1, 2, 3, 2], 'only the unconfirmed message went out again')
+  })
+
+  test('a batch that fully succeeds publishes each message exactly once', async () => {
+    const { publisher, channel } = createPublisher()
+
+    await publisher.publishBatch('orders', [{ n: 1 }, { n: 2 }])
+
+    assert.equal(channel.published.length, 2)
+  })
+})

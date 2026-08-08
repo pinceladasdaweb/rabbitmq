@@ -172,13 +172,31 @@ class Publisher {
 
     await this.preflight(exchange, routingKey, options, routingKey, messages.length * (options.rateLimitCost ?? 1))
 
+    // Retries republish ONLY what the broker has not confirmed. Resending the
+    // whole batch because one message was nacked delivered every already
+    // confirmed message again — up to three times by default — so consumers
+    // saw duplicates of messages that never failed. Encoding is memoized for
+    // the same reason: the payloads cannot change between attempts.
+    let prepared = null
+    const unconfirmed = new Set(messages.keys())
+
     const batchOperation = async () => {
       const channel = await this.getChannel()
-      const preparedMessages = await Promise.all(messages.map(message => this.codec.encode(message)))
 
-      await Promise.all(preparedMessages.map(({ content, compressed }) =>
-        this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
-      ))
+      prepared ??= await Promise.all(messages.map(message => this.codec.encode(message)))
+
+      const attempts = [...unconfirmed].map(async (index) => {
+        const { content, compressed } = prepared[index]
+
+        await this.publishOnChannel(channel, exchange.name, routingKey, content, this.buildOptions(options, compressed))
+
+        unconfirmed.delete(index)
+      })
+
+      const results = await Promise.allSettled(attempts)
+      const failed = results.find(result => result.status === 'rejected')
+
+      if (failed) throw failed.reason
 
       this.logger.info(`Batch of ${messages.length} messages published to ${routingKey}`)
     }

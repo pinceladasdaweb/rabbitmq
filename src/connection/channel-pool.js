@@ -24,8 +24,10 @@ class ChannelPool {
     this.closed = false
 
     try {
+      this.channels = new Array(this.size).fill(null)
+
       for (let i = 0; i < this.size; i++) {
-        this.channels.push(await this.#createPoolChannel(i))
+        await this.#createPoolChannel(i)
       }
     } catch (error) {
       // Without this the channels created so far stay open on a pool nobody
@@ -39,6 +41,16 @@ class ChannelPool {
 
   async #createPoolChannel (index) {
     const channel = await this.connection.createConfirmChannel()
+
+    // The slot is claimed BEFORE any further await: the close guard below
+    // recognises its channel by slot identity, so a channel dying while the
+    // caller was still awaiting used to be installed permanently dead — its
+    // close event had already decided the slot was not its own, and no
+    // further one would ever come. A closed pool claims nothing: close()
+    // already emptied the array and writing into it would resurrect it.
+    if (!this.closed) {
+      this.channels[index] = channel
+    }
 
     channel.on('error', (error) => {
       if (this.closed) return
@@ -65,12 +77,15 @@ class ChannelPool {
         const channel = await this.#createPoolChannel(index)
 
         if (this.closed) {
+          // Only give the slot back if it is still ours: the pool may have
+          // closed (and emptied the array) after we claimed it.
+          if (this.channels[index] === channel) this.channels[index] = null
+
           await this.#closeChannel(channel)
 
           return
         }
 
-        this.channels[index] = channel
         this.logger.info(`Pool channel ${index} recreated successfully`)
 
         return

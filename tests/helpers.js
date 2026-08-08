@@ -210,8 +210,16 @@ export class FakeChannel extends EventEmitter {
     this.published.push({ exchange, routingKey, content, options })
 
     if (this.returnRoutingKey) {
-      // basic.return reaches the client before the confirm, as the broker does.
-      this.emit('return', { fields: { routingKey: this.returnRoutingKey } })
+      // basic.return reaches the client before the confirm, as the broker
+      // does — and it carries the WHOLE returned message, properties and
+      // headers included. Emitting bare fields let a listener that
+      // correlates on a header look correct while never matching anything.
+      const returned = this.returnRoutingKey === routingKey
+        ? { fields: { routingKey, exchange }, properties: options, content }
+        // A return for someone else's publish on this shared channel.
+        : { fields: { routingKey: this.returnRoutingKey, exchange }, properties: { headers: {} }, content: Buffer.alloc(0) }
+
+      this.emit('return', returned)
     }
 
     if (confirmCallback) {
