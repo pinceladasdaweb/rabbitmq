@@ -24,8 +24,6 @@ class ChannelPool {
     this.closed = false
 
     try {
-      this.channels = new Array(this.size).fill(null)
-
       for (let i = 0; i < this.size; i++) {
         await this.#createPoolChannel(i)
       }

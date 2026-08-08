@@ -1848,3 +1848,77 @@ describe('ConsumerManager recovery guards', () => {
     assert.equal(harness.channel.consumers.length, consumesBefore, 'no recreation for a consumer on its way out')
   })
 })
+
+describe('ConsumerManager guards on partial inputs', () => {
+  test('a delivery without properties or fields is still settled', async () => {
+    // amqplib hands over what the broker sent; a message missing either shape
+    // must not crash the retry decision on its way to being nacked.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => { throw new Error('boom') }, {
+      retryPolicy: { attempts: 3 }
+    })
+
+    const consumer = harness.channel.consumers.at(-1)
+    const { content } = await harness.codec.encode({ n: 1 })
+
+    await consumer.callback({ content, fields: {}, properties: {} })
+
+    assert.equal(harness.channel.nacked.length, 1, 'the bare delivery was settled')
+    assert.equal(harness.channel.nacked[0].requeue, true, 'and the budget still applied to it')
+  })
+
+  test('a malformed retry policy names what it received', async () => {
+    // The message is the only thing the caller has to work with at subscribe
+    // time; "[object Object]" would send them hunting.
+    const harness = createManager()
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: { attempts: 0 } }),
+      /Invalid retryPolicy '\{"attempts":0\}'/
+    )
+
+    await assert.rejects(
+      () => harness.manager.subscribe('orders', async () => {}, { retryPolicy: 'twice' }),
+      /Invalid retryPolicy 'twice'/
+    )
+  })
+
+  test('a close from a channel the consumer already replaced triggers no recovery', async () => {
+    // The watcher fires per channel; after a recreation moved the consumer to
+    // a new one, the old channel's close is stale news.
+    const clock = new ManualClock()
+    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const staleChannel = harness.channel
+    const consumerId = harness.manager.findConsumerIdByTag(harness.channel.consumers.at(-1).consumerTag)
+
+    // Move the consumer onto a different channel, as a recreation would.
+    harness.manager.activeConsumers.get(consumerId).channel = new FakeChannel()
+
+    const consumesBefore = staleChannel.consumers.length
+
+    staleChannel.emit('close')
+    clock.advance(100)
+    await sleep(20)
+
+    assert.equal(staleChannel.consumers.length, consumesBefore, 'the stale channel recreated nothing')
+  })
+
+  test('unsubscribing while disconnected does not crash on the missing pool', async () => {
+    // The pool is gone during recovery; releasing a channel back to it has to
+    // tolerate that rather than throwing over a consumer being removed.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    let pool = harness.channelPool
+
+    harness.manager.getChannelPool = () => pool
+    pool = null
+
+    assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true)
+    assert.equal(harness.manager.activeConsumers.size, 0, 'the consumer was still removed')
+  })
+})

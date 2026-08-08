@@ -222,6 +222,9 @@ describe('ChannelPool', () => {
 
     assert.notEqual(pool.channels[0], original)
     assert.equal(pool.getChannel(), pool.channels[0], 'the replacement must be back in rotation')
+    // Occupying the slot is not enough: a replacement that was discarded as
+    // late (closed on the way in) would sit there dead and unusable.
+    assert.equal(pool.getChannel().closed, false, 'and it must be a LIVE channel')
   })
 
   test('a replacement that lands after the pool closed is discarded, not left open', async (t) => {

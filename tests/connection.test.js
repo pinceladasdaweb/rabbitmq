@@ -833,7 +833,10 @@ describe('RabbitMQConnection reconnect timer races', () => {
 
     const dialsBefore = dialer.dials
 
-    await scheduled.fn()
+    // fn() is the timer's arrow, which does not return the async work — give
+    // it a turn to finish or the assertions race it.
+    scheduled.fn()
+    await sleep(50)
 
     assert.equal(dialer.dials, dialsBefore, 'the stale callback dialed nothing')
     assert.deepEqual(reconnects, [], 'and announced no reconnection that never happened')

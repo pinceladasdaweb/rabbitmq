@@ -600,6 +600,26 @@ describe('Publisher unroutable detection', () => {
     assert.equal(channel.listenerCount('return'), 0, 'one listener per publish, removed on settle')
   })
 
+  test('a malformed basic.return cannot crash the correlation', async () => {
+    const { publisher, channel } = createPublisher()
+
+    channel.manualConfirms = true
+
+    const publishing = publisher.publish('orders', { id: 1 }, { mandatory: true })
+
+    // The listener is attached asynchronously, after the encode; emitting
+    // before that would prove nothing.
+    await waitFor(() => channel.listenerCount('return') > 0, 2000, 'return listener attached')
+
+    channel.emit('return', {})
+    channel.emit('return', { properties: {} })
+    channel.emit('return', undefined)
+
+    channel.releaseConfirms()
+
+    await publishing
+  })
+
   test("another publish's return does not fail this one", async () => {
     // Pool channels carry many publishes; matching on the routing key alone
     // let one message's return reject a message that had been delivered.

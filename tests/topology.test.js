@@ -227,6 +227,28 @@ describe('Topology moveToDeadLetter', () => {
     await assert.rejects(() => topology.moveToDeadLetter(buildMessage()), /no binding/)
   })
 
+  test('a malformed basic.return cannot crash the correlation', async () => {
+    // amqplib hands over whatever the broker sent; a return without
+    // properties or headers must simply not match, never throw.
+    const { topology, channel } = createTopology()
+
+    channel.manualConfirms = true
+
+    const move = topology.moveToDeadLetter(buildMessage())
+
+    // The listener is attached asynchronously; emitting before that would
+    // prove nothing.
+    await waitFor(() => channel.listenerCount('return') > 0, 2000, 'return listener attached')
+
+    channel.emit('return', {})
+    channel.emit('return', { properties: {} })
+    channel.emit('return', undefined)
+
+    channel.releaseConfirms()
+
+    await move
+  })
+
   test('ignores basic.return events for other routing keys', async () => {
     const { topology, channel } = createTopology()
 
@@ -351,6 +373,7 @@ describe('Topology isolation', () => {
     const poolChannel = new FakeChannel()
     const probeChannel = new FakeChannel()
     const released = []
+    const acquired = []
 
     const topology = new Topology({
       logger: silentLogger,
@@ -358,7 +381,7 @@ describe('Topology isolation', () => {
       delayExchange: 'delayed',
       getChannel: async () => poolChannel,
       getChannelPool: () => ({
-        getDedicatedChannel: async () => probeChannel,
+        getDedicatedChannel: async (id) => { acquired.push(id); return probeChannel },
         releaseDedicatedChannel: async (id) => released.push(id)
       }),
       getExchange: () => ({ name: 'main-exchange', type: 'topic' })
@@ -368,6 +391,9 @@ describe('Topology isolation', () => {
 
     assert.equal(await topology.isDelayPluginEnabled(), false)
     assert.deepEqual(poolChannel.assertedExchanges, [], 'no pool channel was risked')
+    // A real pool keys by id: acquiring under one and releasing under another
+    // would leak the channel while looking correct here.
+    assert.deepEqual(acquired, released, 'the channel is released under the id it was acquired with')
     assert.deepEqual(released, ['delay-probe'], 'the burnt channel was released')
   })
 })
