@@ -79,7 +79,7 @@
   "dependencies": {
     "@cacheable/node-cache": "^3.1.1",
     "amqplib": "^2.0.1",
-    "breakwater": "^0.7.0"
+    "breakwater": "^0.9.0"
   },
   "lint-staged": {
     "src/**/*.js": "standard",
