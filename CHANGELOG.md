@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 1.7.0 (2026-08-16)
+
+* build(deps): adopt breakwater 1.x and refresh the toolchain by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2cca31ad03f9c4836a4309f948944cfc0a499eb9)
+* feat: report each consumed message through per-message events (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/4e8db76cc20d7f9045321d621b91ffad84431dad)
+* docs: map every failure mode to its behavior and its signal by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/3a8ff317e12a55e585b84d4eb07d150bb8a1d20d)
+* ci: add Node 26 to the test matrix by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/67245d7256ed0d889ed740da1381904ae2c58873)
+* fix: consumers survive connection outages of any length by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/989d2c31055d36883a6cf910b6d363647d727a0d)
+* fix: event reporting can never interfere with message settlement by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bf37385b5498e77f526bcc4af883b2150016f7ce)
+* test: stop the suite leaking diagnostic reports and console noise by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/4de8ff2c01a669579ee89bfaf45319d702a996c4)
+* fix: unsubscribe drains in-flight handlers before closing the channel by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/4e6b3d834d70ca022cd50102d669d25e5e5ec842)
+* fix: one shared basic.return watcher, and mandatory is refused where it lies by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/5ad38d442628f307b689d1f6c1cea8f732efa96c)
+* refactor: remove derivable state and shadow APIs the review flagged by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/79e2de376f60d4207ef9b62ab1fd140ca55e9e07)
+* fix: restore the setupGracefulShutdown shim, and teach the gate Stryker 10 by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/31f01be4b7e5128921f189573d28507033ec7513)
+* release: full-src review round 2 — consumer lifecycle, events and mandatory fixes (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/454c87aa6d686bd7d17eb9aa803a58b1afcd07b5)
+
+
 ## 1.6.0 (2026-08-08)
 
 * fix: keep consumer tags valid across recreations and make the restore atomic by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/b992623be00734bdee7e03bc128b5d86198e5c8e)
