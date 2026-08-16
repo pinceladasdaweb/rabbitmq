@@ -1256,6 +1256,14 @@ The `RabbitMQ` instance is an `EventEmitter`. All emitted events:
 | `circuitBreakerStateChanged` | `'CLOSED' \| 'OPEN' \| 'HALF-OPEN'` | Every circuit breaker state transition |
 | `rateLimited` | `{ key, strategy }` | A publish was rejected by the rate limiter |
 | `rateBlocked` | `{ key, remainingTime }` | A publish hit a key blocked via `blockRateLimit()` |
+| `messageProcessed` | `{ queue, messageId, consumerTag, durationMs }` | A consumed message was handled successfully (every subscribe variant) |
+| `messageFailed` | `{ queue, messageId, consumerTag, durationMs, error, requeued }` | A consumed message failed — handler crash, decode failure or an expired `depends-on` dependency |
+
+Notes on the per-message events:
+
+- `durationMs` measures the handler work. It is `undefined` on `messageFailed` when the message never ran — a sequential message that expired waiting for its `depends-on` dependency.
+- `requeued` reports what actually happened to the delivery, not what the retry policy wanted: under `noAck` it is always `false`, because there was nothing left to requeue.
+- A duplicate delivery of a message parked behind a dependency is acknowledged and dropped without an event — the original reports once, when it completes.
 
 Example:
 
@@ -1266,6 +1274,14 @@ rabbitMQ.on('consumerLost', ({ queueName }) => {
 
 rabbitMQ.on('circuitBreakerStateChanged', (state) => {
   metrics.gauge('rabbitmq.circuit_breaker', state === 'CLOSED' ? 0 : 1)
+})
+
+rabbitMQ.on('messageProcessed', ({ queue, durationMs }) => {
+  metrics.histogram('rabbitmq.consume_duration_ms', durationMs, { queue })
+})
+
+rabbitMQ.on('messageFailed', ({ queue, requeued, error }) => {
+  metrics.increment('rabbitmq.consume_failures', { queue, requeued })
 })
 ```
 

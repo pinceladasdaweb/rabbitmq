@@ -111,6 +111,17 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     return: falling through reaches the budget branch, where 'none'.attempts
 //     is undefined and `undefined > 1` is false — the same no-requeue answer
 //     by a longer road.
+//   - consumer-manager.js the messageProcessed payload's
+//     `msg.properties?.messageId`: a delivery without properties throws
+//     reading the compression header and can only reach the FAILED event, so
+//     properties is always present on the success path. (The failed twin IS
+//     load-bearing and killed by the no-properties test; fields?.consumerTag
+//     is killable on both paths and killed by the no-fields tests.)
+//   - consumer-manager.js sequential onSuccess's `meta?.duplicate` and
+//     `meta?.durationMs`: SequentialProcessor passes a meta object at every
+//     onSuccess call site, so the chain cannot miss. Kept because onFailure's
+//     meta genuinely can be absent (dependency-expiry settles from cleanup)
+//     and the symmetric shape is the readable one.
 //   - consumer-manager.js disposeAll's cancelled = true: the loop is
 //     synchronous and activeConsumers.clear() follows immediately, so no
 //     concurrent observer can see the flag between the two.

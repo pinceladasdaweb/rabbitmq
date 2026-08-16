@@ -339,10 +339,30 @@ class ConsumerManager {
     const prefetchCount = options.prefetchCount ?? hooks.defaultPrefetch
     const shouldRequeue = (message, error) => this.#shouldRequeue(message, error, retryPolicy)
 
+    // Per-message observability, one payload shape for every subscribe
+    // variant. `requeued` reports what actually happened to the delivery:
+    // under noAck nothing is ever requeued, whatever the retry policy says.
+    const events = {
+      processed: (msg, durationMs) => this.emit('messageProcessed', {
+        queue: queueName,
+        messageId: msg.properties?.messageId,
+        consumerTag: msg.fields?.consumerTag,
+        durationMs
+      }),
+      failed: (msg, error, requeue, durationMs) => this.emit('messageFailed', {
+        queue: queueName,
+        messageId: msg.properties?.messageId,
+        consumerTag: msg.fields?.consumerTag,
+        durationMs,
+        error,
+        requeued: noAck ? false : requeue
+      })
+    }
+
     const consumerId = this.registerConsumer(queueName, async () => {
       const channel = await this.getDedicatedChannel(consumerId)
       const consumerInfo = this.activeConsumers.get(consumerId)
-      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue })
+      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue, events })
 
       if (!noAck) {
         await channel.prefetch(prefetchCount)
@@ -357,11 +377,20 @@ class ConsumerManager {
 
         this.attachAckControls(msg, channel)
 
+        const startedAt = this.clock.now()
+
         try {
           const isCompressed = Boolean(msg.properties.headers && msg.properties.headers['x-compressed'])
           const decodedContent = await this.codec.decode(msg.content, isCompressed)
 
           await processMessage(decodedContent, msg)
+
+          // The sequential processor settles asynchronously (a message can be
+          // parked behind its dependency), so a clean return here says nothing
+          // about the outcome — that path reports through the events helper.
+          if (!hooks.outcomeFromProcessor) {
+            events.processed(msg, this.clock.now() - startedAt)
+          }
         } catch (error) {
           // describeError, not error.message: a handler can throw null or a
           // string, and a crash here would leave the delivery unsettled
@@ -372,8 +401,12 @@ class ConsumerManager {
           // errors included. A decode failure is deterministic, so under
           // 'once' it costs one pointless redelivery before the DLQ — the
           // price of a single rule with no carve-outs to remember.
+          const requeue = shouldRequeue(msg, error)
+
+          events.failed(msg, error, requeue, this.clock.now() - startedAt)
+
           if (!noAck) {
-            this.settleAck(msg, channel, 'nack', shouldRequeue(msg, error))
+            this.settleAck(msg, channel, 'nack', requeue)
           }
         }
       }
@@ -432,7 +465,11 @@ class ConsumerManager {
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
-      createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
+      // handle() returning cleanly can mean "parked behind a dependency", so
+      // the outcome events come from onSuccess/onFailure below, where the
+      // settlement actually happens.
+      outcomeFromProcessor: true,
+      createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue, events }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
         consumerInfo.sequentialProcessor?.dispose()
 
@@ -442,18 +479,30 @@ class ConsumerManager {
           staleTimeout,
           shouldRequeue,
           clock: this.clock,
-          onSuccess: (message) => {
+          onSuccess: (message, meta) => {
             if (!noAck) {
               this.settleAck(message, channel, 'ack')
+            }
+
+            // A duplicate delivery of a parked message is acked and dropped —
+            // the original will report when it actually completes, and a
+            // second messageProcessed would double-count it.
+            if (!meta?.duplicate) {
+              events.processed(message, meta?.durationMs)
             }
           },
           // Consumer callback failures must NOT feed the circuit breaker: it
           // gates publishing, and poison messages on one queue would block
           // every publish in the application.
-          onFailure: (message, error, requeue) => {
+          onFailure: (message, error, requeue, meta) => {
             if (!noAck) {
               this.settleAck(message, channel, 'nack', requeue)
             }
+
+            // meta.durationMs is absent for a parked message that expired
+            // waiting for its dependency: it never ran, so there is no
+            // duration to report.
+            events.failed(message, error, requeue, meta?.durationMs)
           }
         })
 

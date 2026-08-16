@@ -39,7 +39,7 @@ class SequentialProcessor {
       // duplicate is acknowledged and dropped.
       if (this.pending.has(messageId)) {
         this.logger?.info(`Duplicate delivery of pending message ${messageId} acknowledged`)
-        this.onSuccess(message)
+        this.onSuccess(message, { duplicate: true })
 
         return
       }
@@ -94,14 +94,14 @@ class SequentialProcessor {
 
       await this.callback(content, message)
 
-      if (messageId) {
-        const processingTime = this.clock.now() - startTime
+      const durationMs = this.clock.now() - startTime
 
+      if (messageId) {
         this.processing.delete(messageId)
-        this.logger?.info(`Successfully processed message ${messageId} in ${processingTime}ms`)
+        this.logger?.info(`Successfully processed message ${messageId} in ${durationMs}ms`)
       }
 
-      this.onSuccess(message)
+      this.onSuccess(message, { durationMs })
 
       // No messageId guard: nothing can ever be parked under undefined
       // (parking requires a truthy id), so the lookup is a natural no-op.
@@ -116,7 +116,7 @@ class SequentialProcessor {
       // .message here used to crash the catch and skip onFailure entirely,
       // leaving the message unacknowledged (issue #18).
       this.logger?.error(`Error processing message ${messageId || '(no messageId)'}: ${describeError(error)}`)
-      this.onFailure(message, error, requeue)
+      this.onFailure(message, error, requeue, { durationMs: this.clock.now() - startTime })
     }
   }
 

@@ -242,6 +242,30 @@ export interface Consumer {
   consumerTag: string
 }
 
+export interface MessageProcessedEvent {
+  queue: string
+  messageId?: string
+  consumerTag?: string
+  durationMs?: number
+}
+
+export interface MessageFailedEvent {
+  queue: string
+  messageId?: string
+  consumerTag?: string
+  /**
+   * Absent when the message never ran — e.g. a sequential message that
+   * expired waiting for its `depends-on` dependency.
+   */
+  durationMs?: number
+  error: unknown
+  /**
+   * What actually happened to the delivery. Always `false` under `noAck`,
+   * whatever the retry policy says.
+   */
+  requeued: boolean
+}
+
 export interface ClusterStatus {
   connectedTo: string
   allEndpoints: string[]
@@ -259,6 +283,14 @@ export type RpcHandler = (content: unknown, message: ConsumeMessage) => unknown 
 
 export declare class RabbitMQ extends EventEmitter {
   constructor (options?: RabbitMQOptions)
+
+  on (event: 'messageProcessed', listener: (event: MessageProcessedEvent) => void): this
+  on (event: 'messageFailed', listener: (event: MessageFailedEvent) => void): this
+  on (event: string | symbol, listener: (...args: any[]) => void): this
+
+  once (event: 'messageProcessed', listener: (event: MessageProcessedEvent) => void): this
+  once (event: 'messageFailed', listener: (event: MessageFailedEvent) => void): this
+  once (event: string | symbol, listener: (...args: any[]) => void): this
 
   connect (options?: ConnectOptions): Promise<unknown | null>
   disconnect (): Promise<void>
