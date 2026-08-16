@@ -1296,6 +1296,56 @@ See [examples/21 - consumer-management](examples/21%20-%20consumer-management) a
     const state = rabbitMQ.getCircuitBreakerState()
     ```
 
+## Failure Modes
+
+What the library does when things go wrong, and how each condition surfaces. Every row is pinned by tests — including integration tests against a real broker and a real three-node cluster.
+
+### Connection
+
+| Condition | What the library does | How it surfaces |
+|-----------|----------------------|-----------------|
+| Broker connection lost | Reconnects automatically with backoff, rotating through every configured endpoint. Once the dial succeeds, the channel pool, the exchange and **every consumer** are restored — atomically: if any step fails, the half-built state is torn down and the next cycle retries from scratch. | `disconnected`, then `connected` and `reconnected` |
+| State restore fails after a successful dial | The half-restored pool is closed, nothing is left half-alive, and the reconnection cycle keeps running. | `reconnectError` |
+| Reconnection exhausts `maxReconnectAttempts` | The client stops trying. Callers parked in `connect({ waitForConnection: true })` are rejected instead of hanging. | `reconnectFailed` |
+| Cluster node fails over | Reconnection lands on another endpoint. In-flight unacked deliveries are requeued by the broker; a quorum queue's `x-delivery-count` survives the failover, so `{ attempts: N }` budgets stay honest. | `reconnected`, plus `getClusterStatus().connectedTo` |
+
+See [Reconnection Options](#reconnection-options).
+
+### Publishing
+
+| Condition | What the library does | How it surfaces |
+|-----------|----------------------|-----------------|
+| Publish while disconnected | Fails fast — the connection probe runs before rate-limit tokens are consumed and outside the circuit breaker, so an outage neither drains quotas nor trips the breaker (reconnection already owns that failure). | The publish rejects with `Not connected to RabbitMQ` |
+| Broker refuses / does not confirm | Retries up to `maxRetries` (default 3) with exponential backoff. `publishBatch` retries **only the unconfirmed messages** of the batch. | The publish rejects after the budget is spent |
+| Repeated failures | The circuit breaker opens after `failureThreshold` consecutive failures and publishes fail fast until a probe succeeds. It resets to CLOSED on a successful reconnection — old failures say nothing about the new connection. | `circuitBreakerStateChanged` |
+| Unroutable routing key | Silently dropped by AMQP — unless you pass `mandatory: true`, which makes the publish reject with `code: 'UNROUTABLE'`. | See [Unroutable publishes](#unroutable-publishes-mandatory) |
+| Rate limit hit | The publish is rejected before reaching the broker, with `code: 'RATE_LIMIT_EXCEEDED'`. | `rateLimited` / `rateBlocked` |
+
+### Consuming
+
+| Condition | What the library does | How it surfaces |
+|-----------|----------------------|-----------------|
+| Handler throws | The delivery is settled under the subscription's [`retryPolicy`](#failure-policy-retrypolicy) — `'none'` dead-letters, `'once'` retries a first delivery, `{ attempts: N }` spends a broker-counted budget. Decode failures follow the same rule. | `messageFailed` with the real `requeued` decision |
+| Consumer channel dies | The consumer is recovered on a fresh channel, with backoff. Consumers never die silently. | `consumerCancelled`, then `consumerRecovered` |
+| Broker cancels the consumer (queue deleted) | Same recovery loop; when the attempts are exhausted the consumer is dropped **loudly**. | `consumerLost` |
+| Worker thread dies (`subscribeParallel`) | Respawned up to `maxRespawns`; messages in flight on the dead worker fail and follow the retry policy. When the budget is gone, queued work is rejected instead of hanging. | `messageFailed` per message |
+| Sequential dependency never arrives | After `staleTimeout` (default 30s) the parked message is settled under the retry policy — under `'once'` it goes back once (the dependency may still arrive), a redelivery is dead-lettered. | `messageFailed` with `durationMs: undefined` |
+| Duplicate delivery of a parked message | Acked and dropped — the tracked original settles exactly once. | A single `messageProcessed` |
+
+### RPC
+
+| Condition | What the library does | How it surfaces |
+|-----------|----------------------|-----------------|
+| Responder is slow or gone | `request()` rejects after `timeout` (default 30s). The request is published with a matching `expiration`, so a request nobody will ever answer does not rot in the queue. | The request rejects |
+| Responder queue does not exist | The request fails immediately instead of burning the caller's timeout. | Rejects with `code: 'RPC_UNROUTABLE'` |
+
+### Process
+
+| Condition | What the library does | How it surfaces |
+|-----------|----------------------|-----------------|
+| SIGINT / SIGTERM | With `enableGracefulShutdown()`, the client disconnects cleanly (and exits, unless `exitProcess: false`); closing the channels hands every unacked delivery back to its queue. | `disconnected` |
+| Event-loop exit | Housekeeping timers (rate-limit sweeps, sequential cleanup, retry backoff sleeps) are unref'd and never hold the process open. A **pending reconnection does** — deliberately, so a worker that only consumes does not exit mid-outage as if it were done. | The process exits when the work is done |
+
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the setup, the commands and the rules a change has to meet — most of them are about the failure modes this library hides well, like a consumer that silently stops draining or a message settled on the wrong channel.
