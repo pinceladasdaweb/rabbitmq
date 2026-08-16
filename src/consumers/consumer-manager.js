@@ -263,16 +263,25 @@ class ConsumerManager {
       // State tied to the dead channel goes with it either way.
       consumerInfo.sequentialProcessor?.dispose()
 
-      const channelPool = this.getChannelPool()
+      // amqplib closes every channel synchronously BEFORE the connection
+      // announces its own close, so at this instant a connection-level drop
+      // is indistinguishable from a channel-level one — the pool still looks
+      // healthy. The whole teardown runs in one synchronous stack, so one
+      // microtask later the facade has already nulled the pool if the whole
+      // connection went; only then can the two losses be told apart.
+      queueMicrotask(() => {
+        const channelPool = this.getChannelPool()
 
-      // A pool teardown (disconnect, or a connection that dropped) closes
-      // every channel too; that path belongs to recreateAll, and racing it
-      // here would duplicate consumers or burn the retry budget against a
-      // broker that is not there.
-      if (!channelPool || channelPool.closed) return
-      if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
+        // Pool gone or closed: the connection dropped (or a disconnect is in
+        // flight), and recovery belongs to recreateAll — racing it here would
+        // duplicate consumers or burn the retry budget against a broker that
+        // is not there, permanently dropping consumers the reconnection
+        // would have restored.
+        if (!channelPool || channelPool.closed) return
+        if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
 
-      this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+        this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+      })
     })
   }
 
@@ -296,6 +305,14 @@ class ConsumerManager {
 
     const maxAttempts = 3
     let knownEpoch = consumerInfo.epoch
+    // Ownership fence: this loop only recovers on the pool that lost the
+    // consumer. A different (or missing) pool means a reconnection cycle is
+    // running and recreateAll owns every registered consumer — recovering
+    // here as well would consume the same queue twice, and the epoch check
+    // alone cannot see a recreation that has not happened YET (the window
+    // between the new pool being installed and recreateAll reaching this
+    // consumer).
+    const ownedPool = this.getChannelPool()
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await this.clock.sleep(this.recoveryInterval * attempt)
@@ -303,6 +320,7 @@ class ConsumerManager {
       const currentInfo = this.activeConsumers.get(consumerId)
 
       if (!currentInfo || currentInfo.cancelled) return
+      if (this.getChannelPool() !== ownedPool) return
 
       // Someone else (e.g. recreateAll after a reconnection) already
       // recreated this consumer while we were backing off — recovering

@@ -346,6 +346,24 @@ export class FakeAmqpConnection extends EventEmitter {
     return channel
   }
 
+  // Faithful to amqplib (lib/connection.js, toClosed): a dying connection
+  // closes every channel — each synchronously emitting its own 'close' —
+  // BEFORE the connection announces its own. Modelling the order here is what
+  // lets tests see the window where a consumer's dedicated channel is already
+  // dead but the facade has not torn the pool down yet.
+  emit (event, ...args) {
+    if (event === 'close') {
+      for (const channel of this.channels) {
+        if (!channel.closed) {
+          channel.closed = true
+          channel.emit('close')
+        }
+      }
+    }
+
+    return super.emit(event, ...args)
+  }
+
   async close () {
     this.closed = true
   }

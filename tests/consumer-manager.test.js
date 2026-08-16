@@ -2207,3 +2207,46 @@ describe('ConsumerManager per-message events', () => {
     assert.equal(failed.payload.requeued, false)
   })
 })
+
+describe('ConsumerManager recovery ownership fence', () => {
+  test('recovery yields when the channel pool changed while it was backing off', async () => {
+    // The window recreateAll cannot see: a recovery wake landing after the
+    // new pool is installed but before recreateAll reaches this consumer.
+    // Without the pool-identity fence the recovery would consume the queue a
+    // second time — the epoch check alone cannot catch a recreation that has
+    // not happened yet.
+    const harness = createManager()
+    const cancelled = []
+    const recovered = []
+
+    harness.manager.emit = (event) => {
+      if (event === 'consumerCancelled') cancelled.push(event)
+      if (event === 'consumerRecovered') recovered.push(event)
+    }
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    // The dedicated channel dies while the pool is still the one that lost
+    // it; the watcher hands the loss to the recovery loop.
+    harness.channel.emit('close')
+    await waitFor(() => cancelled.length === 1, 3000, 'recovery started')
+
+    // A reconnection installs a NEW pool while the recovery sleeps.
+    const freshChannel = new (harness.channel.constructor)()
+
+    harness.manager.getChannelPool = () => ({
+      getDedicatedChannel: async () => freshChannel,
+      releaseDedicatedChannel: async () => {}
+    })
+
+    // Let every backoff attempt elapse (20ms base -> 20+40+60).
+    await sleep(200)
+
+    assert.deepEqual(recovered, [], 'recovery must not act on a pool it does not own')
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no consume on the dead pool')
+    assert.equal(freshChannel.consumers.length, 0, 'no duplicate consume on the new pool — that setup belongs to recreateAll')
+    assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer stays registered for recreateAll to restore')
+  })
+})
