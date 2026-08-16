@@ -120,7 +120,11 @@ class RabbitMQ extends EventEmitter {
       getChannel: () => this.getChannel(),
       getChannelPool: () => this.#channelPool,
       getQueueNameByConsumerTag: (consumerTag) => this.#consumers?.findQueueNameByTag(consumerTag) ?? null,
-      emit: (event, payload) => this.emit(event, payload)
+      emit: (event, payload) => this.emit(event, payload),
+      // The consume pipeline skips building per-message event payloads when
+      // nobody subscribed to them — one integer compare instead of an
+      // allocation per delivery.
+      listenerCount: (event) => this.listenerCount(event)
     }
 
     this.#publisher = new Publisher(context)

@@ -16,6 +16,11 @@ class ConsumerManager {
     this.getChannelPool = context.getChannelPool
     this.getChannel = context.getChannel
     this.emit = context.emit
+    // Lets the hot per-message path skip building event payloads nobody is
+    // listening for. Defaults to "someone is listening" so a context without
+    // the hook (tests constructing the manager directly) still sees every
+    // event.
+    this.listenerCount = context.listenerCount ?? (() => 1)
     this.activeConsumers = new Map()
     this.consumersByTag = new Map()
     this.workerPools = new Map()
@@ -285,6 +290,17 @@ class ConsumerManager {
     })
   }
 
+  // A crashing event listener is the listener's bug: it must never leave a
+  // delivery unsettled or misreport an outcome that already happened, so the
+  // per-message emits are contained here (issue #18's class of failure).
+  #emitOutcome (event, payload) {
+    try {
+      this.emit(event, payload)
+    } catch (error) {
+      this.logger.error(`A '${event}' listener threw: ${describeError(error)}`)
+    }
+  }
+
   // Broker-initiated cancellation (e.g. queue deleted): notify and try to
   // recreate the consumer with backoff; on giving up, remove it and emit consumerLost.
   async handleBrokerCancel (consumerId) {
@@ -360,21 +376,33 @@ class ConsumerManager {
     // Per-message observability, one payload shape for every subscribe
     // variant. `requeued` reports what actually happened to the delivery:
     // under noAck nothing is ever requeued, whatever the retry policy says.
+    // Reporting never interferes with the pipeline: payloads are only built
+    // when someone is listening, and both emits are crash-proofed — every
+    // caller settles the delivery BEFORE reporting, and #emitOutcome keeps a
+    // throwing listener from rerouting a settled outcome (issue #18's class).
     const events = {
-      processed: (msg, durationMs) => this.emit('messageProcessed', {
-        queue: queueName,
-        messageId: msg.properties?.messageId,
-        consumerTag: msg.fields?.consumerTag,
-        durationMs
-      }),
-      failed: (msg, error, requeue, durationMs) => this.emit('messageFailed', {
-        queue: queueName,
-        messageId: msg.properties?.messageId,
-        consumerTag: msg.fields?.consumerTag,
-        durationMs,
-        error,
-        requeued: noAck ? false : requeue
-      })
+      processed: (msg, durationMs) => {
+        if (this.listenerCount('messageProcessed') === 0) return
+
+        this.#emitOutcome('messageProcessed', {
+          queue: queueName,
+          messageId: msg.properties?.messageId,
+          consumerTag: msg.fields?.consumerTag,
+          durationMs
+        })
+      },
+      failed: (msg, error, requeue, durationMs) => {
+        if (this.listenerCount('messageFailed') === 0) return
+
+        this.#emitOutcome('messageFailed', {
+          queue: queueName,
+          messageId: msg.properties?.messageId,
+          consumerTag: msg.fields?.consumerTag,
+          durationMs,
+          error,
+          requeued: noAck ? false : requeue
+        })
+      }
     }
 
     const consumerId = this.registerConsumer(queueName, async () => {
@@ -401,14 +429,10 @@ class ConsumerManager {
           const isCompressed = Boolean(msg.properties.headers && msg.properties.headers['x-compressed'])
           const decodedContent = await this.codec.decode(msg.content, isCompressed)
 
+          // Outcome reporting belongs to the processor, uniformly: only it
+          // knows when a message actually settled (the sequential one can
+          // park a message behind its dependency and settle it much later).
           await processMessage(decodedContent, msg)
-
-          // The sequential processor settles asynchronously (a message can be
-          // parked behind its dependency), so a clean return here says nothing
-          // about the outcome — that path reports through the events helper.
-          if (!hooks.outcomeFromProcessor) {
-            events.processed(msg, this.clock.now() - startedAt)
-          }
         } catch (error) {
           // describeError, not error.message: a handler can throw null or a
           // string, and a crash here would leave the delivery unsettled
@@ -421,11 +445,11 @@ class ConsumerManager {
           // price of a single rule with no carve-outs to remember.
           const requeue = shouldRequeue(msg, error)
 
-          events.failed(msg, error, requeue, this.clock.now() - startedAt)
-
           if (!noAck) {
             this.settleAck(msg, channel, 'nack', requeue)
           }
+
+          events.failed(msg, error, requeue, this.clock.now() - startedAt)
         }
       }
 
@@ -459,12 +483,18 @@ class ConsumerManager {
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
-      createProcessor: ({ channel, noAck }) => async (content, msg) => {
+      createProcessor: ({ channel, noAck, events }) => async (content, msg) => {
+        const startedAt = this.clock.now()
+
         await callback(content, msg)
 
         if (!noAck) {
           this.settleAck(msg, channel, 'ack')
         }
+
+        // After the ack, always: reporting must never reroute a message that
+        // already succeeded into the failure path.
+        events.processed(msg, this.clock.now() - startedAt)
       }
     })
   }
@@ -484,9 +514,8 @@ class ConsumerManager {
       defaultRetryPolicy: 'once',
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
       // handle() returning cleanly can mean "parked behind a dependency", so
-      // the outcome events come from onSuccess/onFailure below, where the
+      // this processor reports from onSuccess/onFailure below, where the
       // settlement actually happens.
-      outcomeFromProcessor: true,
       createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue, events }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
         consumerInfo.sequentialProcessor?.dispose()

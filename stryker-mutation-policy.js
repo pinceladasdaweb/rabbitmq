@@ -111,6 +111,10 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     return: falling through reaches the budget branch, where 'none'.attempts
 //     is undefined and `undefined > 1` is false — the same no-requeue answer
 //     by a longer road.
+//   - consumer-manager.js the listenerCount default `(() => 1)` -> `(() =>
+//     undefined)`: the only consumer compares the return against 0 with
+//     strict equality, and undefined !== 0 emits exactly like 1 does — any
+//     non-zero return is the same "someone is listening" answer.
 //   - consumer-manager.js the messageProcessed payload's
 //     `msg.properties?.messageId`: a delivery without properties throws
 //     reading the compression header and can only reach the FAILED event, so

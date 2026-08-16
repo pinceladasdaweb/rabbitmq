@@ -2250,3 +2250,88 @@ describe('ConsumerManager recovery ownership fence', () => {
     assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer stays registered for recreateAll to restore')
   })
 })
+
+describe('ConsumerManager event reporting never interferes with settlement', () => {
+  test('a throwing messageFailed listener cannot leave the delivery unsettled', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        if (event === 'messageFailed') throw new Error('listener boom')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('handler exploded')
+    }, { retryPolicy: 'once' })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    assert.deepEqual(
+      harness.channel.nacked.map(n => n.requeue),
+      [true],
+      'the nack happened before the listener could interfere'
+    )
+    assert.ok(
+      logger.records.error.some(line => line.includes("'messageFailed' listener threw") && line.includes('listener boom')),
+      'the listener crash is reported as the listener bug it is'
+    )
+  })
+
+  test('a throwing messageProcessed listener cannot turn a success into a failure', async () => {
+    const logger = recordingLogger()
+    const emitted = []
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        emitted.push(event)
+
+        if (event === 'messageProcessed') throw new Error('metrics down')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {})
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    assert.equal(harness.channel.acked.length, 1, 'the ack stands')
+    assert.equal(harness.channel.nacked.length, 0)
+    assert.ok(!emitted.includes('messageFailed'), 'no spurious failure report for an acked message')
+    assert.ok(logger.records.error.some(line => line.includes("'messageProcessed' listener threw")))
+  })
+
+  test('the sequential path contains a throwing listener the same way', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        if (event === 'messageProcessed') throw new Error('listener boom')
+      }
+    })
+
+    await harness.manager.subscribeSequential('orders', async () => {})
+
+    await deliver(harness, { step: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => harness.channel.acked.length === 1, 3000, 'sequential message acked')
+
+    assert.ok(logger.records.error.some(line => line.includes("'messageProcessed' listener threw")))
+  })
+
+  test('no listener, no payload: events are skipped entirely when nobody subscribed', async () => {
+    // Arg-sensitive on purpose: the guard must ask about THIS event's
+    // listeners, not about listeners in general.
+    const harness = createManager({
+      listenerCount: (event) => (event === 'messageProcessed' || event === 'messageFailed') ? 0 : 1
+    })
+
+    await harness.manager.subscribe('orders', async (content) => {
+      if (content.explode) throw new Error('boom')
+    })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await deliver(harness, { explode: true }, { messageId: 'm2', headers: { 'x-compressed': false } })
+
+    assert.deepEqual(harness.events, [], 'emit was never called, success and failure alike')
+    assert.equal(harness.channel.acked.length, 1, 'the ack is unaffected')
+    assert.equal(harness.channel.nacked.length, 1, 'the nack is unaffected')
+  })
+})
