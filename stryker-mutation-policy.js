@@ -111,6 +111,10 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     return: falling through reaches the budget branch, where 'none'.attempts
 //     is undefined and `undefined > 1` is false — the same no-requeue answer
 //     by a longer road.
+//   - routable-publish.js the watch entry `{ returned: false }` -> `{}`: the
+//     only reads are `entry.returned = true` (works on either shape) and the
+//     final falsy check, where a missing property and false are the same
+//     "not returned" answer.
 //   - consumer-manager.js the listenerCount default `(() => 1)` -> `(() =>
 //     undefined)`: the only consumer compares the return against 0 with
 //     strict equality, and undefined !== 0 emits exactly like 1 does — any

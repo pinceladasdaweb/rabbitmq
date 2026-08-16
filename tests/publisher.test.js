@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
 import Publisher from '../src/messaging/publisher.js'
 import MessageCodec from '../src/messaging/message-codec.js'
+import { watchCount } from '../src/messaging/routable-publish.js'
 import CircuitBreaker from '../src/resilience/circuit-breaker.js'
 import { FakeChannel, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
 
@@ -390,6 +391,24 @@ describe('Publisher fire-and-forget (publishAsync)', () => {
     assert.equal(channel.published[0].options.headers['x-async'], true)
   })
 
+  test('refuses mandatory loudly: fire-and-forget cannot see a basic.return', async () => {
+    // Accepting the flag would let the broker return the message to a channel
+    // nobody watches while the promise resolves as success — the exact silent
+    // drop the option's contract promises to prevent.
+    const { publisher, channel } = createPublisher()
+
+    await assert.rejects(
+      () => publisher.publishAsync('orders', { id: 1 }, { mandatory: true }),
+      /'mandatory' option needs a broker confirm.*publishAsync is fire-and-forget/
+    )
+    await assert.rejects(
+      () => publisher.publishAsyncBatch('orders', [{ id: 1 }], { mandatory: true }),
+      /publishAsyncBatch is fire-and-forget/
+    )
+
+    assert.equal(channel.published.length, 0, 'nothing reached the broker')
+  })
+
   test('waits for drain when the write buffer is full', async () => {
     const { publisher, channel } = createPublisher()
 
@@ -591,13 +610,59 @@ describe('Publisher unroutable detection', () => {
     await publisher.publish('orders', { id: 1 })
   })
 
-  test('a routable mandatory publish resolves and leaves no return listener', async () => {
+  test('the return token rides a stable, named header and is cleaned up on settle', async () => {
+    // The header name is contract: it travels on the wire and DLQ consumers
+    // can read it. The registry entry must die with the publish, or every
+    // mandatory publish leaks a token on a channel that lives for hours.
+    const { publisher, channel } = createPublisher()
+
+    channel.manualConfirms = true
+
+    assert.equal(watchCount(channel), 0, 'a channel nobody watched yet answers 0, not a crash')
+
+    const publishing = publisher.publish('orders', { id: 1 }, { mandatory: true })
+
+    await waitFor(() => channel.published.length === 1, 2000, 'publish reached the channel')
+    assert.ok(channel.published[0].options.headers['x-return-token'], 'the token is under its documented header')
+    assert.equal(watchCount(channel), 1, 'the in-flight publish is being watched')
+
+    channel.releaseConfirms(1)
+    await publishing
+
+    assert.equal(watchCount(channel), 0, 'the settled publish left no token behind')
+  })
+
+  test('mandatory publishes share ONE persistent return listener per channel', async () => {
+    // A listener per publish stacked up on the shared pool channel: a
+    // mandatory batch over 10 messages tripped MaxListenersExceededWarning
+    // and every basic.return scanned O(N) listeners.
     const { publisher, channel } = createPublisher()
 
     await publisher.publish('orders', { id: 1 }, { mandatory: true })
-
     assert.equal(channel.published.length, 1)
-    assert.equal(channel.listenerCount('return'), 0, 'one listener per publish, removed on settle')
+    assert.equal(channel.listenerCount('return'), 1, 'the channel-wide watcher is installed')
+
+    await publisher.publishBatch('orders', Array.from({ length: 15 }, (_, n) => ({ n })), { mandatory: true })
+    assert.equal(channel.listenerCount('return'), 1, 'fifteen concurrent publishes still mean one listener')
+  })
+
+  test('a mandatory batch never trips the MaxListenersExceededWarning', async () => {
+    const { publisher, channel } = createPublisher()
+    const warnings = []
+    const onWarning = (warning) => warnings.push(warning)
+
+    process.on('warning', onWarning)
+
+    try {
+      await publisher.publishBatch('orders', Array.from({ length: 15 }, (_, n) => ({ n })), { mandatory: true })
+      // Warnings are emitted asynchronously; give them the turn they need.
+      await new Promise(resolve => setImmediate(resolve))
+    } finally {
+      process.off('warning', onWarning)
+    }
+
+    assert.equal(channel.published.length, 15)
+    assert.deepEqual(warnings.map(w => w.name).filter(name => name === 'MaxListenersExceededWarning'), [])
   })
 
   test('a malformed basic.return cannot crash the correlation', async () => {

@@ -798,7 +798,7 @@ try {
 }
 ```
 
-Available on `publish`, `publishBatch` and `publishDelayed`. RPC requests already publish `mandatory` and surface the same condition as `RPC_UNROUTABLE`.
+Available on `publish`, `publishBatch` and `publishDelayed`. RPC requests already publish `mandatory` and surface the same condition as `RPC_UNROUTABLE`. The fire-and-forget methods (`publishAsync`, `publishAsyncBatch`) cannot see the broker's return — they **reject** `mandatory: true` at the call site instead of silently ignoring it; use a confirmed method when routability matters.
 
 #### Failure policy (`retryPolicy`)
 

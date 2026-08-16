@@ -100,6 +100,11 @@ export interface PublishOptions {
    * queue is bound for the routing key. Without it an unroutable publish is
    * discarded in silence and still confirmed, so the caller is told it
    * succeeded; with it, the publish rejects with `code: 'UNROUTABLE'`.
+   *
+   * Honored by `publish`, `publishBatch` and `publishDelayed`. The
+   * fire-and-forget methods (`publishAsync`, `publishAsyncBatch`) cannot see
+   * the broker's return and REJECT this option instead of silently ignoring
+   * it.
    */
   mandatory?: boolean
   [key: string]: unknown

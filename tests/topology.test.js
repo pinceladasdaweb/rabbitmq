@@ -201,14 +201,16 @@ describe('Topology moveToDeadLetter', () => {
     )
   })
 
-  test('removes its return listener once the move settles', async () => {
-    // moveToDeadLetter attaches a basic.return listener per call; leaving it
-    // behind would fire it for every later return on this shared channel.
+  test('repeated moves share one persistent return listener on the channel', async () => {
+    // The shared watcher keeps a token registry behind a single listener;
+    // per-call listeners would accumulate scans on this shared channel.
     const { topology, channel } = createTopology()
 
     await topology.moveToDeadLetter(buildMessage())
+    await topology.moveToDeadLetter(buildMessage())
+    await topology.moveToDeadLetter(buildMessage())
 
-    assert.equal(channel.listenerCount('return'), 0, 'no listener leaked')
+    assert.equal(channel.listenerCount('return'), 1, 'one watcher, however many moves')
   })
 
   test('rejects when the broker does not confirm the publish', async () => {
@@ -394,7 +396,33 @@ describe('Topology isolation', () => {
     // A real pool keys by id: acquiring under one and releasing under another
     // would leak the channel while looking correct here.
     assert.deepEqual(acquired, released, 'the channel is released under the id it was acquired with')
-    assert.deepEqual(released, ['delay-probe'], 'the burnt channel was released')
+    assert.deepEqual(released, ['delay-probe-1'], 'the burnt channel was released')
+  })
+
+  test('concurrent probes get channels of their own, not each other\'s', async () => {
+    // One shared 'delay-probe' id meant the first caller's release() closed
+    // the cached channel under the second caller's in-flight assertExchange,
+    // which then failed with a spurious channel-closed error.
+    const acquired = []
+    const released = []
+
+    const topology = new Topology({
+      logger: silentLogger,
+      deadLetterExchange: 'dlx',
+      delayExchange: 'delayed',
+      getChannel: async () => new FakeChannel(),
+      getChannelPool: () => ({
+        getDedicatedChannel: async (id) => { acquired.push(id); return new FakeChannel() },
+        releaseDedicatedChannel: async (id) => released.push(id)
+      }),
+      getExchange: () => ({ name: 'main-exchange', type: 'topic' })
+    })
+
+    const results = await Promise.all([topology.isDelayPluginEnabled(), topology.isDelayPluginEnabled()])
+
+    assert.deepEqual(results, [true, true], 'both probes answered instead of one crashing the other')
+    assert.equal(new Set(acquired).size, 2, 'each probe acquired its own channel id')
+    assert.deepEqual([...released].sort(), [...acquired].sort(), 'both were released under their own ids')
   })
 })
 
@@ -421,7 +449,7 @@ describe('Topology probe cleanup on unexpected failures', () => {
 
     await assert.rejects(() => topology.isDelayPluginEnabled(), /ACCESS_REFUSED/)
 
-    assert.deepEqual(released, ['delay-probe'], 'the channel was released on the way out')
+    assert.deepEqual(released, ['delay-probe-1'], 'the channel was released on the way out')
   })
 
   test('a successful probe with a pool releases the channel too', async () => {
@@ -440,6 +468,6 @@ describe('Topology probe cleanup on unexpected failures', () => {
     })
 
     assert.equal(await topology.isDelayPluginEnabled(), true)
-    assert.deepEqual(released, ['delay-probe'])
+    assert.deepEqual(released, ['delay-probe-1'])
   })
 })
