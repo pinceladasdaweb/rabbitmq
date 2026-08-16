@@ -764,7 +764,11 @@ describe('RabbitMQ facade connection edge cases', () => {
 
   test('uses the built-in logger when none is provided', async (t) => {
     // options.logger has a default. Losing it makes every log call throw on a
-    // client constructed the simplest possible way.
+    // client constructed the simplest possible way. The console is mocked so
+    // the default logger's output lands in an assertion instead of leaking
+    // into the test runner's stdout.
+    const infoMock = t.mock.method(console, 'log', () => {})
+
     const dialer = createDialer()
 
     installDialer(t, dialer)
@@ -777,9 +781,11 @@ describe('RabbitMQ facade connection edge cases', () => {
     })
 
     t.after(() => rabbit.disconnect())
+    t.after(() => infoMock.mock.restore())
 
     await assert.doesNotReject(() => rabbit.connect())
     assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+    assert.ok(infoMock.mock.callCount() > 0, 'the default logger actually logged the connection')
   })
 
   test('getChannel rejects once the pool is gone', async (t) => {
@@ -1148,8 +1154,11 @@ describe('RabbitMQ facade survivor round', () => {
 
     const happy = await connected(t)
 
-    happy.rabbit.enableGracefulShutdown({ signals: ['SIGUSR2'], exitProcess: true })
-    process.emit('SIGUSR2')
+    // SIGWINCH, not SIGUSR2: the test runner's child process registers
+    // SIGUSR2 as its diagnostic-report trigger, so emitting it wrote a
+    // report.*.json to the repo root on every suite run.
+    happy.rabbit.enableGracefulShutdown({ signals: ['SIGWINCH'], exitProcess: true })
+    process.emit('SIGWINCH')
     await waitFor(() => exits.length === 1, 2000, 'shutdown handler ran')
 
     assert.deepEqual(exits, [0], 'a clean teardown exits 0')
