@@ -3,11 +3,15 @@ import systemClock from '../utils/clock.js'
 const MAX_REPLACE_ATTEMPTS = 5
 
 class ChannelPool {
+  // Options object rather than positionals: the facade forwards whatever the
+  // application configured and the pool owns every default, so a new knob is
+  // additive instead of shifting an arity every caller must respell.
+  //
   // recoveryInterval is the base backoff between attempts to recreate a dead
   // pool channel (attempt N waits N × this value). Configurable for the same
   // reason consumerRecoveryInterval is: five attempts at the default add up to
   // 7.5s, which is right for a broker restart and far too slow for a test.
-  constructor (connection, logger, size = 10, recoveryInterval = 500, clock = systemClock) {
+  constructor (connection, { logger, size = 10, recoveryInterval = 500, clock = systemClock } = {}) {
     this.connection = connection
     this.logger = logger
     this.size = size

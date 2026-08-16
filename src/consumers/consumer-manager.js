@@ -13,9 +13,20 @@ class ConsumerManager {
     // Base backoff between attempts to recover a broker-cancelled consumer
     // (attempt N waits N * this value).
     this.recoveryInterval = context.consumerRecoveryInterval ?? 1000
+    // How long unsubscribe waits for in-flight handlers before closing the
+    // consumer's dedicated channel anyway (see #drainInFlight).
+    this.drainTimeout = context.consumerDrainTimeout ?? 30000
+    // Spawn seam for subscribeParallel's worker pools; tests inject fakes,
+    // production leaves it undefined and WorkerPool spawns real threads.
+    this.createWorker = context.createWorker
     this.getChannelPool = context.getChannelPool
     this.getChannel = context.getChannel
     this.emit = context.emit
+    // Lets the hot per-message path skip building event payloads nobody is
+    // listening for. Defaults to "someone is listening" so a context without
+    // the hook (tests constructing the manager directly) still sees every
+    // event.
+    this.listenerCount = context.listenerCount ?? (() => 1)
     this.activeConsumers = new Map()
     this.consumersByTag = new Map()
     this.workerPools = new Map()
@@ -164,13 +175,15 @@ class ConsumerManager {
       setup,
       channel: null,
       consumerTag: null,
-      // Every tag this consumer has ever answered to (see #trackConsumerTag).
-      knownTags: new Set(),
       // The channel whose lifecycle we are already watching (#watchChannelLoss).
       watchedChannel: null,
       cancelled: false,
       sequentialProcessor: null,
-      epoch: 0
+      epoch: 0,
+      // Deliveries currently inside the consume pipeline; unsubscribe drains
+      // them before closing the dedicated channel (see #drainInFlight).
+      inFlight: 0,
+      drainWaiters: []
     })
 
     return consumerId
@@ -186,7 +199,6 @@ class ConsumerManager {
   // wholesale with it.
   #trackConsumerTag (consumerId, consumerInfo, consumerTag) {
     consumerInfo.consumerTag = consumerTag
-    consumerInfo.knownTags.add(consumerTag)
     this.consumersByTag.set(consumerTag, consumerId)
   }
 
@@ -195,11 +207,15 @@ class ConsumerManager {
   // unsubscribe path, which left threads running (and the process unable to
   // exit) whenever recovery gave up on a consumer instead.
   async #dropConsumer (consumerId, consumerInfo) {
-    for (const tag of consumerInfo.knownTags) {
-      this.consumersByTag.delete(tag)
+    // consumersByTag is the single source of truth for every tag this
+    // consumer ever answered to — a per-consumer reverse index drifted, and
+    // consumer counts are small enough that the scan is free.
+    for (const [tag, ownerId] of this.consumersByTag) {
+      if (ownerId === consumerId) {
+        this.consumersByTag.delete(tag)
+      }
     }
 
-    consumerInfo.knownTags.clear()
     consumerInfo.sequentialProcessor?.dispose()
     this.activeConsumers.delete(consumerId)
 
@@ -263,17 +279,37 @@ class ConsumerManager {
       // State tied to the dead channel goes with it either way.
       consumerInfo.sequentialProcessor?.dispose()
 
-      const channelPool = this.getChannelPool()
+      // amqplib closes every channel synchronously BEFORE the connection
+      // announces its own close, so at this instant a connection-level drop
+      // is indistinguishable from a channel-level one — the pool still looks
+      // healthy. The whole teardown runs in one synchronous stack, so one
+      // microtask later the facade has already nulled the pool if the whole
+      // connection went; only then can the two losses be told apart.
+      queueMicrotask(() => {
+        const channelPool = this.getChannelPool()
 
-      // A pool teardown (disconnect, or a connection that dropped) closes
-      // every channel too; that path belongs to recreateAll, and racing it
-      // here would duplicate consumers or burn the retry budget against a
-      // broker that is not there.
-      if (!channelPool || channelPool.closed) return
-      if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
+        // Pool gone or closed: the connection dropped (or a disconnect is in
+        // flight), and recovery belongs to recreateAll — racing it here would
+        // duplicate consumers or burn the retry budget against a broker that
+        // is not there, permanently dropping consumers the reconnection
+        // would have restored.
+        if (!channelPool || channelPool.closed) return
+        if (consumerInfo.cancelled || consumerInfo.channel !== channel) return
 
-      this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+        this.handleConsumerLoss(consumerId, `channel for queue ${consumerInfo.queueName} closed unexpectedly`)
+      })
     })
+  }
+
+  // A crashing event listener is the listener's bug: it must never leave a
+  // delivery unsettled or misreport an outcome that already happened, so the
+  // per-message emits are contained here (issue #18's class of failure).
+  #emitOutcome (event, payload) {
+    try {
+      this.emit(event, payload)
+    } catch (error) {
+      this.logger.error(`A '${event}' listener threw: ${describeError(error)}`)
+    }
   }
 
   // Broker-initiated cancellation (e.g. queue deleted): notify and try to
@@ -294,8 +330,21 @@ class ConsumerManager {
     this.logger.warn(`Recovering consumer: ${reason}`)
     this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag, reason })
 
+    // Deliberately NOT shared with ChannelPool's replacement loop despite the
+    // similar shape: this one sleeps BEFORE each attempt and re-fetches state
+    // through three fences (existence/cancelled, pool identity, epoch) whose
+    // placement is load-bearing — a generic retry helper would bury exactly
+    // the parts that have already carried bugs.
     const maxAttempts = 3
     let knownEpoch = consumerInfo.epoch
+    // Ownership fence: this loop only recovers on the pool that lost the
+    // consumer. A different (or missing) pool means a reconnection cycle is
+    // running and recreateAll owns every registered consumer — recovering
+    // here as well would consume the same queue twice, and the epoch check
+    // alone cannot see a recreation that has not happened YET (the window
+    // between the new pool being installed and recreateAll reaching this
+    // consumer).
+    const ownedPool = this.getChannelPool()
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await this.clock.sleep(this.recoveryInterval * attempt)
@@ -303,6 +352,7 @@ class ConsumerManager {
       const currentInfo = this.activeConsumers.get(consumerId)
 
       if (!currentInfo || currentInfo.cancelled) return
+      if (this.getChannelPool() !== ownedPool) return
 
       // Someone else (e.g. recreateAll after a reconnection) already
       // recreated this consumer while we were backing off — recovering
@@ -339,10 +389,42 @@ class ConsumerManager {
     const prefetchCount = options.prefetchCount ?? hooks.defaultPrefetch
     const shouldRequeue = (message, error) => this.#shouldRequeue(message, error, retryPolicy)
 
+    // Per-message observability, one payload shape for every subscribe
+    // variant. `requeued` reports what actually happened to the delivery:
+    // under noAck nothing is ever requeued, whatever the retry policy says.
+    // Reporting never interferes with the pipeline: payloads are only built
+    // when someone is listening, and both emits are crash-proofed — every
+    // caller settles the delivery BEFORE reporting, and #emitOutcome keeps a
+    // throwing listener from rerouting a settled outcome (issue #18's class).
+    const events = {
+      processed: (msg, durationMs) => {
+        if (this.listenerCount('messageProcessed') === 0) return
+
+        this.#emitOutcome('messageProcessed', {
+          queue: queueName,
+          messageId: msg.properties?.messageId,
+          consumerTag: msg.fields?.consumerTag,
+          durationMs
+        })
+      },
+      failed: (msg, error, requeue, durationMs) => {
+        if (this.listenerCount('messageFailed') === 0) return
+
+        this.#emitOutcome('messageFailed', {
+          queue: queueName,
+          messageId: msg.properties?.messageId,
+          consumerTag: msg.fields?.consumerTag,
+          durationMs,
+          error,
+          requeued: noAck ? false : requeue
+        })
+      }
+    }
+
     const consumerId = this.registerConsumer(queueName, async () => {
       const channel = await this.getDedicatedChannel(consumerId)
       const consumerInfo = this.activeConsumers.get(consumerId)
-      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue })
+      const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue, events })
 
       if (!noAck) {
         await channel.prefetch(prefetchCount)
@@ -357,10 +439,17 @@ class ConsumerManager {
 
         this.attachAckControls(msg, channel)
 
+        const startedAt = this.clock.now()
+
+        consumerInfo.inFlight++
+
         try {
           const isCompressed = Boolean(msg.properties.headers && msg.properties.headers['x-compressed'])
           const decodedContent = await this.codec.decode(msg.content, isCompressed)
 
+          // Outcome reporting belongs to the processor, uniformly: only it
+          // knows when a message actually settled (the sequential one can
+          // park a message behind its dependency and settle it much later).
           await processMessage(decodedContent, msg)
         } catch (error) {
           // describeError, not error.message: a handler can throw null or a
@@ -372,8 +461,18 @@ class ConsumerManager {
           // errors included. A decode failure is deterministic, so under
           // 'once' it costs one pointless redelivery before the DLQ — the
           // price of a single rule with no carve-outs to remember.
+          const requeue = shouldRequeue(msg, error)
+
           if (!noAck) {
-            this.settleAck(msg, channel, 'nack', shouldRequeue(msg, error))
+            this.settleAck(msg, channel, 'nack', requeue)
+          }
+
+          events.failed(msg, error, requeue, this.clock.now() - startedAt)
+        } finally {
+          consumerInfo.inFlight--
+
+          if (consumerInfo.inFlight === 0) {
+            for (const resolve of consumerInfo.drainWaiters.splice(0)) resolve()
           }
         }
       }
@@ -408,12 +507,18 @@ class ConsumerManager {
       // 'once' when the handler is idempotent.
       defaultRetryPolicy: 'none',
       successLog: (prefetchCount) => `Subscribed to queue: ${queueName} with prefetch count: ${prefetchCount}`,
-      createProcessor: ({ channel, noAck }) => async (content, msg) => {
+      createProcessor: ({ channel, noAck, events }) => async (content, msg) => {
+        const startedAt = this.clock.now()
+
         await callback(content, msg)
 
         if (!noAck) {
           this.settleAck(msg, channel, 'ack')
         }
+
+        // After the ack, always: reporting must never reroute a message that
+        // already succeeded into the failure path.
+        events.processed(msg, this.clock.now() - startedAt)
       }
     })
   }
@@ -432,7 +537,10 @@ class ConsumerManager {
       // exists to provide. Pass 'none' when order matters more than the retry.
       defaultRetryPolicy: 'once',
       successLog: () => `Subscribed to queue ${queueName} with sequential processing`,
-      createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue }) => {
+      // handle() returning cleanly can mean "parked behind a dependency", so
+      // this processor reports from onSuccess/onFailure below, where the
+      // settlement actually happens.
+      createProcessor: ({ channel, consumerInfo, noAck, shouldRequeue, events }) => {
         // Recreation (reconnect): discard state tied to the previous channel.
         consumerInfo.sequentialProcessor?.dispose()
 
@@ -442,18 +550,30 @@ class ConsumerManager {
           staleTimeout,
           shouldRequeue,
           clock: this.clock,
-          onSuccess: (message) => {
+          onSuccess: (message, meta) => {
             if (!noAck) {
               this.settleAck(message, channel, 'ack')
+            }
+
+            // A duplicate delivery of a parked message is acked and dropped —
+            // the original will report when it actually completes, and a
+            // second messageProcessed would double-count it.
+            if (!meta?.duplicate) {
+              events.processed(message, meta?.durationMs)
             }
           },
           // Consumer callback failures must NOT feed the circuit breaker: it
           // gates publishing, and poison messages on one queue would block
           // every publish in the application.
-          onFailure: (message, error, requeue) => {
+          onFailure: (message, error, requeue, meta) => {
             if (!noAck) {
               this.settleAck(message, channel, 'nack', requeue)
             }
+
+            // meta.durationMs is absent for a parked message that expired
+            // waiting for its dependency: it never ran, so there is no
+            // duration to report.
+            events.failed(message, error, requeue, meta?.durationMs)
           }
         })
 
@@ -465,6 +585,23 @@ class ConsumerManager {
         return (content, msg) => processor.handle(content, msg)
       }
     })
+  }
+
+  // basic.cancel only stops NEW deliveries: a handler already running keeps
+  // its delivery tag valid only while the channel lives, so the channel must
+  // outlive every in-flight handler or their late acks die and the broker
+  // redelivers work that actually succeeded. Bounded, because a wedged
+  // handler is the application's bug and must not hang unsubscribe forever.
+  async #drainInFlight (consumerInfo) {
+    if (consumerInfo.inFlight > 0) {
+      const drained = new Promise((resolve) => consumerInfo.drainWaiters.push(resolve))
+
+      await Promise.race([drained, this.clock.sleep(this.drainTimeout)])
+    }
+
+    // Re-read rather than trust which promise won: the counter is the truth
+    // about whether the grace period expired with work still running.
+    return consumerInfo.inFlight === 0
   }
 
   async unsubscribe (consumerTag) {
@@ -485,6 +622,12 @@ class ConsumerManager {
       }
     } catch (error) {
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
+    }
+
+    const drained = await this.#drainInFlight(consumerInfo)
+
+    if (!drained) {
+      this.logger.warn(`Consumer ${consumerTag} still has ${consumerInfo.inFlight} handler(s) in flight after ${this.drainTimeout}ms; closing its channel anyway`)
     }
 
     await this.#dropConsumer(consumerId, consumerInfo)
@@ -599,7 +742,6 @@ class ConsumerManager {
       workerCount,
       prefetch = 10,
       maxRespawns,
-      createWorker,
       ...subscribeOptions
     } = options
 
@@ -608,9 +750,10 @@ class ConsumerManager {
       maxRespawns,
       workerData: { queueName },
       logger: this.logger,
-      // The pool's spawn seam, threaded through so the parallel path is
-      // testable without real threads.
-      createWorker
+      // The pool's spawn seam. A construction-time dependency, so it arrives
+      // through the manager's context like the clock does — never through the
+      // per-subscription options, which belong to the caller.
+      createWorker: this.createWorker
     })
 
     const messageHandler = async (content, message) => {

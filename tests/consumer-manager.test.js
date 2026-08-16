@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor, withLiveEventLoop } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
@@ -1485,8 +1485,9 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
   }
 
   const createParallelHarness = (replyWith) => {
-    const harness = createManager()
     const spawned = []
+    // The spawn seam is construction-time wiring, so it enters through the
+    // manager's context — the per-subscription options belong to the caller.
     const createWorker = (file, options) => {
       const worker = new FakeParallelWorker(file, options, replyWith)
 
@@ -1495,7 +1496,9 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
       return worker
     }
 
-    return { ...harness, spawned, createWorker }
+    const harness = createManager({ createWorker })
+
+    return { ...harness, spawned }
   }
 
   test('spawns the requested workers with the queue name in their workerData', async () => {
@@ -1503,8 +1506,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
       workerCount: 2,
-      prefetch: 10,
-      createWorker: harness.createWorker
+      prefetch: 10
     })
 
     assert.equal(harness.spawned.length, 2)
@@ -1520,8 +1522,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.manager.logger = logger
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: harness.createWorker
+      workerCount: 1
     })
 
     await deliver(harness, { n: 1 })
@@ -1537,8 +1538,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.manager.logger = logger
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: harness.createWorker
+      workerCount: 1
     })
 
     await deliver(harness, { n: 1 })
@@ -1553,7 +1553,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.channel.consume = async () => { throw new Error('queue gone') }
 
     await assert.rejects(
-      () => harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker: harness.createWorker }),
+      () => harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 }),
       /queue gone/
     )
 
@@ -1562,7 +1562,6 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
   test('unsubscribe terminates the parallel pool; disposeAll disposes everything', async () => {
     const clock = new ManualClock()
-    const base = createManager({ clock })
     const spawned = []
     const createWorker = (file, options) => {
       const worker = new FakeParallelWorker(file, options, () => ({ success: true }))
@@ -1571,14 +1570,15 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
       return worker
     }
+    const base = createManager({ clock, createWorker })
 
-    const consumer = await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+    const consumer = await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
 
     await base.manager.unsubscribe(consumer.consumerTag)
 
     assert.equal(spawned[0].terminated, true, 'unsubscribe shut the pool down')
 
-    await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+    await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
     await base.manager.subscribeSequential('billing', async () => {})
 
     assert.equal(clock.intervals.size, 1, 'one sequential sweep running')
@@ -1694,20 +1694,18 @@ describe('ConsumerManager resource ownership', () => {
 
   test('giving up on a lost consumer terminates its worker pool', async () => {
     const clock = new ManualClock()
-    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
     let terminated = false
+    const createWorker = () => {
+      const worker = new EventEmitter()
 
-    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: () => {
-        const worker = new EventEmitter()
+      worker.postMessage = () => {}
+      worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
 
-        worker.postMessage = () => {}
-        worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
+      return worker
+    }
+    const harness = createManager({ clock, consumerRecoveryInterval: 10, createWorker })
 
-        return worker
-      }
-    })
+    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
 
     const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
 
@@ -1920,5 +1918,538 @@ describe('ConsumerManager guards on partial inputs', () => {
 
     assert.equal(await harness.manager.unsubscribe(consumer.consumerTag), true)
     assert.equal(harness.manager.activeConsumers.size, 0, 'the consumer was still removed')
+  })
+})
+
+describe('ConsumerManager per-message events', () => {
+  const consumerEvents = (harness) =>
+    harness.events.filter(({ event }) => event === 'messageProcessed' || event === 'messageFailed')
+
+  test('a processed message reports queue, identity and measured duration', async () => {
+    // A non-zero epoch: with the clock starting at 0, `now - startedAt` and
+    // `now + startedAt` agree and the subtraction would be untestable.
+    const clock = new ManualClock(1000)
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribe('orders', async () => {
+      clock.jump(25)
+    })
+
+    await deliver(harness, { id: 7 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+
+    assert.deepEqual(consumerEvents(harness), [{
+      event: 'messageProcessed',
+      payload: { queue: 'orders', messageId: 'm1', consumerTag: tag, durationMs: 25 }
+    }])
+  })
+
+  test('a failed message reports the error and the real requeue decision', async () => {
+    const clock = new ManualClock(1000)
+    const harness = createManager({ clock })
+    const boom = new Error('handler exploded')
+
+    await harness.manager.subscribe('orders', async () => {
+      clock.jump(40)
+      throw boom
+    })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.queue, 'orders')
+    assert.equal(failed.payload.durationMs, 40)
+    assert.equal(failed.payload.error, boom)
+    assert.equal(failed.payload.requeued, false, "the default 'none' policy dead-letters")
+    assert.equal(failed.payload.requeued, harness.channel.nacked[0].requeue, 'the event mirrors the nack')
+  })
+
+  test("under 'once' the event reports the retry the broker was asked for", async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('boom')
+    }, { retryPolicy: 'once' })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.payload.requeued, true)
+    assert.equal(harness.channel.nacked[0].requeue, true)
+  })
+
+  test('noAck failures always report requeued: false — nothing was settled', async () => {
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('boom')
+    }, { noAck: true, retryPolicy: 'once' })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.payload.requeued, false, "even under 'once': a noAck delivery is already gone")
+    assert.equal(harness.channel.nacked.length, 0)
+  })
+
+  test('an undecodable message emits messageFailed without running the callback', async () => {
+    const harness = createManager()
+    let called = false
+
+    await harness.manager.subscribe('orders', async () => { called = true })
+
+    const consumer = harness.channel.consumers.at(-1)
+
+    await consumer.callback({
+      content: Buffer.from('not-gzip'),
+      fields: { consumerTag: consumer.consumerTag },
+      properties: { messageId: 'm1', headers: { 'x-compressed': true } }
+    })
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(called, false)
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.messageId, 'm1')
+    assert.equal(failed.payload.requeued, false)
+  })
+
+  test('a delivery with no fields object is still reported as processed', async () => {
+    // The event payload reads fields for the consumer tag AFTER the ack: a
+    // crash there would flip a successfully processed message into a
+    // messageFailed report.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const { content, compressed } = await harness.codec.encode({ id: 1 })
+
+    await harness.channel.consumers.at(-1).callback({
+      content,
+      properties: { messageId: 'm1', headers: { 'x-compressed': compressed } }
+    })
+
+    const [processed] = consumerEvents(harness)
+
+    assert.equal(processed.event, 'messageProcessed')
+    assert.equal(processed.payload.consumerTag, undefined)
+    assert.equal(harness.channel.acked.length, 1)
+  })
+
+  test('a delivery with no properties object still fails safely and is nacked', async () => {
+    // Reading the compression header throws before the callback ever runs;
+    // the failure path must tolerate the missing properties or the delivery
+    // would hang unsettled with no event at all.
+    const harness = createManager()
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    await harness.channel.consumers.at(-1).callback({ content: Buffer.from('x') })
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.messageId, undefined)
+    assert.equal(failed.payload.requeued, false)
+    assert.deepEqual(harness.channel.nacked.map(n => n.requeue), [false])
+  })
+
+  test('a sequential success reports the duration measured by the processor', async () => {
+    const clock = new ManualClock(1000)
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeSequential('orders', async () => {
+      clock.jump(60)
+    })
+
+    await deliver(harness, { step: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => harness.channel.acked.length === 1, 3000, 'sequential message acked')
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+
+    assert.deepEqual(consumerEvents(harness), [{
+      event: 'messageProcessed',
+      payload: { queue: 'orders', messageId: 'm1', consumerTag: tag, durationMs: 60 }
+    }])
+  })
+
+  test('a sequential failure reports duration, error and the requeue decision', async () => {
+    const clock = new ManualClock(1000)
+    const harness = createManager({ clock })
+    const boom = new Error('boom')
+
+    await harness.manager.subscribeSequential('orders', async () => {
+      clock.jump(15)
+      throw boom
+    })
+
+    await deliver(harness, { step: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'sequential message nacked')
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.durationMs, 15)
+    assert.equal(failed.payload.error, boom)
+    assert.equal(failed.payload.requeued, true, "sequential defaults to 'once': first delivery retries")
+  })
+
+  test('a parked message reports nothing until its dependency releases it', async () => {
+    const gate = Promise.withResolvers()
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', async (content) => {
+      if (content.step === 1) await gate.promise
+    })
+
+    // The child only parks while its dependency is visibly in flight, so the
+    // parent goes first and holds the processing slot at the gate.
+    const parent = deliver(harness, { step: 1 }, { messageId: 'parent', headers: { 'x-compressed': false } })
+
+    await deliver(harness, { step: 2 }, {
+      messageId: 'child',
+      headers: { 'x-compressed': false, 'depends-on': 'parent' }
+    })
+
+    assert.deepEqual(consumerEvents(harness), [], 'nothing settled, nothing reported')
+
+    gate.resolve()
+    await parent
+    await waitFor(() => harness.channel.acked.length === 2, 3000, 'parent and child acked')
+
+    assert.deepEqual(
+      consumerEvents(harness).map(({ event, payload }) => [event, payload.messageId]),
+      [['messageProcessed', 'parent'], ['messageProcessed', 'child']]
+    )
+  })
+
+  test('a duplicate delivery of a parked message is acked but never reported twice', async () => {
+    const gate = Promise.withResolvers()
+    const harness = createManager()
+
+    await harness.manager.subscribeSequential('orders', async (content) => {
+      if (content.step === 1) await gate.promise
+    })
+
+    const parent = deliver(harness, { step: 1 }, { messageId: 'parent', headers: { 'x-compressed': false } })
+
+    await deliver(harness, { step: 2 }, {
+      messageId: 'child',
+      headers: { 'x-compressed': false, 'depends-on': 'parent' }
+    })
+    await deliver(harness, { step: 2 }, {
+      messageId: 'child',
+      headers: { 'x-compressed': false, 'depends-on': 'parent' }
+    })
+
+    assert.equal(harness.channel.acked.length, 1, 'the duplicate itself was acked')
+    assert.deepEqual(consumerEvents(harness), [], 'an acked duplicate is not a processed message')
+
+    gate.resolve()
+    await parent
+    await waitFor(() => harness.channel.acked.length === 3, 3000, 'parent, duplicate and child acked')
+
+    assert.deepEqual(
+      consumerEvents(harness).map(({ event, payload }) => [event, payload.messageId]),
+      [['messageProcessed', 'parent'], ['messageProcessed', 'child']],
+      'the child completes once, whatever the broker redelivered'
+    )
+  })
+
+  test('a dependency that never resolves reports a failure with no duration', async () => {
+    const clock = new ManualClock()
+    const harness = createManager({ clock })
+
+    await harness.manager.subscribeSequential('orders', async (content) => {
+      if (content.step === 1) await new Promise(() => {})
+    }, { staleTimeout: 100 })
+
+    const parent = deliver(harness, { step: 1 }, { messageId: 'parent', headers: { 'x-compressed': false } })
+
+    await deliver(harness, { step: 2 }, {
+      messageId: 'child',
+      headers: { 'x-compressed': false, 'depends-on': 'parent' }
+    })
+
+    clock.advance(201)
+    await waitFor(() => harness.channel.nacked.length === 1, 3000, 'expired child nacked')
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.messageId, 'child')
+    assert.equal(failed.payload.durationMs, undefined, 'it never ran, so there is no duration')
+    assert.equal(failed.payload.requeued, true, "'once' gives the dependency a second chance to arrive")
+
+    parent.catch(() => {})
+  })
+
+  test('a worker failure on the parallel path reports messageFailed', async (t) => {
+    const harness = createManager()
+
+    await harness.manager.subscribeParallel('orders', FLAKY_WORKER, { workerCount: 1 })
+    t.after(() => harness.manager.disposeAll())
+
+    await deliver(harness, { shouldFail: true }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => harness.channel.nacked.length === 1, 5000, 'worker failure nacked')
+
+    const [failed] = consumerEvents(harness)
+
+    assert.equal(failed.event, 'messageFailed')
+    assert.equal(failed.payload.queue, 'orders')
+    assert.equal(failed.payload.requeued, false)
+  })
+})
+
+describe('ConsumerManager recovery ownership fence', () => {
+  test('recovery yields when the channel pool changed while it was backing off', async () => {
+    // The window recreateAll cannot see: a recovery wake landing after the
+    // new pool is installed but before recreateAll reaches this consumer.
+    // Without the pool-identity fence the recovery would consume the queue a
+    // second time — the epoch check alone cannot catch a recreation that has
+    // not happened yet.
+    const harness = createManager()
+    const cancelled = []
+    const recovered = []
+
+    harness.manager.emit = (event) => {
+      if (event === 'consumerCancelled') cancelled.push(event)
+      if (event === 'consumerRecovered') recovered.push(event)
+    }
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    const consumesBefore = harness.channel.consumers.length
+
+    // The dedicated channel dies while the pool is still the one that lost
+    // it; the watcher hands the loss to the recovery loop.
+    harness.channel.emit('close')
+    await waitFor(() => cancelled.length === 1, 3000, 'recovery started')
+
+    // A reconnection installs a NEW pool while the recovery sleeps.
+    const freshChannel = new (harness.channel.constructor)()
+
+    harness.manager.getChannelPool = () => ({
+      getDedicatedChannel: async () => freshChannel,
+      releaseDedicatedChannel: async () => {}
+    })
+
+    // Let every backoff attempt elapse (20ms base -> 20+40+60).
+    await sleep(200)
+
+    assert.deepEqual(recovered, [], 'recovery must not act on a pool it does not own')
+    assert.equal(harness.channel.consumers.length, consumesBefore, 'no consume on the dead pool')
+    assert.equal(freshChannel.consumers.length, 0, 'no duplicate consume on the new pool — that setup belongs to recreateAll')
+    assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer stays registered for recreateAll to restore')
+  })
+})
+
+describe('ConsumerManager event reporting never interferes with settlement', () => {
+  test('a throwing messageFailed listener cannot leave the delivery unsettled', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        if (event === 'messageFailed') throw new Error('listener boom')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {
+      throw new Error('handler exploded')
+    }, { retryPolicy: 'once' })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    assert.deepEqual(
+      harness.channel.nacked.map(n => n.requeue),
+      [true],
+      'the nack happened before the listener could interfere'
+    )
+    assert.ok(
+      logger.records.error.some(line => line.includes("'messageFailed' listener threw") && line.includes('listener boom')),
+      'the listener crash is reported as the listener bug it is'
+    )
+  })
+
+  test('a throwing messageProcessed listener cannot turn a success into a failure', async () => {
+    const logger = recordingLogger()
+    const emitted = []
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        emitted.push(event)
+
+        if (event === 'messageProcessed') throw new Error('metrics down')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {})
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    assert.equal(harness.channel.acked.length, 1, 'the ack stands')
+    assert.equal(harness.channel.nacked.length, 0)
+    assert.ok(!emitted.includes('messageFailed'), 'no spurious failure report for an acked message')
+    assert.ok(logger.records.error.some(line => line.includes("'messageProcessed' listener threw")))
+  })
+
+  test('the sequential path contains a throwing listener the same way', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({
+      logger,
+      emit: (event) => {
+        if (event === 'messageProcessed') throw new Error('listener boom')
+      }
+    })
+
+    await harness.manager.subscribeSequential('orders', async () => {})
+
+    await deliver(harness, { step: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => harness.channel.acked.length === 1, 3000, 'sequential message acked')
+
+    assert.ok(logger.records.error.some(line => line.includes("'messageProcessed' listener threw")))
+  })
+
+  test('no listener, no payload: events are skipped entirely when nobody subscribed', async () => {
+    // Arg-sensitive on purpose: the guard must ask about THIS event's
+    // listeners, not about listeners in general.
+    const harness = createManager({
+      listenerCount: (event) => (event === 'messageProcessed' || event === 'messageFailed') ? 0 : 1
+    })
+
+    await harness.manager.subscribe('orders', async (content) => {
+      if (content.explode) throw new Error('boom')
+    })
+
+    await deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await deliver(harness, { explode: true }, { messageId: 'm2', headers: { 'x-compressed': false } })
+
+    assert.deepEqual(harness.events, [], 'emit was never called, success and failure alike')
+    assert.equal(harness.channel.acked.length, 1, 'the ack is unaffected')
+    assert.equal(harness.channel.nacked.length, 1, 'the nack is unaffected')
+  })
+})
+
+describe('ConsumerManager unsubscribe drains in-flight handlers', () => {
+  test('the dedicated channel outlives a handler that is still running', async () => {
+    const gate = Promise.withResolvers()
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+    let delivered
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      delivered = msg
+      await gate.promise
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+    const inFlight = deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    await waitFor(() => delivered, 3000, 'the handler is inside the pipeline')
+
+    const unsubscribing = harness.manager.unsubscribe(tag)
+
+    // The cancel reached the broker, but the channel must stay open while the
+    // handler runs — closing it now would kill the ack and force a
+    // redelivery of work that succeeds.
+    await sleep(30)
+    assert.deepEqual(harness.channelPool.released, [], 'the channel is still open')
+    assert.equal(harness.channel.acked.length, 0, 'the handler has not finished yet')
+
+    gate.resolve()
+    await inFlight
+    assert.equal(await unsubscribing, true)
+
+    assert.equal(harness.channel.acked.length, 1, 'the late ack landed on the still-open channel')
+    assert.equal(delivered.__ackSettled, true)
+    assert.equal(harness.channelPool.released.length, 1, 'the channel closed only after the drain')
+    assert.ok(
+      !logger.records.warn.some(line => line.includes('in flight')),
+      'a drain that completed is not reported as a forced close'
+    )
+  })
+
+  test('one finished handler does not end the drain while another still runs', async () => {
+    const gates = [Promise.withResolvers(), Promise.withResolvers()]
+    const harness = createManager()
+    let started = 0
+
+    await harness.manager.subscribe('orders', async (content) => {
+      started++
+      await gates[content.slot].promise
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+    const first = deliver(harness, { slot: 0 }, { headers: { 'x-compressed': false } })
+    const second = deliver(harness, { slot: 1 }, { headers: { 'x-compressed': false } })
+
+    await waitFor(() => started === 2, 3000, 'both handlers are inside the pipeline')
+
+    const unsubscribing = harness.manager.unsubscribe(tag)
+
+    gates[0].resolve()
+    await first
+    await sleep(20)
+
+    assert.deepEqual(harness.channelPool.released, [], 'one completion must not release the channel under the other handler')
+
+    gates[1].resolve()
+    await second
+    await unsubscribing
+
+    assert.equal(harness.channel.acked.length, 2, 'both acks landed before the close')
+    assert.equal(harness.channelPool.released.length, 1)
+  })
+
+  test('a wedged handler cannot hang unsubscribe forever: the grace period bounds the drain', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({ logger, consumerDrainTimeout: 25 })
+    let entered = false
+
+    await harness.manager.subscribe('orders', async () => {
+      entered = true
+      await new Promise(() => {})
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+
+    deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => entered, 3000, 'the wedged handler is inside the pipeline')
+
+    // The grace period rides an unref'd clock.sleep; Node 22 cancels a test
+    // whose only pending work is an unref'd timer.
+    const result = await withLiveEventLoop(() => harness.manager.unsubscribe(tag))
+
+    assert.equal(result, true, 'unsubscribe returns after the grace period')
+    assert.equal(harness.channelPool.released.length, 1, 'the channel was closed anyway')
+    assert.ok(
+      logger.records.warn.some(line => line.includes('in flight after 25ms')),
+      'the forced close is reported, not silent'
+    )
+  })
+})
+
+describe('ConsumerManager tag bookkeeping across consumers', () => {
+  test('dropping one consumer leaves the other one reachable by its tag', async () => {
+    // #dropConsumer sweeps consumersByTag for the dropped consumer's tags —
+    // sweeping indiscriminately would orphan every OTHER consumer's tag too,
+    // making them impossible to unsubscribe.
+    const harness = createManager()
+
+    const orders = await harness.manager.subscribe('orders', async () => {})
+    const billing = await harness.manager.subscribe('billing', async () => {})
+
+    assert.equal(await harness.manager.unsubscribe(orders.consumerTag), true)
+
+    assert.equal(
+      harness.manager.findQueueNameByTag(billing.consumerTag),
+      'billing',
+      'the surviving consumer still answers to its tag'
+    )
+    assert.equal(await harness.manager.unsubscribe(billing.consumerTag), true, 'and can still be unsubscribed')
   })
 })

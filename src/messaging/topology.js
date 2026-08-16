@@ -1,6 +1,8 @@
-import { randomUUID } from 'node:crypto'
+import { publishWatched } from './routable-publish.js'
 
 class Topology {
+  #probeSequence = 0
+
   constructor (context) {
     this.logger = context.logger
     this.getChannel = context.getChannel
@@ -80,21 +82,15 @@ class Topology {
     const deadLetterQueue = `${sourceQueue || message.fields.routingKey}_dlq`
     const channel = await this.getChannel()
 
-    // Concurrent moves share a pool channel, and a basic.return only carries
-    // the routing key — matching on that alone let one message's return
-    // reject a different message that had actually been delivered. The token
-    // comes back on the returned message, so each move recognises its own.
-    const returnToken = randomUUID()
-
     const properties = {
       ...message.properties,
       persistent: true,
       // mandatory makes the broker return unroutable messages instead of
-      // silently dropping them when the DLQ binding does not exist.
+      // silently dropping them when the DLQ binding does not exist; the
+      // shared watcher correlates the return with this exact move.
       mandatory: true,
       headers: {
         ...message.properties.headers,
-        'x-dlq-token': returnToken,
         'x-death-reason': reason,
         'x-death-time': new Date().toISOString(),
         'x-original-exchange': message.fields.exchange,
@@ -102,33 +98,17 @@ class Topology {
       }
     }
 
-    await new Promise((resolve, reject) => {
-      let returned = false
+    let returned
 
-      const onReturn = (returnedMessage) => {
-        if (returnedMessage?.properties?.headers?.['x-dlq-token'] === returnToken) {
-          returned = true
-        }
-      }
+    try {
+      returned = await publishWatched(channel, this.deadLetterExchange, deadLetterQueue, message.content, properties)
+    } catch (error) {
+      throw new Error(`Failed to move message to dead letter queue: ${error.message}`)
+    }
 
-      channel.on('return', onReturn)
-
-      channel.publish(this.deadLetterExchange, deadLetterQueue, message.content, properties, (err) => {
-        // basic.return (if any) arrives before the confirm ack; give the
-        // event loop one turn so onReturn has definitely been processed.
-        setImmediate(() => {
-          channel.off('return', onReturn)
-
-          if (err) {
-            reject(new Error(`Failed to move message to dead letter queue: ${err.message}`))
-          } else if (returned) {
-            reject(new Error(`Dead letter queue routing key '${deadLetterQueue}' has no binding on exchange '${this.deadLetterExchange}' — message was returned`))
-          } else {
-            resolve()
-          }
-        })
-      })
-    })
+    if (returned) {
+      throw new Error(`Dead letter queue routing key '${deadLetterQueue}' has no binding on exchange '${this.deadLetterExchange}' — message was returned`)
+    }
 
     this.logger.info(`Message moved to dead letter queue: ${reason}`)
   }
@@ -171,9 +151,15 @@ class Topology {
 
     if (!channelPool) return { channel: await this.getChannel(), release: async () => {} }
 
+    // A unique id per probe: concurrent isDelayPluginEnabled() calls sharing
+    // one cached channel let the first caller's release() close it under the
+    // second caller's in-flight assertExchange, which then failed with a
+    // spurious channel-closed error instead of answering true/false.
+    const probeId = `delay-probe-${++this.#probeSequence}`
+
     return {
-      channel: await channelPool.getDedicatedChannel('delay-probe'),
-      release: () => channelPool.releaseDedicatedChannel('delay-probe')
+      channel: await channelPool.getDedicatedChannel(probeId),
+      release: () => channelPool.releaseDedicatedChannel(probeId)
     }
   }
 

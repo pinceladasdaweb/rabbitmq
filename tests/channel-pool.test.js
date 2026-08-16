@@ -48,7 +48,7 @@ function createConfirmAwareConnection () {
 describe('ChannelPool', () => {
   test('initialize creates the configured number of channels', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 4)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 4 })
 
     await pool.initialize()
 
@@ -57,14 +57,14 @@ describe('ChannelPool', () => {
   })
 
   test('getChannel throws before initialization', () => {
-    const pool = new ChannelPool(createFakeConnection(), silentLogger, 2)
+    const pool = new ChannelPool(createFakeConnection(), { logger: silentLogger, size: 2 })
 
     assert.throws(() => pool.getChannel(), /not initialized/)
   })
 
   test('getChannel rotates channels round-robin', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
 
@@ -78,7 +78,7 @@ describe('ChannelPool', () => {
 
   test('getDedicatedChannel reuses the channel for the same id', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     const channelA = await pool.getDedicatedChannel('consumer-1')
     const channelB = await pool.getDedicatedChannel('consumer-1')
@@ -90,7 +90,7 @@ describe('ChannelPool', () => {
 
   test('dedicated channel is removed from the pool on error and on close', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     const channelA = await pool.getDedicatedChannel('consumer-1')
     channelA.emit('error', new Error('channel error'))
@@ -105,7 +105,7 @@ describe('ChannelPool', () => {
 
   test('pool channel is recreated after it dies (error followed by close)', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
 
@@ -123,7 +123,7 @@ describe('ChannelPool', () => {
 
   test('pool channel closed without an error event is also replaced', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     await pool.initialize()
 
@@ -139,7 +139,7 @@ describe('ChannelPool', () => {
 
   test('a failed channel recreation takes the slot out of rotation instead of crashing', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -163,7 +163,7 @@ describe('ChannelPool', () => {
 
   test('getChannel throws when every channel is dead', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -181,7 +181,7 @@ describe('ChannelPool', () => {
 
   test('close shuts down every channel and clears state', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
     await pool.getDedicatedChannel('consumer-1')
@@ -197,7 +197,7 @@ describe('ChannelPool', () => {
 
   test('a pool channel is replaced after a transient failure and returns to rotation', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     await pool.initialize()
     // The replacement loop sleeps between attempts; closing the pool stops it.
@@ -229,7 +229,7 @@ describe('ChannelPool', () => {
 
   test('a replacement that lands after the pool closed is discarded, not left open', async (t) => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     await pool.initialize()
 
@@ -276,7 +276,7 @@ describe('ChannelPool', () => {
     // FakeChannel models that amqplib behaviour, so this test fails the moment
     // the listeners are stripped again.
     const connection = createConfirmAwareConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1 })
 
     await pool.initialize()
 
@@ -298,7 +298,7 @@ describe('ChannelPool', () => {
     // bury the real cause of a shutdown under noise the operator cannot act on.
     const logger = recordingLogger()
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, logger, 1)
+    const pool = new ChannelPool(connection, { logger, size: 1 })
 
     await pool.initialize()
 
@@ -322,7 +322,7 @@ describe('ChannelPool', () => {
     // Teardown errors are routine when the connection is already gone: they
     // must not abort the loop and leave the remaining channels open.
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
 
@@ -345,7 +345,7 @@ describe('ChannelPool', () => {
     const logger = recordingLogger()
     const connection = createFakeConnection()
     const clock = new ManualClock()
-    const pool = new ChannelPool(connection, logger, 1, 500, clock)
+    const pool = new ChannelPool(connection, { logger, size: 1, recoveryInterval: 500, clock })
 
     await pool.initialize()
     t.after(() => pool.close())
@@ -371,7 +371,7 @@ describe('ChannelPool', () => {
     // re-emit); only the event from the CURRENT occupant of the slot may
     // trigger a replacement, or every stale event dials one more channel.
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1, clock: new ManualClock() })
 
     await pool.initialize()
 
@@ -392,7 +392,7 @@ describe('ChannelPool', () => {
     // A slot whose recreation gave up holds null; close() must skip it
     // instead of calling close on nothing.
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1, clock: new ManualClock() })
 
     await pool.initialize()
 
@@ -412,7 +412,7 @@ describe('ChannelPool', () => {
     const logger = recordingLogger()
     const connection = createFakeConnection()
     const clock = new ManualClock()
-    const pool = new ChannelPool(connection, logger, 1, 1, clock)
+    const pool = new ChannelPool(connection, { logger, size: 1, recoveryInterval: 1, clock })
 
     await pool.initialize()
 
@@ -441,7 +441,7 @@ describe('ChannelPool', () => {
   test('dedicated channel errors are reported while the pool is open and silenced after close', async () => {
     const logger = recordingLogger()
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, logger, 1)
+    const pool = new ChannelPool(connection, { logger, size: 1 })
 
     // Before initialize: dedicated channels are usable and their errors real.
     const early = await pool.getDedicatedChannel('early')
@@ -467,7 +467,7 @@ describe('ChannelPool', () => {
   test('defaults the recovery backoff to 500ms', () => {
     // Every other test pins the interval to keep the suite fast, which leaves
     // the production default asserted nowhere.
-    const pool = new ChannelPool(createFakeConnection(), silentLogger, 1)
+    const pool = new ChannelPool(createFakeConnection(), { logger: silentLogger, size: 1 })
 
     assert.equal(pool.recoveryInterval, 500)
   })
@@ -477,7 +477,7 @@ describe('ChannelPool', () => {
     // would kick off replacement loops that recreate channels on a connection
     // that is going away.
     const connection = createConfirmAwareConnection()
-    const pool = new ChannelPool(connection, silentLogger, 2)
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 2 })
 
     await pool.initialize()
 
@@ -509,7 +509,7 @@ describe('ChannelPool resource ownership', () => {
       return realCreate()
     }
 
-    const pool = new ChannelPool(connection, silentLogger, 5, 1, new ManualClock())
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 5, recoveryInterval: 1, clock: new ManualClock() })
 
     await assert.rejects(() => pool.initialize(), /channel_max reached/)
 
@@ -524,7 +524,7 @@ describe('ChannelPool resource ownership', () => {
 
   test('releaseDedicatedChannel closes it and lets the next request build a fresh one', async () => {
     const connection = createFakeConnection()
-    const pool = new ChannelPool(connection, silentLogger, 1, 1, new ManualClock())
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 1, recoveryInterval: 1, clock: new ManualClock() })
 
     await pool.initialize()
 
@@ -542,7 +542,7 @@ describe('ChannelPool resource ownership', () => {
   })
 
   test('releasing an unknown id is a no-op', async () => {
-    const pool = new ChannelPool(createFakeConnection(), silentLogger, 1, 1, new ManualClock())
+    const pool = new ChannelPool(createFakeConnection(), { logger: silentLogger, size: 1, recoveryInterval: 1, clock: new ManualClock() })
 
     await pool.initialize()
     await pool.releaseDedicatedChannel('never-existed')

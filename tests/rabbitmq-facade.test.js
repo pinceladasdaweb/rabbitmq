@@ -764,7 +764,11 @@ describe('RabbitMQ facade connection edge cases', () => {
 
   test('uses the built-in logger when none is provided', async (t) => {
     // options.logger has a default. Losing it makes every log call throw on a
-    // client constructed the simplest possible way.
+    // client constructed the simplest possible way. The console is mocked so
+    // the default logger's output lands in an assertion instead of leaking
+    // into the test runner's stdout.
+    const infoMock = t.mock.method(console, 'log', () => {})
+
     const dialer = createDialer()
 
     installDialer(t, dialer)
@@ -777,9 +781,11 @@ describe('RabbitMQ facade connection edge cases', () => {
     })
 
     t.after(() => rabbit.disconnect())
+    t.after(() => infoMock.mock.restore())
 
     await assert.doesNotReject(() => rabbit.connect())
     assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+    assert.ok(infoMock.mock.callCount() > 0, 'the default logger actually logged the connection')
   })
 
   test('getChannel rejects once the pool is gone', async (t) => {
@@ -947,6 +953,35 @@ describe('RabbitMQ facade shutdown', () => {
 
     assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected')
   })
+
+  test('setupGracefulShutdown still works as the deprecated 1.5-era alias', async (t) => {
+    // Its removal shipped in a minor (1.6.0) and broke callers at boot; the
+    // shim restores them, warns toward the new name and delegates for real.
+    const logger = recordingLogger()
+    const { rabbit } = await connected(t, { logger })
+    const installed = []
+    const originalOn = process.on.bind(process)
+
+    process.on = (event, handler) => {
+      if (event === 'SIGINT' || event === 'SIGTERM') {
+        installed.push(event)
+
+        return process
+      }
+
+      return originalOn(event, handler)
+    }
+
+    t.after(() => { process.on = originalOn })
+
+    rabbit.setupGracefulShutdown({ exitProcess: false })
+
+    assert.deepEqual(installed, ['SIGINT', 'SIGTERM'], 'the alias installed the real handlers')
+    assert.ok(
+      logger.records.warn.some(line => line.includes('deprecated') && line.includes('enableGracefulShutdown')),
+      'the deprecation points at the new name'
+    )
+  })
 })
 
 describe('RabbitMQ facade survivor round', () => {
@@ -1107,6 +1142,7 @@ describe('RabbitMQ facade survivor round', () => {
     assert.equal(rabbit.listenerCount('reconnected'), 0, 'the waiter unhooked itself')
     assert.equal(rabbit.listenerCount('reconnectFailed'), 0)
     assert.equal(rabbit.listenerCount('reconnectError'), 0)
+    assert.equal(rabbit.listenerCount('disconnecting'), 0, 'the shutdown listener left with the others')
     assert.equal(clock.timeouts.size, 0, 'the guard timer was cleared, not left to fire')
   })
 
@@ -1148,8 +1184,11 @@ describe('RabbitMQ facade survivor round', () => {
 
     const happy = await connected(t)
 
-    happy.rabbit.enableGracefulShutdown({ signals: ['SIGUSR2'], exitProcess: true })
-    process.emit('SIGUSR2')
+    // SIGWINCH, not SIGUSR2: the test runner's child process registers
+    // SIGUSR2 as its diagnostic-report trigger, so emitting it wrote a
+    // report.*.json to the repo root on every suite run.
+    happy.rabbit.enableGracefulShutdown({ signals: ['SIGWINCH'], exitProcess: true })
+    process.emit('SIGWINCH')
     await waitFor(() => exits.length === 1, 2000, 'shutdown handler ran')
 
     assert.deepEqual(exits, [0], 'a clean teardown exits 0')

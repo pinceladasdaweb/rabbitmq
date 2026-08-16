@@ -67,6 +67,8 @@ export interface RabbitMQOptions {
   channelRecoveryInterval?: number
   /** Base backoff in ms between attempts to recover a broker-cancelled consumer (attempt N waits N * this). Default: 1000. */
   consumerRecoveryInterval?: number
+  /** How long unsubscribe() waits for in-flight handlers to finish before closing the consumer's dedicated channel anyway. Default: 30000. */
+  consumerDrainTimeout?: number
   useCompression?: boolean
   compressionThreshold?: number
   serializer?: (message: unknown) => string
@@ -98,6 +100,11 @@ export interface PublishOptions {
    * queue is bound for the routing key. Without it an unroutable publish is
    * discarded in silence and still confirmed, so the caller is told it
    * succeeded; with it, the publish rejects with `code: 'UNROUTABLE'`.
+   *
+   * Honored by `publish`, `publishBatch` and `publishDelayed`. The
+   * fire-and-forget methods (`publishAsync`, `publishAsyncBatch`) cannot see
+   * the broker's return and REJECT this option instead of silently ignoring
+   * it.
    */
   mandatory?: boolean
   [key: string]: unknown
@@ -242,6 +249,30 @@ export interface Consumer {
   consumerTag: string
 }
 
+export interface MessageProcessedEvent {
+  queue: string
+  messageId?: string
+  consumerTag?: string
+  durationMs?: number
+}
+
+export interface MessageFailedEvent {
+  queue: string
+  messageId?: string
+  consumerTag?: string
+  /**
+   * Absent when the message never ran — e.g. a sequential message that
+   * expired waiting for its `depends-on` dependency.
+   */
+  durationMs?: number
+  error: unknown
+  /**
+   * What actually happened to the delivery. Always `false` under `noAck`,
+   * whatever the retry policy says.
+   */
+  requeued: boolean
+}
+
 export interface ClusterStatus {
   connectedTo: string
   allEndpoints: string[]
@@ -260,11 +291,21 @@ export type RpcHandler = (content: unknown, message: ConsumeMessage) => unknown 
 export declare class RabbitMQ extends EventEmitter {
   constructor (options?: RabbitMQOptions)
 
+  on (event: 'messageProcessed', listener: (event: MessageProcessedEvent) => void): this
+  on (event: 'messageFailed', listener: (event: MessageFailedEvent) => void): this
+  on (event: string | symbol, listener: (...args: any[]) => void): this
+
+  once (event: 'messageProcessed', listener: (event: MessageProcessedEvent) => void): this
+  once (event: 'messageFailed', listener: (event: MessageFailedEvent) => void): this
+  once (event: string | symbol, listener: (...args: any[]) => void): this
+
   connect (options?: ConnectOptions): Promise<unknown | null>
   disconnect (): Promise<void>
   getChannel (): Promise<unknown>
   getClusterStatus (): ClusterStatus
   enableGracefulShutdown (options?: GracefulShutdownOptions): void
+  /** @deprecated Renamed to `enableGracefulShutdown()`; this shim delegates and warns. */
+  setupGracefulShutdown (options?: GracefulShutdownOptions): void
 
   setExchange (name: string, type?: 'direct' | 'topic' | 'fanout' | 'headers', options?: Record<string, unknown>): void
 

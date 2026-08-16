@@ -1,11 +1,11 @@
 import Rpc from './messaging/rpc.js'
-import systemClock from './utils/clock.js'
-import describeError from './utils/describe-error.js'
 import Logger from './utils/logger.js'
 import { EventEmitter } from 'node:events'
+import systemClock from './utils/clock.js'
 import _NodeCache from '@cacheable/node-cache'
 import Topology from './messaging/topology.js'
 import Publisher from './messaging/publisher.js'
+import describeError from './utils/describe-error.js'
 import RateLimiter from './resilience/rate-limiter.js'
 import ChannelPool from './connection/channel-pool.js'
 import MessageCodec from './messaging/message-codec.js'
@@ -35,7 +35,6 @@ class RabbitMQ extends EventEmitter {
   #connectPromise
   #restorePromise
   #clock
-  #connectionWaiters
 
   constructor (options = {}) {
     super()
@@ -55,7 +54,6 @@ class RabbitMQ extends EventEmitter {
     // sequential staleness, recovery backoffs, RPC deadlines). Injectable so
     // tests drive all of them from a single fake without sleeping.
     this.#clock = options.clock ?? systemClock
-    this.#connectionWaiters = new Set()
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -114,13 +112,18 @@ class RabbitMQ extends EventEmitter {
       maxPriority: options.maxPriority || 10,
       prefetchCount: options.prefetchCount ?? 10,
       consumerRecoveryInterval: options.consumerRecoveryInterval,
+      consumerDrainTimeout: options.consumerDrainTimeout,
       deadLetterExchange: options.deadLetterExchange || 'dlx',
       delayExchange: options.delayExchange || 'delayed',
       getExchange: () => this.#exchange,
       getChannel: () => this.getChannel(),
       getChannelPool: () => this.#channelPool,
       getQueueNameByConsumerTag: (consumerTag) => this.#consumers?.findQueueNameByTag(consumerTag) ?? null,
-      emit: (event, payload) => this.emit(event, payload)
+      emit: (event, payload) => this.emit(event, payload),
+      // The consume pipeline skips building per-message event payloads when
+      // nobody subscribed to them — one integer compare instead of an
+      // allocation per delivery.
+      listenerCount: (event) => this.listenerCount(event)
     }
 
     this.#publisher = new Publisher(context)
@@ -139,6 +142,15 @@ class RabbitMQ extends EventEmitter {
       this.#logger.warn(`Key ${key} is blocked. Remaining time: ${remainingTime}ms`)
       this.emit('rateBlocked', { key, remainingTime })
     })
+  }
+
+  // Deprecated 1.5-era name. Removing it shipped in a minor (1.6.0) and broke
+  // callers at boot — the shim restores them and warns once per process
+  // toward the real name.
+  setupGracefulShutdown (options) {
+    this.#logger.warn('setupGracefulShutdown() is deprecated; use enableGracefulShutdown()')
+
+    return this.enableGracefulShutdown(options)
   }
 
   enableGracefulShutdown ({ signals = ['SIGINT', 'SIGTERM'], exitProcess = true } = {}) {
@@ -289,7 +301,12 @@ class RabbitMQ extends EventEmitter {
     // the field would satisfy #doConnect's `if (!this.#channelPool)` gate and
     // silently skip the restore a manual retry is asking for — leaving
     // publishing and consumers broken until the next disconnection.
-    const channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval, this.#clock)
+    const channelPool = new ChannelPool(connection, {
+      logger: this.#logger,
+      size: this.#channelPoolSize,
+      recoveryInterval: this.#channelRecoveryInterval,
+      clock: this.#clock
+    })
 
     await channelPool.initialize()
 
@@ -354,7 +371,7 @@ class RabbitMQ extends EventEmitter {
         this.off('reconnected', onReconnected)
         this.off('reconnectFailed', onReconnectFailed)
         this.off('reconnectError', onReconnectError)
-        this.#connectionWaiters.delete(abort)
+        this.off('disconnecting', onDisconnecting)
 
         if (timer) this.#clock.clearTimeout(timer)
       }
@@ -362,8 +379,11 @@ class RabbitMQ extends EventEmitter {
       // disconnect() stops the reconnection cycles this promise is waiting on,
       // so without an explicit abort it would never settle — and since
       // #connectPromise is only released in its finally, EVERY later connect()
-      // would receive the same dead promise.
-      this.#connectionWaiters.add(abort)
+      // would receive the same dead promise. One mechanism for all four
+      // signals: anything else waiting on the cycle hears the shutdown too.
+      const onDisconnecting = () => {
+        abort(new Error('Connection wait aborted: the client was disconnected'))
+      }
 
       const onReconnected = () => {
         cleanup()
@@ -386,6 +406,7 @@ class RabbitMQ extends EventEmitter {
       this.on('reconnected', onReconnected)
       this.on('reconnectFailed', onReconnectFailed)
       this.on('reconnectError', onReconnectError)
+      this.on('disconnecting', onDisconnecting)
 
       if (options.timeout > 0) {
         timer = this.#clock.setTimeout(() => {
@@ -397,11 +418,11 @@ class RabbitMQ extends EventEmitter {
   }
 
   async disconnect () {
-    // Before anything else: whoever is parked in connect({ waitForConnection })
-    // is waiting for a reconnection cycle this shutdown is about to end.
-    for (const abort of [...this.#connectionWaiters]) {
-      abort(new Error('Connection wait aborted: the client was disconnected'))
-    }
+    // Fired before any teardown, unlike 'disconnected' (which also fires on
+    // transient losses): this is the explicit-shutdown signal. Whoever is
+    // parked in connect({ waitForConnection }) is waiting on a reconnection
+    // cycle this shutdown is about to end.
+    this.emit('disconnecting')
 
     try {
       this.#rpc.handleConnectionLoss('client disconnected')

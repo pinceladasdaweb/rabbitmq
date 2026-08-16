@@ -880,3 +880,118 @@ describe('RabbitMQ stale restore teardown', () => {
     assert.equal(dialer.connections.at(-1).publishedOn().length, 1, 'the live pool was left alone')
   })
 })
+
+describe('RabbitMQ consumers across connection drops', () => {
+  // amqplib closes every channel (each emitting 'close') BEFORE the connection
+  // emits its own 'close' — FakeAmqpConnection.emit models that ordering, so a
+  // plain connection 'close' here exercises the same window production sees.
+
+  test('an outage longer than the recovery budget must not drop consumers', async (t) => {
+    // Recovery budget with interval 5ms is 5+10+15 = 30ms; the two failed
+    // redials at 40ms apart keep the broker away well past it.
+    const dialer = createDialer(['ok', new Error('still down'), new Error('still down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, {
+      reconnectInterval: 40,
+      maxReconnectInterval: 40,
+      channelPoolSize: 1,
+      consumerRecoveryInterval: 5
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    const events = []
+
+    rabbit.on('consumerCancelled', () => events.push('consumerCancelled'))
+    rabbit.on('consumerLost', () => events.push('consumerLost'))
+    rabbit.on('reconnected', () => events.push('reconnected'))
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    dialer.connections[0].emit('close')
+
+    await waitFor(() => events.includes('reconnected'), 5000, 'reconnection after the long outage')
+    await waitFor(
+      () => dialer.connections.at(-1).consumersOn().length === 1,
+      5000,
+      'the consumer was recreated on the new connection'
+    )
+
+    assert.ok(!events.includes('consumerLost'), 'no consumer was dropped during the outage')
+    assert.ok(
+      !events.includes('consumerCancelled'),
+      'a connection drop is not a consumer cancellation — recovery belongs to recreateAll'
+    )
+  })
+
+  test('a brief drop reconnects without spurious consumerCancelled events', async (t) => {
+    const dialer = createDialer(['ok'])
+    const rabbit = createRabbit(t, dialer, {
+      reconnectInterval: 10,
+      maxReconnectInterval: 10,
+      channelPoolSize: 1,
+      consumerRecoveryInterval: 50
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    const events = []
+
+    rabbit.on('consumerCancelled', () => events.push('consumerCancelled'))
+    rabbit.on('reconnected', () => events.push('reconnected'))
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    dialer.connections[0].emit('close')
+
+    await waitFor(() => events.includes('reconnected'), 5000, 'fast reconnection')
+    await waitFor(
+      () => dialer.connections.at(-1).consumersOn().length === 1,
+      5000,
+      'the consumer was recreated on the new connection'
+    )
+
+    assert.deepEqual(
+      events.filter(name => name === 'consumerCancelled'),
+      [],
+      'a healthy reconnection emits no consumer events at all'
+    )
+  })
+
+  test('a channel-level loss on a healthy connection still recovers the consumer', async (t) => {
+    const dialer = createDialer(['ok'])
+    const rabbit = createRabbit(t, dialer, {
+      channelPoolSize: 1,
+      consumerRecoveryInterval: 5
+    })
+
+    t.after(() => rabbit.disconnect())
+
+    const events = []
+
+    rabbit.on('consumerCancelled', () => events.push('consumerCancelled'))
+    rabbit.on('consumerRecovered', () => events.push('consumerRecovered'))
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    const connection = dialer.connections[0]
+    const consumerChannel = connection.channels.at(-1)
+
+    assert.equal(connection.consumersOn().length, 1)
+
+    // Only the consumer's dedicated channel dies; the connection stays up.
+    consumerChannel.closed = true
+    consumerChannel.emit('close')
+
+    await waitFor(() => events.includes('consumerRecovered'), 5000, 'channel-level recovery')
+
+    assert.deepEqual(events, ['consumerCancelled', 'consumerRecovered'])
+    assert.equal(
+      connection.consumersOn().filter(consumer => !consumer.cancelled).length >= 1,
+      true,
+      'the consumer is consuming again on the same connection'
+    )
+  })
+})

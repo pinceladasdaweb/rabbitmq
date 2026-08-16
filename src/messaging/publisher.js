@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto'
 import describeError from '../utils/describe-error.js'
+import { publishConfirmed, publishWatched } from './routable-publish.js'
 import { compose, exponential, isRetryExhaustedError, retry } from 'breakwater'
 
 class Publisher {
@@ -66,51 +66,19 @@ class Publisher {
   }
 
   publishOnChannel (channel, exchange, routingKey, content, options) {
-    return new Promise((resolve, reject) => {
-      channel.publish(exchange, routingKey, content, options, (err) => {
-        if (err) {
-          reject(new Error(`Message was not confirmed by the broker: ${err.message}`))
-        } else {
-          resolve()
-        }
-      })
-    })
+    return publishConfirmed(channel, exchange, routingKey, content, options)
   }
 
   // A publish the broker cannot route is DROPPED IN SILENCE: the confirm still
   // arrives, so the caller is told everything went fine while the message went
   // nowhere. `mandatory` makes the broker hand it back as a basic.return
   // instead, and this turns that into an error the caller can act on.
-  //
-  // The token correlates the return with this exact publish: a pool channel
-  // carries many, and matching on the routing key alone would let one
-  // publish's return fail another that was delivered.
   async publishRoutable (channel, exchangeName, routingKey, content, options) {
     if (!options.mandatory) {
       return this.publishOnChannel(channel, exchangeName, routingKey, content, options)
     }
 
-    const token = randomUUID()
-    const guarded = { ...options, headers: { ...options.headers, 'x-publish-token': token } }
-    let returned = false
-
-    const onReturn = (returnedMessage) => {
-      if (returnedMessage?.properties?.headers?.['x-publish-token'] === token) {
-        returned = true
-      }
-    }
-
-    channel.on('return', onReturn)
-
-    try {
-      await this.publishOnChannel(channel, exchangeName, routingKey, content, guarded)
-
-      // basic.return reaches the client before the confirm, but give the loop
-      // one turn so onReturn has definitely run.
-      await new Promise(resolve => setImmediate(resolve))
-    } finally {
-      channel.off('return', onReturn)
-    }
+    const returned = await publishWatched(channel, exchangeName, routingKey, content, options)
 
     if (returned) {
       const error = new Error(`Message to '${routingKey}' was returned by the broker: no queue is bound for that routing key on exchange '${exchangeName}'`)
@@ -248,7 +216,19 @@ class Publisher {
     return this.runProtected(this.publishPolicy(options), batchOperation)
   }
 
+  // Fire-and-forget cannot honor `mandatory`: detecting the broker's
+  // basic.return requires waiting on the confirm, which is exactly what this
+  // path exists to skip. Accepting the flag and dropping its result would be
+  // the silent loss the option promises to prevent, so it is refused loudly.
+  #rejectMandatory (options, method) {
+    if (options.mandatory) {
+      throw new Error(`The 'mandatory' option needs a broker confirm to report the return — ${method} is fire-and-forget. Use publish(), publishBatch() or publishDelayed() instead.`)
+    }
+  }
+
   async publishAsync (routingKey, message, options = {}) {
+    this.#rejectMandatory(options, 'publishAsync')
+
     const exchange = this.getExchange()
 
     await this.preflight(exchange, routingKey, options, `async:${routingKey}`, options.rateLimitCost ?? 1)
@@ -272,6 +252,8 @@ class Publisher {
   }
 
   async publishAsyncBatch (routingKey, messages, options = {}) {
+    this.#rejectMandatory(options, 'publishAsyncBatch')
+
     const exchange = this.getExchange()
 
     if (!Array.isArray(messages) || messages.length === 0) {

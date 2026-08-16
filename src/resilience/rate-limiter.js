@@ -21,8 +21,6 @@ class RateLimiter extends EventEmitter {
     this.maxRequests = options.maxRequests || 100
     this.strategy = options.strategy || 'token-bucket'
     this.burstable = options.burstable || false
-    this.burstLimit = options.burstLimit || this.maxRequests * 1.5
-    this.queueLimit = options.queueLimit || 1000
     this.logger = options.logger
     this.clock = options.clock || systemClock
     this.blocked = new Map()
@@ -36,12 +34,15 @@ class RateLimiter extends EventEmitter {
       throw new Error(`Unknown rate limiting strategy: ${this.strategy}`)
     }
 
+    // burstLimit and queueLimit live only in the strategy: keeping copies
+    // here made them look tunable at runtime when mutating them changed
+    // nothing.
     this.limiter = new Strategy({
       maxRequests: this.maxRequests,
       windowMs: this.windowMs,
       burstable: this.burstable,
-      burstLimit: this.burstLimit,
-      queueLimit: this.queueLimit
+      burstLimit: options.burstLimit || this.maxRequests * 1.5,
+      queueLimit: options.queueLimit || 1000
     }, this.clock)
 
     this.cleanupInterval = this.clock.setInterval(() => this.#cleanup(), Math.min(this.windowMs / 10, 60000))
