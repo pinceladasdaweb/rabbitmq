@@ -304,6 +304,8 @@ export declare class RabbitMQ extends EventEmitter {
   getChannel (): Promise<unknown>
   getClusterStatus (): ClusterStatus
   enableGracefulShutdown (options?: GracefulShutdownOptions): void
+  /** @deprecated Renamed to `enableGracefulShutdown()`; this shim delegates and warns. */
+  setupGracefulShutdown (options?: GracefulShutdownOptions): void
 
   setExchange (name: string, type?: 'direct' | 'topic' | 'fanout' | 'headers', options?: Record<string, unknown>): void
 

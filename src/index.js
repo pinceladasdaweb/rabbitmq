@@ -144,6 +144,15 @@ class RabbitMQ extends EventEmitter {
     })
   }
 
+  // Deprecated 1.5-era name. Removing it shipped in a minor (1.6.0) and broke
+  // callers at boot — the shim restores them and warns once per process
+  // toward the real name.
+  setupGracefulShutdown (options) {
+    this.#logger.warn('setupGracefulShutdown() is deprecated; use enableGracefulShutdown()')
+
+    return this.enableGracefulShutdown(options)
+  }
+
   enableGracefulShutdown ({ signals = ['SIGINT', 'SIGTERM'], exitProcess = true } = {}) {
     if (this.#shutdownHandlersInstalled) return
 

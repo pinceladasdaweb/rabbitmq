@@ -1306,7 +1306,7 @@ What the library does when things go wrong, and how each condition surfaces. Eve
 
 | Condition | What the library does | How it surfaces |
 |-----------|----------------------|-----------------|
-| Broker connection lost | Reconnects automatically with backoff, rotating through every configured endpoint. Once the dial succeeds, the channel pool, the exchange and **every consumer** are restored — atomically: if any step fails, the half-built state is torn down and the next cycle retries from scratch. | `disconnected`, then `connected` and `reconnected` |
+| Broker connection lost | Reconnects automatically with backoff, rotating through every configured endpoint. Once the dial succeeds, the channel pool, the exchange and **every consumer** are restored — atomically: if any step fails, the half-built state is torn down and the next cycle retries from scratch. Consumers survive outages of **any** length: reconnection owns their recovery, and per-consumer recovery never races it. | `disconnected`, then `connected` and `reconnected` |
 | State restore fails after a successful dial | The half-restored pool is closed, nothing is left half-alive, and the reconnection cycle keeps running. | `reconnectError` |
 | Reconnection exhausts `maxReconnectAttempts` | The client stops trying. Callers parked in `connect({ waitForConnection: true })` are rejected instead of hanging. | `reconnectFailed` |
 | Cluster node fails over | Reconnection lands on another endpoint. In-flight unacked deliveries are requeued by the broker; a quorum queue's `x-delivery-count` survives the failover, so `{ attempts: N }` budgets stay honest. | `reconnected`, plus `getClusterStatus().connectedTo` |
@@ -1328,7 +1328,8 @@ See [Reconnection Options](#reconnection-options).
 | Condition | What the library does | How it surfaces |
 |-----------|----------------------|-----------------|
 | Handler throws | The delivery is settled under the subscription's [`retryPolicy`](#failure-policy-retrypolicy) — `'none'` dead-letters, `'once'` retries a first delivery, `{ attempts: N }` spends a broker-counted budget. Decode failures follow the same rule. | `messageFailed` with the real `requeued` decision |
-| Consumer channel dies | The consumer is recovered on a fresh channel, with backoff. Consumers never die silently. | `consumerCancelled`, then `consumerRecovered` |
+| Consumer channel dies | The consumer is recovered on a fresh channel, with backoff. Consumers never die silently — and a *connection*-level drop is told apart from a channel-level one, so it raises no consumer events at all (reconnection restores everything). | `consumerCancelled`, then `consumerRecovered` |
+| `unsubscribe()` with a handler mid-message | The dedicated channel outlives every in-flight handler (bounded by `consumerDrainTimeout`, default 30s), so late acks land instead of dying with the channel and forcing redeliveries of work that succeeded. | A warn only if the grace period expires |
 | Broker cancels the consumer (queue deleted) | Same recovery loop; when the attempts are exhausted the consumer is dropped **loudly**. | `consumerLost` |
 | Worker thread dies (`subscribeParallel`) | Respawned up to `maxRespawns`; messages in flight on the dead worker fail and follow the retry policy. When the budget is gone, queued work is rejected instead of hanging. | `messageFailed` per message |
 | Sequential dependency never arrives | After `staleTimeout` (default 30s) the parked message is settled under the retry policy — under `'once'` it goes back once (the dependency may still arrive), a redelivery is dead-lettered. | `messageFailed` with `durationMs: undefined` |

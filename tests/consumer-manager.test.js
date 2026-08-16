@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import MessageCodec from '../src/messaging/message-codec.js'
 import ConsumerManager from '../src/consumers/consumer-manager.js'
-import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor } from './helpers.js'
+import { FakeChannel, ManualClock, recordingLogger, silentLogger, sleep, waitFor, withLiveEventLoop } from './helpers.js'
 
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 const FLAKY_WORKER = fileURLToPath(new URL('./fixtures/flaky-worker.mjs', import.meta.url))
@@ -2420,7 +2420,11 @@ describe('ConsumerManager unsubscribe drains in-flight handlers', () => {
     deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
     await waitFor(() => entered, 3000, 'the wedged handler is inside the pipeline')
 
-    assert.equal(await harness.manager.unsubscribe(tag), true, 'unsubscribe returns after the grace period')
+    // The grace period rides an unref'd clock.sleep; Node 22 cancels a test
+    // whose only pending work is an unref'd timer.
+    const result = await withLiveEventLoop(() => harness.manager.unsubscribe(tag))
+
+    assert.equal(result, true, 'unsubscribe returns after the grace period')
     assert.equal(harness.channelPool.released.length, 1, 'the channel was closed anyway')
     assert.ok(
       logger.records.warn.some(line => line.includes('in flight after 25ms')),

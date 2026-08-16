@@ -111,6 +111,10 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     return: falling through reaches the budget branch, where 'none'.attempts
 //     is undefined and `undefined > 1` is false — the same no-requeue answer
 //     by a longer road.
+//   - index.js the context's `(event) => this.listenerCount(event)` arrow ->
+//     `() => undefined`: same family as the manager-side default — the only
+//     consumer compares against 0 with strict equality, and undefined !== 0
+//     emits exactly like a positive count does.
 //   - routable-publish.js the watch entry `{ returned: false }` -> `{}`: the
 //     only reads are `entry.returned = true` (works on either shape) and the
 //     final falsy check, where a missing property and false are the same
@@ -200,8 +204,8 @@ const isLoggerCall = (callPath) => {
   return isLoggerObject(callee.object)
 }
 
-// String/TemplateLiteral inside a logger.* call. A ternary passed to a logger
-// keeps its ConditionalExpression mutant — only the string arms are ignored.
+// String/TemplateLiteral inside a logger.* call. Kept alongside logCall as a
+// belt for string nodes reached outside a matched call subtree.
 const logString = (path) => {
   if (!path.isStringLiteral() && !path.isTemplateLiteral()) return undefined
 
@@ -209,6 +213,29 @@ const logString = (path) => {
 
   if (call && isLoggerCall(call)) {
     return 'Log phrasing is not contract: errors are identified by code, events by name.'
+  }
+
+  return undefined
+}
+
+// The logger.* CALL itself (Stryker 10 added statement-removal mutants for
+// calls): removing a log line is the same phrasing-not-contract policy as
+// rewording it. NOTE the ignore covers the call's whole subtree, argument
+// expressions included — acceptable because nothing inside a logger call may
+// have behavior (an argument with side effects would silently leave the
+// gate; review keeps that true). The log lines the README PROMISES an
+// operator — the drain grace-period warn, the deprecation warn, the
+// listener-crash report — are pinned by tests on a recording logger, so a
+// regression there still fails the suite.
+const logCall = (path) => {
+  // Stryker 10's statement-removal mutant lives on the ExpressionStatement
+  // wrapping the call, so that is the node to match.
+  const call = path.isExpressionStatement() ? path.get('expression') : path
+
+  if (!call.isCallExpression() && !call.isOptionalCallExpression()) return undefined
+
+  if (isLoggerCall(call)) {
+    return 'Removing a log call is phrasing-level; promised log lines are pinned by tests.'
   }
 
   return undefined
@@ -286,7 +313,7 @@ const repairedWindowCounter = (path) => {
   return undefined
 }
 
-const RULES = [logString, successLogHook, bufferEncoding, breakerName, repairedWindowCounter]
+const RULES = [logString, logCall, successLogHook, bufferEncoding, breakerName, repairedWindowCounter]
 
 export const strykerPlugins = [
   declareValuePlugin(PluginKind.Ignore, 'mutation-policy', {

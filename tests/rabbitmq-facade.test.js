@@ -953,6 +953,35 @@ describe('RabbitMQ facade shutdown', () => {
 
     assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected')
   })
+
+  test('setupGracefulShutdown still works as the deprecated 1.5-era alias', async (t) => {
+    // Its removal shipped in a minor (1.6.0) and broke callers at boot; the
+    // shim restores them, warns toward the new name and delegates for real.
+    const logger = recordingLogger()
+    const { rabbit } = await connected(t, { logger })
+    const installed = []
+    const originalOn = process.on.bind(process)
+
+    process.on = (event, handler) => {
+      if (event === 'SIGINT' || event === 'SIGTERM') {
+        installed.push(event)
+
+        return process
+      }
+
+      return originalOn(event, handler)
+    }
+
+    t.after(() => { process.on = originalOn })
+
+    rabbit.setupGracefulShutdown({ exitProcess: false })
+
+    assert.deepEqual(installed, ['SIGINT', 'SIGTERM'], 'the alias installed the real handlers')
+    assert.ok(
+      logger.records.warn.some(line => line.includes('deprecated') && line.includes('enableGracefulShutdown')),
+      'the deprecation points at the new name'
+    )
+  })
 })
 
 describe('RabbitMQ facade survivor round', () => {
