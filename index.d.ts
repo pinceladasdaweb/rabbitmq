@@ -67,6 +67,8 @@ export interface RabbitMQOptions {
   channelRecoveryInterval?: number
   /** Base backoff in ms between attempts to recover a broker-cancelled consumer (attempt N waits N * this). Default: 1000. */
   consumerRecoveryInterval?: number
+  /** How long unsubscribe() waits for in-flight handlers to finish before closing the consumer's dedicated channel anyway. Default: 30000. */
+  consumerDrainTimeout?: number
   useCompression?: boolean
   compressionThreshold?: number
   serializer?: (message: unknown) => string

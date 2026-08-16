@@ -13,6 +13,9 @@ class ConsumerManager {
     // Base backoff between attempts to recover a broker-cancelled consumer
     // (attempt N waits N * this value).
     this.recoveryInterval = context.consumerRecoveryInterval ?? 1000
+    // How long unsubscribe waits for in-flight handlers before closing the
+    // consumer's dedicated channel anyway (see #drainInFlight).
+    this.drainTimeout = context.consumerDrainTimeout ?? 30000
     this.getChannelPool = context.getChannelPool
     this.getChannel = context.getChannel
     this.emit = context.emit
@@ -175,7 +178,11 @@ class ConsumerManager {
       watchedChannel: null,
       cancelled: false,
       sequentialProcessor: null,
-      epoch: 0
+      epoch: 0,
+      // Deliveries currently inside the consume pipeline; unsubscribe drains
+      // them before closing the dedicated channel (see #drainInFlight).
+      inFlight: 0,
+      drainWaiters: []
     })
 
     return consumerId
@@ -425,6 +432,8 @@ class ConsumerManager {
 
         const startedAt = this.clock.now()
 
+        consumerInfo.inFlight++
+
         try {
           const isCompressed = Boolean(msg.properties.headers && msg.properties.headers['x-compressed'])
           const decodedContent = await this.codec.decode(msg.content, isCompressed)
@@ -450,6 +459,12 @@ class ConsumerManager {
           }
 
           events.failed(msg, error, requeue, this.clock.now() - startedAt)
+        } finally {
+          consumerInfo.inFlight--
+
+          if (consumerInfo.inFlight === 0) {
+            for (const resolve of consumerInfo.drainWaiters.splice(0)) resolve()
+          }
         }
       }
 
@@ -563,6 +578,23 @@ class ConsumerManager {
     })
   }
 
+  // basic.cancel only stops NEW deliveries: a handler already running keeps
+  // its delivery tag valid only while the channel lives, so the channel must
+  // outlive every in-flight handler or their late acks die and the broker
+  // redelivers work that actually succeeded. Bounded, because a wedged
+  // handler is the application's bug and must not hang unsubscribe forever.
+  async #drainInFlight (consumerInfo) {
+    if (consumerInfo.inFlight > 0) {
+      const drained = new Promise((resolve) => consumerInfo.drainWaiters.push(resolve))
+
+      await Promise.race([drained, this.clock.sleep(this.drainTimeout)])
+    }
+
+    // Re-read rather than trust which promise won: the counter is the truth
+    // about whether the grace period expired with work still running.
+    return consumerInfo.inFlight === 0
+  }
+
   async unsubscribe (consumerTag) {
     const consumerId = this.findConsumerIdByTag(consumerTag)
 
@@ -581,6 +613,12 @@ class ConsumerManager {
       }
     } catch (error) {
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
+    }
+
+    const drained = await this.#drainInFlight(consumerInfo)
+
+    if (!drained) {
+      this.logger.warn(`Consumer ${consumerTag} still has ${consumerInfo.inFlight} handler(s) in flight after ${this.drainTimeout}ms; closing its channel anyway`)
     }
 
     await this.#dropConsumer(consumerId, consumerInfo)

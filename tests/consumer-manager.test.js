@@ -2335,3 +2335,98 @@ describe('ConsumerManager event reporting never interferes with settlement', () 
     assert.equal(harness.channel.nacked.length, 1, 'the nack is unaffected')
   })
 })
+
+describe('ConsumerManager unsubscribe drains in-flight handlers', () => {
+  test('the dedicated channel outlives a handler that is still running', async () => {
+    const gate = Promise.withResolvers()
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+    let delivered
+
+    await harness.manager.subscribe('orders', async (content, msg) => {
+      delivered = msg
+      await gate.promise
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+    const inFlight = deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+
+    await waitFor(() => delivered, 3000, 'the handler is inside the pipeline')
+
+    const unsubscribing = harness.manager.unsubscribe(tag)
+
+    // The cancel reached the broker, but the channel must stay open while the
+    // handler runs — closing it now would kill the ack and force a
+    // redelivery of work that succeeds.
+    await sleep(30)
+    assert.deepEqual(harness.channelPool.released, [], 'the channel is still open')
+    assert.equal(harness.channel.acked.length, 0, 'the handler has not finished yet')
+
+    gate.resolve()
+    await inFlight
+    assert.equal(await unsubscribing, true)
+
+    assert.equal(harness.channel.acked.length, 1, 'the late ack landed on the still-open channel')
+    assert.equal(delivered.__ackSettled, true)
+    assert.equal(harness.channelPool.released.length, 1, 'the channel closed only after the drain')
+    assert.ok(
+      !logger.records.warn.some(line => line.includes('in flight')),
+      'a drain that completed is not reported as a forced close'
+    )
+  })
+
+  test('one finished handler does not end the drain while another still runs', async () => {
+    const gates = [Promise.withResolvers(), Promise.withResolvers()]
+    const harness = createManager()
+    let started = 0
+
+    await harness.manager.subscribe('orders', async (content) => {
+      started++
+      await gates[content.slot].promise
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+    const first = deliver(harness, { slot: 0 }, { headers: { 'x-compressed': false } })
+    const second = deliver(harness, { slot: 1 }, { headers: { 'x-compressed': false } })
+
+    await waitFor(() => started === 2, 3000, 'both handlers are inside the pipeline')
+
+    const unsubscribing = harness.manager.unsubscribe(tag)
+
+    gates[0].resolve()
+    await first
+    await sleep(20)
+
+    assert.deepEqual(harness.channelPool.released, [], 'one completion must not release the channel under the other handler')
+
+    gates[1].resolve()
+    await second
+    await unsubscribing
+
+    assert.equal(harness.channel.acked.length, 2, 'both acks landed before the close')
+    assert.equal(harness.channelPool.released.length, 1)
+  })
+
+  test('a wedged handler cannot hang unsubscribe forever: the grace period bounds the drain', async () => {
+    const logger = recordingLogger()
+    const harness = createManager({ logger, consumerDrainTimeout: 25 })
+    let entered = false
+
+    await harness.manager.subscribe('orders', async () => {
+      entered = true
+      await new Promise(() => {})
+    })
+
+    const tag = harness.channel.consumers.at(-1).consumerTag
+
+    deliver(harness, { id: 1 }, { messageId: 'm1', headers: { 'x-compressed': false } })
+    await waitFor(() => entered, 3000, 'the wedged handler is inside the pipeline')
+
+    assert.equal(await harness.manager.unsubscribe(tag), true, 'unsubscribe returns after the grace period')
+    assert.equal(harness.channelPool.released.length, 1, 'the channel was closed anyway')
+    assert.ok(
+      logger.records.warn.some(line => line.includes('in flight after 25ms')),
+      'the forced close is reported, not silent'
+    )
+  })
+})

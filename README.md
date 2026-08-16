@@ -309,6 +309,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
   - Default: `500`
   - Example: `100`
 - **consumerRecoveryInterval** `{number}`: Base backoff in milliseconds between attempts to recover a consumer cancelled by the broker (attempt N waits N × this value, up to 3 attempts before `consumerLost` is emitted).
+- **consumerDrainTimeout** `{number}`: How long `unsubscribe()` waits for handlers still processing a delivery before closing the consumer's dedicated channel anyway (default `30000`). The channel must outlive in-flight handlers or their late acks die and the broker redelivers work that succeeded.
   - Default: `1000`
   - Example: `500`
 

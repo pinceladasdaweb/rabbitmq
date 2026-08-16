@@ -1,11 +1,11 @@
 import Rpc from './messaging/rpc.js'
-import systemClock from './utils/clock.js'
-import describeError from './utils/describe-error.js'
 import Logger from './utils/logger.js'
 import { EventEmitter } from 'node:events'
+import systemClock from './utils/clock.js'
 import _NodeCache from '@cacheable/node-cache'
 import Topology from './messaging/topology.js'
 import Publisher from './messaging/publisher.js'
+import describeError from './utils/describe-error.js'
 import RateLimiter from './resilience/rate-limiter.js'
 import ChannelPool from './connection/channel-pool.js'
 import MessageCodec from './messaging/message-codec.js'
@@ -114,6 +114,7 @@ class RabbitMQ extends EventEmitter {
       maxPriority: options.maxPriority || 10,
       prefetchCount: options.prefetchCount ?? 10,
       consumerRecoveryInterval: options.consumerRecoveryInterval,
+      consumerDrainTimeout: options.consumerDrainTimeout,
       deadLetterExchange: options.deadLetterExchange || 'dlx',
       delayExchange: options.delayExchange || 'delayed',
       getExchange: () => this.#exchange,
