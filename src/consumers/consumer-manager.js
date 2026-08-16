@@ -16,6 +16,9 @@ class ConsumerManager {
     // How long unsubscribe waits for in-flight handlers before closing the
     // consumer's dedicated channel anyway (see #drainInFlight).
     this.drainTimeout = context.consumerDrainTimeout ?? 30000
+    // Spawn seam for subscribeParallel's worker pools; tests inject fakes,
+    // production leaves it undefined and WorkerPool spawns real threads.
+    this.createWorker = context.createWorker
     this.getChannelPool = context.getChannelPool
     this.getChannel = context.getChannel
     this.emit = context.emit
@@ -172,8 +175,6 @@ class ConsumerManager {
       setup,
       channel: null,
       consumerTag: null,
-      // Every tag this consumer has ever answered to (see #trackConsumerTag).
-      knownTags: new Set(),
       // The channel whose lifecycle we are already watching (#watchChannelLoss).
       watchedChannel: null,
       cancelled: false,
@@ -198,7 +199,6 @@ class ConsumerManager {
   // wholesale with it.
   #trackConsumerTag (consumerId, consumerInfo, consumerTag) {
     consumerInfo.consumerTag = consumerTag
-    consumerInfo.knownTags.add(consumerTag)
     this.consumersByTag.set(consumerTag, consumerId)
   }
 
@@ -207,11 +207,15 @@ class ConsumerManager {
   // unsubscribe path, which left threads running (and the process unable to
   // exit) whenever recovery gave up on a consumer instead.
   async #dropConsumer (consumerId, consumerInfo) {
-    for (const tag of consumerInfo.knownTags) {
-      this.consumersByTag.delete(tag)
+    // consumersByTag is the single source of truth for every tag this
+    // consumer ever answered to — a per-consumer reverse index drifted, and
+    // consumer counts are small enough that the scan is free.
+    for (const [tag, ownerId] of this.consumersByTag) {
+      if (ownerId === consumerId) {
+        this.consumersByTag.delete(tag)
+      }
     }
 
-    consumerInfo.knownTags.clear()
     consumerInfo.sequentialProcessor?.dispose()
     this.activeConsumers.delete(consumerId)
 
@@ -326,6 +330,11 @@ class ConsumerManager {
     this.logger.warn(`Recovering consumer: ${reason}`)
     this.emit('consumerCancelled', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag, reason })
 
+    // Deliberately NOT shared with ChannelPool's replacement loop despite the
+    // similar shape: this one sleeps BEFORE each attempt and re-fetches state
+    // through three fences (existence/cancelled, pool identity, epoch) whose
+    // placement is load-bearing — a generic retry helper would bury exactly
+    // the parts that have already carried bugs.
     const maxAttempts = 3
     let knownEpoch = consumerInfo.epoch
     // Ownership fence: this loop only recovers on the pool that lost the
@@ -733,7 +742,6 @@ class ConsumerManager {
       workerCount,
       prefetch = 10,
       maxRespawns,
-      createWorker,
       ...subscribeOptions
     } = options
 
@@ -742,9 +750,10 @@ class ConsumerManager {
       maxRespawns,
       workerData: { queueName },
       logger: this.logger,
-      // The pool's spawn seam, threaded through so the parallel path is
-      // testable without real threads.
-      createWorker
+      // The pool's spawn seam. A construction-time dependency, so it arrives
+      // through the manager's context like the clock does — never through the
+      // per-subscription options, which belong to the caller.
+      createWorker: this.createWorker
     })
 
     const messageHandler = async (content, message) => {

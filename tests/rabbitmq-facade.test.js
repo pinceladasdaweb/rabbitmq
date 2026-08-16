@@ -1113,6 +1113,7 @@ describe('RabbitMQ facade survivor round', () => {
     assert.equal(rabbit.listenerCount('reconnected'), 0, 'the waiter unhooked itself')
     assert.equal(rabbit.listenerCount('reconnectFailed'), 0)
     assert.equal(rabbit.listenerCount('reconnectError'), 0)
+    assert.equal(rabbit.listenerCount('disconnecting'), 0, 'the shutdown listener left with the others')
     assert.equal(clock.timeouts.size, 0, 'the guard timer was cleared, not left to fire')
   })
 

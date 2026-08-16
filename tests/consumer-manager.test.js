@@ -1485,8 +1485,9 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
   }
 
   const createParallelHarness = (replyWith) => {
-    const harness = createManager()
     const spawned = []
+    // The spawn seam is construction-time wiring, so it enters through the
+    // manager's context — the per-subscription options belong to the caller.
     const createWorker = (file, options) => {
       const worker = new FakeParallelWorker(file, options, replyWith)
 
@@ -1495,7 +1496,9 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
       return worker
     }
 
-    return { ...harness, spawned, createWorker }
+    const harness = createManager({ createWorker })
+
+    return { ...harness, spawned }
   }
 
   test('spawns the requested workers with the queue name in their workerData', async () => {
@@ -1503,8 +1506,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
       workerCount: 2,
-      prefetch: 10,
-      createWorker: harness.createWorker
+      prefetch: 10
     })
 
     assert.equal(harness.spawned.length, 2)
@@ -1520,8 +1522,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.manager.logger = logger
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: harness.createWorker
+      workerCount: 1
     })
 
     await deliver(harness, { n: 1 })
@@ -1537,8 +1538,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.manager.logger = logger
 
     await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: harness.createWorker
+      workerCount: 1
     })
 
     await deliver(harness, { n: 1 })
@@ -1553,7 +1553,7 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
     harness.channel.consume = async () => { throw new Error('queue gone') }
 
     await assert.rejects(
-      () => harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker: harness.createWorker }),
+      () => harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 }),
       /queue gone/
     )
 
@@ -1562,7 +1562,6 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
   test('unsubscribe terminates the parallel pool; disposeAll disposes everything', async () => {
     const clock = new ManualClock()
-    const base = createManager({ clock })
     const spawned = []
     const createWorker = (file, options) => {
       const worker = new FakeParallelWorker(file, options, () => ({ success: true }))
@@ -1571,14 +1570,15 @@ describe('ConsumerManager subscribeParallel (fake workers)', () => {
 
       return worker
     }
+    const base = createManager({ clock, createWorker })
 
-    const consumer = await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+    const consumer = await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
 
     await base.manager.unsubscribe(consumer.consumerTag)
 
     assert.equal(spawned[0].terminated, true, 'unsubscribe shut the pool down')
 
-    await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1, createWorker })
+    await base.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
     await base.manager.subscribeSequential('billing', async () => {})
 
     assert.equal(clock.intervals.size, 1, 'one sequential sweep running')
@@ -1694,20 +1694,18 @@ describe('ConsumerManager resource ownership', () => {
 
   test('giving up on a lost consumer terminates its worker pool', async () => {
     const clock = new ManualClock()
-    const harness = createManager({ clock, consumerRecoveryInterval: 10 })
     let terminated = false
+    const createWorker = () => {
+      const worker = new EventEmitter()
 
-    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', {
-      workerCount: 1,
-      createWorker: () => {
-        const worker = new EventEmitter()
+      worker.postMessage = () => {}
+      worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
 
-        worker.postMessage = () => {}
-        worker.terminate = async () => { terminated = true; worker.emit('exit', 0) }
+      return worker
+    }
+    const harness = createManager({ clock, consumerRecoveryInterval: 10, createWorker })
 
-        return worker
-      }
-    })
+    const consumer = await harness.manager.subscribeParallel('orders', 'processor.js', { workerCount: 1 })
 
     const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
 
@@ -2428,5 +2426,26 @@ describe('ConsumerManager unsubscribe drains in-flight handlers', () => {
       logger.records.warn.some(line => line.includes('in flight after 25ms')),
       'the forced close is reported, not silent'
     )
+  })
+})
+
+describe('ConsumerManager tag bookkeeping across consumers', () => {
+  test('dropping one consumer leaves the other one reachable by its tag', async () => {
+    // #dropConsumer sweeps consumersByTag for the dropped consumer's tags —
+    // sweeping indiscriminately would orphan every OTHER consumer's tag too,
+    // making them impossible to unsubscribe.
+    const harness = createManager()
+
+    const orders = await harness.manager.subscribe('orders', async () => {})
+    const billing = await harness.manager.subscribe('billing', async () => {})
+
+    assert.equal(await harness.manager.unsubscribe(orders.consumerTag), true)
+
+    assert.equal(
+      harness.manager.findQueueNameByTag(billing.consumerTag),
+      'billing',
+      'the surviving consumer still answers to its tag'
+    )
+    assert.equal(await harness.manager.unsubscribe(billing.consumerTag), true, 'and can still be unsubscribed')
   })
 })

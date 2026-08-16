@@ -1247,6 +1247,7 @@ The `RabbitMQ` instance is an `EventEmitter`. All emitted events:
 | Event | Payload | When it fires |
 |-------|---------|---------------|
 | `connected` | — | Connection established (initial connect and every successful reconnect) |
+| `disconnecting` | — | An explicit `disconnect()` began — unlike `disconnected`, this never fires on transient losses |
 | `disconnected` | — | Connection lost or closed |
 | `reconnected` | — | Reconnection finished **and** internal state restored (channel pool, exchange, consumers) |
 | `reconnectFailed` | — | Reconnection gave up after `maxReconnectAttempts` |

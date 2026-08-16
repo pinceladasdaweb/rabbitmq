@@ -455,8 +455,8 @@ describe('RateLimiter', () => {
       sliding.clock.advance(1101)
       leaky.clock.advance(1101)
 
-      assert.equal(sliding.limiter.limiter.log.windows.size, 0)
-      assert.equal(leaky.limiter.limiter.log.windows.size, 0)
+      assert.equal(sliding.limiter.limiter.windows.size, 0)
+      assert.equal(leaky.limiter.limiter.windows.size, 0)
       assert.equal(sliding.limiter.getRemainingTokens('key-a'), 2, 'capacity fully released')
       assert.equal(leaky.limiter.getRemainingTokens('key-a'), 4, 'queue fully drained')
     })
@@ -698,8 +698,9 @@ describe('RateLimiter', () => {
 
       t.after(() => limiter.dispose())
 
-      assert.equal(limiter.burstLimit, 6, 'multiplied, not divided')
-      assert.equal(limiter.getStatus('key-a').remainingTokens, 6)
+      // Pinned through the observable surface: the limiter no longer keeps a
+      // copy of the strategy's burstLimit.
+      assert.equal(limiter.getStatus('key-a').remainingTokens, 6, 'multiplied, not divided')
     })
   })
 
@@ -719,9 +720,9 @@ describe('RateLimiter', () => {
     test('empties every strategy store', async () => {
       // Same reason as the per-strategy reset: each store has its own clear.
       const cases = [
-        { config: { strategy: 'leaky-bucket', maxRequests: 100, windowMs: 60000, queueLimit: 2 }, storeOf: (limiter) => limiter.limiter.log.windows },
+        { config: { strategy: 'leaky-bucket', maxRequests: 100, windowMs: 60000, queueLimit: 2 }, storeOf: (limiter) => limiter.limiter.windows },
         { config: { strategy: 'fixed-window', maxRequests: 2, windowMs: 60000 }, storeOf: (limiter) => limiter.limiter.counters },
-        { config: { strategy: 'sliding-window', maxRequests: 2, windowMs: 60000 }, storeOf: (limiter) => limiter.limiter.log.windows }
+        { config: { strategy: 'sliding-window', maxRequests: 2, windowMs: 60000 }, storeOf: (limiter) => limiter.limiter.windows }
       ]
 
       for (const { config, storeOf } of cases) {

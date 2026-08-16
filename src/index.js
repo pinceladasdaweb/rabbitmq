@@ -35,7 +35,6 @@ class RabbitMQ extends EventEmitter {
   #connectPromise
   #restorePromise
   #clock
-  #connectionWaiters
 
   constructor (options = {}) {
     super()
@@ -55,7 +54,6 @@ class RabbitMQ extends EventEmitter {
     // sequential staleness, recovery backoffs, RPC deadlines). Injectable so
     // tests drive all of them from a single fake without sleeping.
     this.#clock = options.clock ?? systemClock
-    this.#connectionWaiters = new Set()
 
     this.#codec = new MessageCodec({
       serializer: options.serializer,
@@ -294,7 +292,12 @@ class RabbitMQ extends EventEmitter {
     // the field would satisfy #doConnect's `if (!this.#channelPool)` gate and
     // silently skip the restore a manual retry is asking for — leaving
     // publishing and consumers broken until the next disconnection.
-    const channelPool = new ChannelPool(connection, this.#logger, this.#channelPoolSize, this.#channelRecoveryInterval, this.#clock)
+    const channelPool = new ChannelPool(connection, {
+      logger: this.#logger,
+      size: this.#channelPoolSize,
+      recoveryInterval: this.#channelRecoveryInterval,
+      clock: this.#clock
+    })
 
     await channelPool.initialize()
 
@@ -359,7 +362,7 @@ class RabbitMQ extends EventEmitter {
         this.off('reconnected', onReconnected)
         this.off('reconnectFailed', onReconnectFailed)
         this.off('reconnectError', onReconnectError)
-        this.#connectionWaiters.delete(abort)
+        this.off('disconnecting', onDisconnecting)
 
         if (timer) this.#clock.clearTimeout(timer)
       }
@@ -367,8 +370,11 @@ class RabbitMQ extends EventEmitter {
       // disconnect() stops the reconnection cycles this promise is waiting on,
       // so without an explicit abort it would never settle — and since
       // #connectPromise is only released in its finally, EVERY later connect()
-      // would receive the same dead promise.
-      this.#connectionWaiters.add(abort)
+      // would receive the same dead promise. One mechanism for all four
+      // signals: anything else waiting on the cycle hears the shutdown too.
+      const onDisconnecting = () => {
+        abort(new Error('Connection wait aborted: the client was disconnected'))
+      }
 
       const onReconnected = () => {
         cleanup()
@@ -391,6 +397,7 @@ class RabbitMQ extends EventEmitter {
       this.on('reconnected', onReconnected)
       this.on('reconnectFailed', onReconnectFailed)
       this.on('reconnectError', onReconnectError)
+      this.on('disconnecting', onDisconnecting)
 
       if (options.timeout > 0) {
         timer = this.#clock.setTimeout(() => {
@@ -402,11 +409,11 @@ class RabbitMQ extends EventEmitter {
   }
 
   async disconnect () {
-    // Before anything else: whoever is parked in connect({ waitForConnection })
-    // is waiting for a reconnection cycle this shutdown is about to end.
-    for (const abort of [...this.#connectionWaiters]) {
-      abort(new Error('Connection wait aborted: the client was disconnected'))
-    }
+    // Fired before any teardown, unlike 'disconnected' (which also fires on
+    // transient losses): this is the explicit-shutdown signal. Whoever is
+    // parked in connect({ waitForConnection }) is waiting on a reconnection
+    // cycle this shutdown is about to end.
+    this.emit('disconnecting')
 
     try {
       this.#rpc.handleConnectionLoss('client disconnected')
