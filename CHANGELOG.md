@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 1.8.0 (2026-08-22)
+
+* build(deps): move to breakwater 1.1.1 and rollup 4.62.5 by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/3564c346aed299824d1d4b449aa30a95881494f9)
+* fix: a listener that throws can no longer disable reconnection by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/1ad0fc68e924e7bfdf7797c209e95d6e889de766)
+* fix: the facade reports lifecycle events without breaking on them by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bd44cd2823ca3f10887246d6d47b32d513f548ec)
+* fix: give every consumer's dedicated channel and lost recovery an owner by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/be5c367cb699c3eca26f507d571bf9b67bd773e7)
+* fix: compressionThreshold 0 survives the codec constructor by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2df2ddd1c7b11e1fc01bdbbd28ad5f609387956b)
+* fix: refuse a rate limit cost no limiter could ever admit by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/eca79fd0a75385b1bb86d17774b53c87e9c278fd)
+* docs: pin the listener contract, the zero defaults and the new error code by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bef14f5ad1b5be8128937372b333b86328d2ed90)
+* release: full-src review round 3 — listener containment, channel ownership and limiter capacity (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/bfb8c0a5ed182610c6dda317a3232472694d0283)
+
+
 ## 1.7.0 (2026-08-16)
 
 * build(deps): adopt breakwater 1.x and refresh the toolchain by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/2cca31ad03f9c4836a4309f948944cfc0a499eb9)
