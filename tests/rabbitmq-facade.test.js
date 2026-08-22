@@ -745,21 +745,28 @@ describe('RabbitMQ facade connection edge cases', () => {
   })
 
   test('a throwing disconnected listener does not abort the shutdown', async (t) => {
-    // emit('disconnected') runs inside disconnect()'s try, so a listener that
-    // throws lands in the catch. Without it, one bad application listener
-    // would turn a graceful shutdown into a rejected promise.
+    // emit('disconnected') is disconnect()'s last act, and it used to sit
+    // uncontained inside the try that reports teardown failures: one bad
+    // application listener landed in the catch, which logged a perfectly clean
+    // shutdown as 'Error during disconnection' and dialed the connection
+    // teardown a second time. Contained, the crash is reported as what it is.
     const logger = recordingLogger()
-    const { rabbit } = await connected(t, { logger })
+    const { rabbit, connection } = await connected(t, { logger })
 
     rabbit.on('disconnected', () => { throw new Error('listener blew up') })
 
     await assert.doesNotReject(() => rabbit.disconnect())
 
     assert.ok(
-      logger.records.warn.some(line => line.includes('listener blew up')),
+      logger.records.error.some(line => line.includes("'disconnected' listener threw") && line.includes('listener blew up')),
       'the failure is reported, not swallowed silently'
     )
+    assert.ok(
+      !logger.records.warn.some(line => line.includes('Error during disconnection')),
+      'and it is not misreported as a teardown failure'
+    )
     assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected', 'the connection still went down')
+    assert.equal(connection.closed, true, 'exactly the one teardown, on a connection that really closed')
   })
 
   test('uses the built-in logger when none is provided', async (t) => {
@@ -1300,6 +1307,23 @@ describe('RabbitMQ facade cache accounting', () => {
     await defaulted.rabbit.publishWithCache('route', { n: 1 })
     assert.ok(defaultedLogger.records.info.some(line => line.includes('TTL: 60s')), 'the default stdTTL is 60s')
   })
+
+  test('a TTL of 0 survives both entry points', async (t) => {
+    // 0 means "never expire" to node-cache, and `||` silently replaced it with
+    // the default at BOTH ends: the constructor's cacheTTL and the per-publish
+    // option. Two distinct lines, one defect.
+    const perPublish = recordingLogger()
+    const explicit = await cached(t, { logger: perPublish })
+
+    await explicit.rabbit.publishWithCache('route', { n: 1 }, { cacheTTL: 0 })
+    assert.ok(perPublish.records.info.some(line => line.includes('TTL: 0s')), 'a per-publish 0 is honoured')
+
+    const configured = recordingLogger()
+    const zeroDefault = await cached(t, { logger: configured, cacheTTL: 0 })
+
+    await zeroDefault.rabbit.publishWithCache('route', { n: 1 })
+    assert.ok(configured.records.info.some(line => line.includes('TTL: 0s')), 'and so is a configured 0')
+  })
 })
 
 describe('RabbitMQ facade connect/disconnect fencing', () => {
@@ -1385,5 +1409,147 @@ describe('RabbitMQ facade teardown failures', () => {
     await reconnected
 
     assert.equal(dialer.connections.at(-1).consumersOn().length, 1, 'recovery completed despite the wedged teardown')
+  })
+})
+
+describe('RabbitMQ reconnection notification', () => {
+  test('a throwing reconnected listener is not misreported as a failed restore', async (t) => {
+    // The emit sat inside the try that reports restore failures, so an
+    // application listener's crash arrived as 'reconnectError' — rejecting an
+    // in-flight connect({ waitForConnection: true }) with "failed to restore
+    // state" on a client that had just recovered perfectly.
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, { logger })
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    const events = []
+
+    rabbit.on('reconnectError', (error) => events.push(`reconnectError:${error.message}`))
+    rabbit.on('reconnected', () => {
+      events.push('reconnected')
+
+      throw new Error('listener exploded')
+    })
+
+    dialer.connections[0].emit('close')
+
+    await waitFor(() => events.includes('reconnected'), 3000, 'reconnection')
+    await sleep(20)
+
+    assert.deepEqual(events, ['reconnected'], 'a listener crash is not a restore failure')
+    assert.equal(
+      dialer.connections.at(-1).consumersOn().length,
+      1,
+      'and the state really had been restored before the notification'
+    )
+    assert.ok(logger.records.error.some(line => line.includes("'reconnected' listener threw")))
+  })
+})
+
+describe('RabbitMQ shutdown notification', () => {
+  test('a throwing disconnecting listener cannot abort the shutdown', async (t) => {
+    // The emit sits BEFORE any teardown, so an application listener that threw
+    // left the whole disconnect undone: RPC waiters unsettled, consumers still
+    // registered, and the AMQP connection wide open.
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, { logger })
+
+    await rabbit.connect()
+    await rabbit.subscribe('orders', async () => {})
+
+    rabbit.on('disconnecting', () => { throw new Error('listener exploded') })
+
+    await rabbit.disconnect()
+
+    assert.equal(dialer.connections[0].closed, true, 'the connection was really closed')
+    assert.ok(logger.records.error.some(line => line.includes("'disconnecting' listener threw")))
+  })
+
+  test('a throwing circuitBreakerStateChanged listener does not break the publish that tripped it', async (t) => {
+    // The breaker transitions DURING a publish, so an uncontained listener
+    // crash surfaced as that publish failing with the listener's error.
+    const logger = recordingLogger()
+    const { rabbit, connection } = await connected(t, {
+      logger,
+      circuitBreaker: { failureThreshold: 2, timeout: 60000 }
+    })
+
+    rabbit.on('circuitBreakerStateChanged', () => { throw new Error('listener exploded') })
+
+    connection.channels.forEach((channel) => {
+      channel.confirmErrors.push(new Error('broker refused'), new Error('broker refused'))
+    })
+
+    const failures = []
+
+    for (let i = 0; i < 2; i++) {
+      await rabbit.publish('route', { n: i }, { maxRetries: 1 }).catch((error) => failures.push(error.message))
+    }
+
+    await waitFor(
+      () => logger.records.error.some(line => line.includes("'circuitBreakerStateChanged' listener threw")),
+      3000,
+      'the listener crash is reported as a listener crash'
+    )
+
+    assert.ok(
+      failures.every(message => /broker refused/.test(message)),
+      `publishes must fail for the broker's reason, not the listener's: ${failures.join(' | ')}`
+    )
+  })
+})
+
+describe('RabbitMQ event emission is per listener', () => {
+  test('a throwing listener registered first cannot starve the waitForConnection listeners', async (t) => {
+    // Containing the exception is not enough on its own: EventEmitter.emit
+    // ABANDONS its listener loop at the first throw, and the internal
+    // 'reconnected' listener that settles connect({ waitForConnection }) is
+    // registered after the application's. A timeout is passed here only so a
+    // regression fails in two seconds instead of hanging the suite — the
+    // documented no-timeout form would wait forever.
+    const logger = recordingLogger()
+    const dialer = createDialer([new Error('broker down'), 'ok'])
+    const rabbit = createRabbit(t, dialer, { logger })
+
+    t.after(() => rabbit.disconnect())
+
+    rabbit.on('reconnected', () => { throw new Error('listener exploded') })
+
+    const connection = await rabbit.connect({ waitForConnection: true, timeout: 2000 })
+
+    assert.ok(connection, 'the waiter settled despite the listener ahead of it throwing')
+    assert.ok(logger.records.error.some(line => line.includes("'reconnected' listener threw")))
+  })
+
+  test('a once listener still fires exactly once', async (t) => {
+    // Per-listener emission walks rawListeners, whose `once` wrappers remove
+    // themselves when called. Walking listeners() instead would hand back the
+    // unwrapped originals, leaving every once-listener installed for good.
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    t.after(() => rabbit.disconnect())
+
+    await rabbit.connect()
+
+    let calls = 0
+
+    rabbit.once('disconnected', () => { calls++ })
+
+    for (let cycle = 1; cycle <= 2; cycle++) {
+      const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+      dialer.connections.at(-1).emit('close')
+      await reconnected
+    }
+
+    assert.equal(calls, 1, 'two disconnections, one delivery')
+    assert.equal(rabbit.listenerCount('disconnected'), 0, 'and the wrapper removed itself')
   })
 })
