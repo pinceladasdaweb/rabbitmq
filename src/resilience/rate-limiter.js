@@ -71,6 +71,20 @@ class RateLimiter extends EventEmitter {
   }
 
   async checkRateLimit (key, cost = 1) {
+    // A cost above the strategy's capacity is not "rate limited", it is
+    // impossible: every strategy tops out at one limit, so waiting cannot help
+    // and the answer would be false forever. publishBatch spends one unit per
+    // message, so a batch larger than maxRequests used to fail permanently —
+    // outside any retry or backoff, and reported as an ordinary rate limit
+    // that would clear on its own. Fail loudly instead: the only fixes are a
+    // smaller batch or a bigger limit, and both belong to the caller.
+    if (cost > this.limiter.capacity) {
+      const error = new Error(`Rate limit cost ${cost} exceeds the ${this.strategy} capacity of ${this.limiter.capacity}; it can never be admitted. Publish in smaller batches or raise the limit.`)
+      error.code = 'RATE_LIMIT_COST_UNSATISFIABLE'
+
+      throw error
+    }
+
     const now = this.clock.now()
     const blockedUntil = this.blocked.get(key)
 
