@@ -140,3 +140,25 @@ describe('MessageCodec compression', () => {
     await assert.rejects(() => codec.decode(Buffer.from('not-gzip'), true), /incorrect header check/)
   })
 })
+
+describe('MessageCodec threshold configuration', () => {
+  test('compressionThreshold 0 survives the constructor', async () => {
+    // `|| 1000` made 0 unreachable from the constructor while
+    // setCompressionThreshold(0) explicitly accepts it: the same request,
+    // answered two different ways depending on the entry point.
+    const codec = new MessageCodec({ logger: silentLogger, useCompression: true, compressionThreshold: 0 })
+
+    assert.equal(codec.compressionThreshold, 0)
+
+    // A payload far below the old default: with 1000 silently substituted, this
+    // was never compressed however explicitly the caller asked.
+    const { compressed } = await codec.encode({ n: 1 })
+
+    assert.equal(compressed, true, 'threshold 0 means compress everything')
+  })
+
+  test('an omitted threshold still defaults to 1000', () => {
+    assert.equal(new MessageCodec({ logger: silentLogger }).compressionThreshold, 1000)
+    assert.equal(new MessageCodec({ logger: silentLogger, compressionThreshold: undefined }).compressionThreshold, 1000)
+  })
+})
