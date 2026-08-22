@@ -59,6 +59,7 @@ export interface RabbitMQOptions {
   connectionName?: string
   reconnectInterval?: number
   maxReconnectInterval?: number
+  /** Reconnection budget. `0` disables automatic reconnection entirely. Default: unlimited. */
   maxReconnectAttempts?: number
   exchange?: ExchangeOptions
   prefetchCount?: number
@@ -70,6 +71,7 @@ export interface RabbitMQOptions {
   /** How long unsubscribe() waits for in-flight handlers to finish before closing the consumer's dedicated channel anyway. Default: 30000. */
   consumerDrainTimeout?: number
   useCompression?: boolean
+  /** Minimum size in bytes before a message is compressed. `0` compresses everything. Default: 1000. */
   compressionThreshold?: number
   serializer?: (message: unknown) => string
   deserializer?: (message: string) => unknown
@@ -78,6 +80,7 @@ export interface RabbitMQOptions {
   deadLetterExchange?: string
   delayExchange?: string
   useCache?: boolean
+  /** Cache TTL in seconds. `0` means entries never expire. Default: 60. */
   cacheTTL?: number
   cacheCheckPeriod?: number
   cacheOptions?: Record<string, unknown>
@@ -110,8 +113,16 @@ export interface PublishOptions {
   [key: string]: unknown
 }
 
-/** Values of `error.code` on errors rejected by the publish methods. */
-export type PublishErrorCode = 'RATE_LIMIT_EXCEEDED' | 'UNROUTABLE'
+/**
+ * Values of `error.code` on errors rejected by the publish methods.
+ *
+ * - `RATE_LIMIT_EXCEEDED`: the limit is spent right now; retrying later works.
+ * - `RATE_LIMIT_COST_UNSATISFIABLE`: the cost exceeds the limiter's capacity,
+ *   so no amount of waiting helps (a `publishBatch` of 200 against
+ *   `maxRequests: 100`). Publish in smaller batches or raise the limit.
+ * - `UNROUTABLE`: no queue is bound for the routing key (`mandatory` only).
+ */
+export type PublishErrorCode = 'RATE_LIMIT_EXCEEDED' | 'RATE_LIMIT_COST_UNSATISFIABLE' | 'UNROUTABLE'
 
 /**
  * What happens to a message whose processing failed.

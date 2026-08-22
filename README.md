@@ -278,7 +278,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 - **maxReconnectInterval** `{number}`: Maximum interval between reconnection attempts in milliseconds.
   - Default: `15000`
   - Example: `30000`
-- **maxReconnectAttempts** `{number}`: Maximum number of reconnection attempts.
+- **maxReconnectAttempts** `{number}`: Maximum number of reconnection attempts. Pass `0` to disable automatic reconnection entirely.
   - Default: `Infinity`
   - Example: `10`
 
@@ -318,7 +318,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 - **useCompression** `{boolean}`: Enable message compression.
   - Default: `false`
   - Example: `true`
-- **compressionThreshold** `{number}`: Minimum message size in bytes for compression.
+- **compressionThreshold** `{number}`: Minimum message size in bytes for compression. `0` compresses every message.
   - Default: `1000`
   - Example: `2048`
 - **serializer** `{function}`: Custom function for message serialization.
@@ -330,7 +330,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 
 - **useCache** `{boolean}`: Enable message caching.
   - Default: `false`
-- **cacheTTL** `{number}`: Time to live for cached messages in seconds.
+- **cacheTTL** `{number}`: Time to live for cached messages in seconds. `0` means entries never expire.
   - Default: `60`
   - Example: `120`
 - **cacheCheckPeriod** `{number}`: Cache cleanup interval in seconds.
@@ -1261,6 +1261,16 @@ The `RabbitMQ` instance is an `EventEmitter`. All emitted events:
 | `messageProcessed` | `{ queue, messageId, consumerTag, durationMs }` | A consumed message was handled successfully (every subscribe variant) |
 | `messageFailed` | `{ queue, messageId, consumerTag, durationMs, error, requeued }` | A consumed message failed — handler crash, decode failure or an expired `depends-on` dependency |
 
+**A listener that throws never breaks the client.** Every event above is emitted
+defensively: the listener's exception is logged as such (`A 'reconnected'
+listener threw: …`) and the operation it was reporting on carries on. A crashing
+`disconnected` listener cannot stop reconnection, a crashing `consumerCancelled`
+listener cannot abort consumer recovery, a crashing `messageProcessed` listener
+cannot turn a successful delivery into a nack, and a crashing `reconnected`
+listener is not reported as `reconnectError` — the state really was restored.
+Note this covers **synchronous** throws; an `async` listener's rejection belongs
+to the listener, so `await` inside one needs its own `try/catch`.
+
 Notes on the per-message events:
 
 - `durationMs` measures the handler work. It is `undefined` on `messageFailed` when the message never ran — a sequential message that expired waiting for its `depends-on` dependency.
@@ -1321,7 +1331,8 @@ See [Reconnection Options](#reconnection-options).
 | Broker refuses / does not confirm | Retries up to `maxRetries` (default 3) with exponential backoff. `publishBatch` retries **only the unconfirmed messages** of the batch. | The publish rejects after the budget is spent |
 | Repeated failures | The circuit breaker opens after `failureThreshold` consecutive failures and publishes fail fast until a probe succeeds. It resets to CLOSED on a successful reconnection — old failures say nothing about the new connection. | `circuitBreakerStateChanged` |
 | Unroutable routing key | Silently dropped by AMQP — unless you pass `mandatory: true`, which makes the publish reject with `code: 'UNROUTABLE'`. | See [Unroutable publishes](#unroutable-publishes-mandatory) |
-| Rate limit hit | The publish is rejected before reaching the broker, with `code: 'RATE_LIMIT_EXCEEDED'`. | `rateLimited` / `rateBlocked` |
+| Rate limit hit | The publish is rejected before reaching the broker, with `code: 'RATE_LIMIT_EXCEEDED'`. Retrying later succeeds. | `rateLimited` / `rateBlocked` |
+| Rate limit cost above the limiter's capacity | Rejected immediately with `code: 'RATE_LIMIT_COST_UNSATISFIABLE'`. A `publishBatch` spends one unit per message, so a batch larger than the limit could never be admitted however long you wait — publish in smaller batches or raise the limit. | The publish rejects; no `rateLimited` event, because nothing was limited |
 
 ### Consuming
 
