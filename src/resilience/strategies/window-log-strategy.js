@@ -11,6 +11,13 @@ class WindowLogStrategy {
     this.windows = new Map()
   }
 
+  // The most a single check can ever be granted: occupancy is compared against
+  // one limit, so an entry costing more than it never fits, however empty the
+  // log. See RateLimiter.checkRateLimit.
+  get capacity () {
+    return this.limit
+  }
+
   #windowFor (key) {
     let windowData = this.windows.get(key)
 

@@ -6,6 +6,12 @@ class TokenBucketStrategy {
     this.buckets = new Map()
   }
 
+  // The most a single check can ever be granted: tokens refill up to
+  // bucketSize and stop there. See RateLimiter.checkRateLimit.
+  get capacity () {
+    return this.bucketSize
+  }
+
   // Reads refill too: remaining() must see the tokens accrued since the last
   // check, not the balance frozen at that moment.
   #bucket (key, now) {

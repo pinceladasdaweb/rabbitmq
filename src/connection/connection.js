@@ -1,6 +1,8 @@
 import amqp from 'amqplib'
 import { EventEmitter } from 'node:events'
 import systemClock from '../utils/clock.js'
+import emitSafely from '../utils/emit-safely.js'
+import describeError from '../utils/describe-error.js'
 
 class RabbitMQConnection extends EventEmitter {
   #logger
@@ -38,7 +40,9 @@ class RabbitMQConnection extends EventEmitter {
     this.#reconnectAttempt = 0
     this.#reconnectInterval = options.reconnectInterval || 1000
     this.#maxReconnectInterval = options.maxReconnectInterval || 15000
-    this.#maxReconnectAttempts = options.maxReconnectAttempts || Infinity
+    // ?? and not ||: a caller asking for 0 attempts wants NO reconnection,
+    // and || turned that exact request into its opposite (retry forever).
+    this.#maxReconnectAttempts = options.maxReconnectAttempts ?? Infinity
     this.#connectionState = 'disconnected'
     this.#currentEndpointIndex = 0
     this.#isShuttingDown = false
@@ -57,6 +61,20 @@ class RabbitMQConnection extends EventEmitter {
     if (this.#endpoints.length === 0 || this.#endpoints.some(endpoint => !endpoint)) {
       throw new Error('At least one valid RabbitMQ endpoint must be provided')
     }
+  }
+
+  // Every lifecycle emit in this class sits at a load-bearing point of the
+  // state machine, and a listener is application code running in the middle
+  // of it. startReconnection used to announce 'disconnected' BEFORE arming
+  // the retry timer, so a throwing listener escaped with #isReconnecting
+  // already true and no timer pending: reconnection was disabled for the rest
+  // of the process's life, state stuck on 'reconnecting'. The listener's crash
+  // is the listener's bug — it must never unwind the caller.
+  //
+  // Contains synchronous throws only. An async listener's rejection belongs to
+  // whoever registered it; the facade's own handlers contain theirs.
+  #safeEmit (event, ...args) {
+    emitSafely(this, event, args, this.#logger)
   }
 
   #clearReconnectTimeout () {
@@ -138,7 +156,7 @@ class RabbitMQConnection extends EventEmitter {
         this.#isReconnecting = false
         this.#reconnectAttempt = 0
         this.#setConnectionState('connected')
-        this.emit('connected', endpoint)
+        this.#safeEmit('connected', endpoint)
 
         return this.#connection
       } catch (err) {
@@ -164,7 +182,7 @@ class RabbitMQConnection extends EventEmitter {
     if (!this.#isReconnecting) {
       this.#isReconnecting = true
       this.#setConnectionState('reconnecting')
-      this.emit('disconnected')
+      this.#safeEmit('disconnected')
     }
 
     this.#scheduleReconnect()
@@ -179,7 +197,7 @@ class RabbitMQConnection extends EventEmitter {
       this.#logger.error(`Max reconnect attempts (${this.#maxReconnectAttempts}) reached. Giving up.`)
       this.#isReconnecting = false
       this.#setConnectionState('failed')
-      this.emit('reconnectFailed')
+      this.#safeEmit('reconnectFailed')
 
       return
     }
@@ -196,7 +214,12 @@ class RabbitMQConnection extends EventEmitter {
     }
 
     this.#reconnectTimeout = this.#clock.setTimeout(() => {
-      this.#attemptReconnect()
+      // Detached: nothing awaits the timer callback, so an unexpected
+      // rejection here would be an unhandled rejection that kills the process
+      // instead of just failing one attempt.
+      this.#attemptReconnect().catch((error) => {
+        this.#logger.error(`Reconnection attempt failed unexpectedly: ${describeError(error)}`)
+      })
     }, delay)
   }
 
@@ -208,7 +231,7 @@ class RabbitMQConnection extends EventEmitter {
     const connection = await this.connect()
 
     if (connection) {
-      this.emit('reconnected')
+      this.#safeEmit('reconnected')
     }
   }
 
@@ -216,7 +239,7 @@ class RabbitMQConnection extends EventEmitter {
     if (this.#connectionState === state) return
 
     this.#connectionState = state
-    this.emit('connectionStateChanged', state)
+    this.#safeEmit('connectionStateChanged', state)
   }
 
   async disconnect () {

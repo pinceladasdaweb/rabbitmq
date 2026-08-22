@@ -166,10 +166,12 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     always ships close(), and skipping it only leaves node-cache's
 //     internal (unref'd) sweep running — unobservable without real waits.
 //   - index.js disconnect's catch-retry: the primary #connection.disconnect
-//     has already run by the time anything can throw (a throwing
-//     'disconnected' listener), and the connection state machine dedups the
-//     second call — the retry exists for mid-teardown failures that the
-//     public API cannot produce deterministically.
+//     has already run by the time anything can throw, and the connection state
+//     machine dedups the second call — the retry exists for mid-teardown
+//     failures that the public API cannot produce deterministically. (This
+//     entry used to name a throwing 'disconnected' listener as that thrower;
+//     every lifecycle emit is contained now, so the listener cannot reach the
+//     catch at all — which is what a test pins.)
 //   - index.js publishWithCache's `#cache.options?.stdTTL`: node-cache
 //     instances always expose options — the chain cannot miss.
 

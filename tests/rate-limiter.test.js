@@ -63,7 +63,13 @@ describe('RateLimiter', () => {
       clock.advance(10000)
 
       assert.equal(limiter.getRemainingTokens('key-a'), 4)
-      assert.equal(await limiter.checkRateLimit('key-a', 5), false, 'the cap is real, not just reported')
+
+      // Spend exactly the cap, then ask for one more: had those 10 idle
+      // windows kept accruing, this would be the start of a 40-token balance.
+      // (Probing with cost 5 would test nothing about the cap — a cost above
+      // capacity is now refused up front, before any balance is consulted.)
+      assert.equal(await limiter.checkRateLimit('key-a', 4), true)
+      assert.equal(await limiter.checkRateLimit('key-a'), false, 'the cap is real, not just reported')
     })
 
     test('respects cost', async (t) => {
@@ -736,5 +742,52 @@ describe('RateLimiter', () => {
         assert.equal(storeOf(limiter).size, 0, `${config.strategy}: dispose emptied the store`)
       }
     })
+  })
+})
+
+describe('RateLimiter unsatisfiable cost', () => {
+  // Every strategy tops out at a single limit, so a cost above it can never be
+  // admitted however long the caller waits. checkRateLimit answered false
+  // forever: publishBatch with more messages than maxRequests failed
+  // permanently, reported as an ordinary rate limit that would clear on its
+  // own, outside any retry or backoff.
+  const capacityCases = [
+    { strategy: 'token-bucket', options: { maxRequests: 10 } },
+    { strategy: 'fixed-window', options: { maxRequests: 10 } },
+    { strategy: 'sliding-window', options: { maxRequests: 10 } },
+    // The leaky bucket paces rather than refuses, so its ceiling is queue
+    // occupancy: queueLimit is what a cost is measured against, not maxRequests.
+    { strategy: 'leaky-bucket', options: { maxRequests: 100, queueLimit: 10 } }
+  ]
+
+  for (const { strategy, options } of capacityCases) {
+    test(`${strategy} refuses a cost above its capacity instead of stalling forever`, async (t) => {
+      const limiter = new RateLimiter({ strategy, windowMs: 1000, ...options })
+      t.after(() => limiter.dispose())
+
+      await assert.rejects(
+        () => limiter.checkRateLimit('key-a', 11),
+        (error) => {
+          assert.equal(error.code, 'RATE_LIMIT_COST_UNSATISFIABLE')
+          assert.match(error.message, /can never be admitted/)
+
+          return true
+        }
+      )
+
+      // The refusal is a configuration verdict, not consumption: a cost that
+      // does fit must still go through untouched.
+      assert.equal(await limiter.checkRateLimit('key-a', 10), true)
+    })
+  }
+
+  test('a burstable token bucket admits up to its burst limit, not just maxRequests', async (t) => {
+    // Capacity has to follow the strategy's real ceiling: reporting maxRequests
+    // here would refuse costs the bucket can actually serve.
+    const limiter = new RateLimiter({ strategy: 'token-bucket', maxRequests: 10, windowMs: 1000, burstable: true, burstLimit: 20 })
+    t.after(() => limiter.dispose())
+
+    assert.equal(await limiter.checkRateLimit('key-a', 20), true, 'the burst capacity is usable')
+    await assert.rejects(() => limiter.checkRateLimit('key-b', 21), /can never be admitted/)
   })
 })

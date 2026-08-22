@@ -71,7 +71,7 @@
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/tap-runner": "^10.0.0",
     "lint-staged": "^17.3.0",
-    "rollup": "^4.62.4",
+    "rollup": "^4.62.5",
     "standard": "^17.1.2",
     "typescript": "^7.0.2",
     "xml2js": "^0.6.2"
@@ -79,7 +79,7 @@
   "dependencies": {
     "@cacheable/node-cache": "^3.1.1",
     "amqplib": "^2.0.1",
-    "breakwater": "^1.1.0"
+    "breakwater": "^1.1.1"
   },
   "overrides": {
     "qs": "^6.15.3"

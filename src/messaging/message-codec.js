@@ -9,7 +9,10 @@ class MessageCodec {
     this.serializer = options.serializer || JSON.stringify
     this.deserializer = options.deserializer || JSON.parse
     this.useCompression = options.useCompression || false
-    this.compressionThreshold = options.compressionThreshold || 1000
+    // ?? and not ||: setCompressionThreshold explicitly accepts 0 ("compress
+    // everything"), so the constructor rewriting that same 0 to 1000 made the
+    // two entry points disagree about the identical request.
+    this.compressionThreshold = options.compressionThreshold ?? 1000
     this.logger = options.logger
   }
 

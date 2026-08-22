@@ -8,6 +8,12 @@ class FixedWindowStrategy {
     this.counters = new Map()
   }
 
+  // The most a single check can ever be granted: even an empty window admits
+  // at most maxRequests. See RateLimiter.checkRateLimit.
+  get capacity () {
+    return this.maxRequests
+  }
+
   #windowStart (now) {
     return Math.floor(now / this.windowMs) * this.windowMs
   }
