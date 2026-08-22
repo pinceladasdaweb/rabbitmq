@@ -2453,3 +2453,240 @@ describe('ConsumerManager tag bookkeeping across consumers', () => {
     assert.equal(await harness.manager.unsubscribe(billing.consumerTag), true, 'and can still be unsubscribed')
   })
 })
+
+describe('ConsumerManager listener containment', () => {
+  test('a throwing lifecycle listener neither aborts recovery nor escapes the detached path', async () => {
+    // consumerCancelled/consumerRecovered/consumerLost used to be raw emits on
+    // paths nothing awaits (a channel 'close' handler, amqplib's null
+    // delivery), so an application listener that threw did not merely skip a
+    // notification: it abandoned the recovery midway AND surfaced as an
+    // unhandled rejection that took the process down.
+    const logger = recordingLogger()
+    const events = []
+    const harness = createManager({
+      logger,
+      emit: (event, payload) => {
+        events.push({ event, payload })
+
+        if (event === 'consumerCancelled') throw new Error('listener exploded')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(() => events.some(e => e.event === 'consumerRecovered'), 3000, 'recovery outlives the listener')
+
+    assert.equal(harness.channel.consumers.length, 2, 'the consumer was recreated despite the crash')
+    assert.ok(
+      logger.records.error.some(line => line.includes("'consumerCancelled' listener threw")),
+      'the listener bug is reported as such, not as a consumer failure'
+    )
+  })
+
+  test('a throwing consumerLost listener still leaves the consumer fully dropped', async () => {
+    const logger = recordingLogger()
+    const events = []
+    const harness = createManager({
+      logger,
+      emit: (event, payload) => {
+        events.push({ event, payload })
+
+        if (event === 'consumerLost') throw new Error('listener exploded')
+      }
+    })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    harness.channel.consumeError = new Error('NOT_FOUND - no queue "orders"')
+
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(() => events.some(e => e.event === 'consumerLost'), 3000, 'consumerLost')
+
+    assert.equal(harness.manager.activeConsumers.size, 0, 'the drop completed before the notification')
+    assert.ok(logger.records.error.some(line => line.includes("'consumerLost' listener threw")))
+  })
+})
+
+describe('ConsumerManager cancellation during channel setup', () => {
+  test('a consumer cancelled while its channel opens never reaches channel.consume', async () => {
+    // Opening a channel is a broker round trip, and every RECREATION runs the
+    // setup closure while the caller already holds an unsubscribable tag.
+    // Without a re-check after the await, the consume below issued a live
+    // broker consumer on a channel nobody tracked: every delivery then threw
+    // on the missing consumerInfo and was never settled, so the queue filled
+    // with unacked messages until the connection dropped.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+    const consumersAfterSubscribe = harness.channel.consumers.length
+
+    // Hold the next handout open: this is the window.
+    const gate = Promise.withResolvers()
+
+    harness.channelPool.getDedicatedChannel = async () => {
+      await gate.promise
+
+      return harness.channel
+    }
+
+    const recreation = harness.manager.recreateAll()
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    gate.resolve()
+    await recreation
+
+    assert.equal(
+      harness.channel.consumers.length,
+      consumersAfterSubscribe,
+      'no consume may be issued for a consumer that is already gone'
+    )
+    assert.deepEqual(
+      harness.channelPool.released,
+      [consumerId, consumerId],
+      'the channel reopened after the drop goes back too, or it leaks'
+    )
+  })
+})
+
+describe('ConsumerManager dedicated channel ownership', () => {
+  test('giving up on a lost consumer releases its dedicated channel', async () => {
+    // The release used to live in unsubscribe() alone, so the other two ways a
+    // consumer goes away each leaked one channel toward channel_max.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    harness.channel.consumeError = new Error('NOT_FOUND - no queue "orders"')
+
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(() => harness.events.some(e => e.event === 'consumerLost'), 3000, 'consumerLost')
+
+    assert.deepEqual(harness.channelPool.released, [consumerId], 'a consumer that is gone must not keep a channel')
+  })
+
+  test('a subscribe that fails during setup releases the channel it opened', async () => {
+    const harness = createManager()
+
+    harness.channel.consumeError = new Error('ACCESS_REFUSED - refused')
+
+    await assert.rejects(() => harness.manager.subscribe('orders', async () => {}), /ACCESS_REFUSED/)
+
+    assert.equal(harness.channelPool.released.length, 1, 'a failed subscribe must not leak its channel')
+  })
+})
+
+describe('ConsumerManager detached recovery failures', () => {
+  test('a recovery that fails on a detached path is reported, not thrown into the void', async () => {
+    // handleConsumerLoss is kicked off from places that cannot await it, so an
+    // unexpected rejection inside it — here the clock seam the backoff sleeps
+    // on — used to become an unhandled rejection and take the process down
+    // over a consumer that was already lost.
+    const logger = recordingLogger()
+    const clock = {
+      now: () => 1000,
+      sleep: async () => { throw new Error('clock seam exploded') }
+    }
+    const harness = createManager({ logger, clock })
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    // The detached entry point: amqplib delivers null on a broker cancel.
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(
+      () => logger.records.error.some(line => line.includes('Consumer recovery failed unexpectedly')),
+      3000,
+      'the detached failure was reported'
+    )
+  })
+})
+
+describe('ConsumerManager channel ownership during a cancelled setup', () => {
+  test('an unsubscribe still in flight keeps the channel the guard must not release', async () => {
+    // Two ways to be cancelled, two owners. A consumer already DROPPED left
+    // nobody to close the channel the setup just reopened, so the guard closes
+    // it; a consumer merely FLAGGED cancelled has an unsubscribe parked on
+    // that very channel, waiting to cancel and drain on it — pulling it out
+    // from under that call would kill the acks it is draining for.
+    const harness = createManager()
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const consumerId = harness.manager.findConsumerIdByTag(consumer.consumerTag)
+
+    const channelReady = Promise.withResolvers()
+    const cancelReached = Promise.withResolvers()
+    const cancelRelease = Promise.withResolvers()
+
+    harness.channelPool.getDedicatedChannel = async () => {
+      await channelReady.promise
+
+      return harness.channel
+    }
+
+    harness.channel.cancel = async () => {
+      cancelReached.resolve()
+
+      await cancelRelease.promise
+    }
+
+    const recreation = harness.manager.recreateAll()
+    const unsubscribing = harness.manager.unsubscribe(consumer.consumerTag)
+
+    // unsubscribe has flagged the consumer and is parked on the broker's
+    // cancel: still registered, so the guard takes the other branch.
+    await cancelReached.promise
+
+    channelReady.resolve()
+    await recreation
+
+    assert.deepEqual(harness.channelPool.released, [], 'the channel unsubscribe is still using must survive the guard')
+
+    cancelRelease.resolve()
+    await unsubscribing
+
+    assert.deepEqual(harness.channelPool.released, [consumerId], 'and unsubscribe releases it exactly once')
+  })
+
+  test('the guard tolerates the pool vanishing while the channel was opening', async () => {
+    // Reaching the guard means a channel WAS handed out, but the connection can
+    // drop before the guard runs — the release has to survive a pool that is
+    // already gone, and still report the cancellation rather than a TypeError.
+    const logger = recordingLogger()
+    let livePool = null
+    const harness = createManager({ logger, getChannelPool: () => livePool })
+
+    livePool = harness.channelPool
+
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    const channelReady = Promise.withResolvers()
+
+    harness.channelPool.getDedicatedChannel = async () => {
+      await channelReady.promise
+
+      return harness.channel
+    }
+
+    const recreation = harness.manager.recreateAll()
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    // The connection drops while the recreation is still waiting for a channel.
+    livePool = null
+
+    channelReady.resolve()
+    await recreation
+
+    assert.ok(
+      logger.records.error.some(line => line.includes('orders') && line.includes('cancelled before its channel was ready')),
+      'the operator is told which consumer was abandoned and why'
+    )
+  })
+})
