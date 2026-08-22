@@ -871,3 +871,73 @@ describe('RabbitMQConnection reconnect timer races', () => {
     assert.deepEqual(delays, [100, 200, 400, 800, 800, 800], 'doubles until the ceiling, then holds')
   })
 })
+
+describe('RabbitMQConnection listener containment', () => {
+  test('a throwing disconnected listener cannot disable reconnection', async (t) => {
+    // startReconnection announces 'disconnected' one statement BEFORE arming
+    // the retry timer. A listener that threw escaped with #isReconnecting
+    // already true and no timer pending, so reconnection was disabled for the
+    // rest of the process's life with the state stuck on 'reconnecting'.
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer, { logger })
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    connection.on('disconnected', () => { throw new Error('listener exploded') })
+
+    const reconnected = new Promise(resolve => connection.once('reconnected', resolve))
+
+    dialer.connections[0].emit('close')
+
+    await reconnected
+
+    assert.equal(connection.getConnectionState(), 'connected')
+    assert.ok(
+      logger.records.error.some(line => line.includes("'disconnected' listener threw")),
+      'the listener bug is reported as such'
+    )
+  })
+
+  test('a throwing connected listener does not make connect() reject a live connection', async (t) => {
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer, { logger })
+
+    t.after(() => connection.disconnect())
+
+    connection.on('connected', () => { throw new Error('listener exploded') })
+
+    const result = await connection.connect()
+
+    assert.ok(result, 'the connection was established; only the notification failed')
+    assert.equal(connection.getConnectionState(), 'connected')
+    assert.ok(logger.records.error.some(line => line.includes("'connected' listener threw")))
+  })
+})
+
+describe('RabbitMQConnection reconnection budget', () => {
+  test('maxReconnectAttempts 0 disables reconnection instead of retrying forever', async (t) => {
+    // `|| Infinity` turned a caller's explicit "never reconnect" into its exact
+    // opposite: an unbounded retry loop.
+    const dialer = createDialer()
+    const connection = createConnection(t, dialer, { maxReconnectAttempts: 0 })
+
+    t.after(() => connection.disconnect())
+
+    await connection.connect()
+
+    const events = []
+
+    connection.on('reconnectFailed', () => events.push('reconnectFailed'))
+
+    dialer.connections[0].emit('close')
+
+    await waitFor(() => events.includes('reconnectFailed'), 1000, 'gives up without dialing')
+
+    assert.equal(connection.getConnectionState(), 'failed')
+    assert.equal(dialer.dials, 1, 'not a single reconnection dial was made')
+  })
+})
