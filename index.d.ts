@@ -116,13 +116,15 @@ export interface PublishOptions {
 /**
  * Values of `error.code` on errors rejected by the publish methods.
  *
+ * - `NOT_CONNECTED`: no channel pool exists — the client is connecting, or
+ *   recovering from a lost connection. Retrying once `connected` fires works.
  * - `RATE_LIMIT_EXCEEDED`: the limit is spent right now; retrying later works.
  * - `RATE_LIMIT_COST_UNSATISFIABLE`: the cost exceeds the limiter's capacity,
  *   so no amount of waiting helps (a `publishBatch` of 200 against
  *   `maxRequests: 100`). Publish in smaller batches or raise the limit.
  * - `UNROUTABLE`: no queue is bound for the routing key (`mandatory` only).
  */
-export type PublishErrorCode = 'RATE_LIMIT_EXCEEDED' | 'RATE_LIMIT_COST_UNSATISFIABLE' | 'UNROUTABLE'
+export type PublishErrorCode = 'NOT_CONNECTED' | 'RATE_LIMIT_EXCEEDED' | 'RATE_LIMIT_COST_UNSATISFIABLE' | 'UNROUTABLE'
 
 /**
  * What happens to a message whose processing failed.

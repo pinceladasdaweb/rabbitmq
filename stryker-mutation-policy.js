@@ -165,13 +165,34 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //   - index.js disconnect's cache-close shape guards: @cacheable/node-cache
 //     always ships close(), and skipping it only leaves node-cache's
 //     internal (unref'd) sweep running — unobservable without real waits.
-//   - index.js disconnect's catch-retry: the primary #connection.disconnect
-//     has already run by the time anything can throw, and the connection state
-//     machine dedups the second call — the retry exists for mid-teardown
-//     failures that the public API cannot produce deterministically. (This
-//     entry used to name a throwing 'disconnected' listener as that thrower;
-//     every lifecycle emit is contained now, so the listener cannot reach the
-//     catch at all — which is what a test pins.)
+//   - index.js disconnect's catch-retry: with every emit contained, the only
+//     public seam that can still throw inside the try is the injected logger,
+//     and the retry's own failure is reachable the same way (the connection
+//     logs through it inside its own catch). Both catches are covered by the
+//     throwing-logger test; listed here because the state machine dedups the
+//     second disconnect, so mutants that drop the retry are unobservable.
+//   - consumer-manager.js handleConsumerLoss's `stillOurs` identity check
+//     (`activeConsumers.get(id) === consumerInfo` -> true): every path that
+//     drops a consumer flags it cancelled first (unsubscribe, disposeAll) or is
+//     this loop itself, so the `!cancelled` operand beside it already answers;
+//     the identity check is defense in depth against a drop that forgot the
+//     flag, which no current caller can produce.
+//   - consumer-manager.js the post-consume fence's identity operand
+//     (`activeConsumers.get(id) !== consumerInfo` -> false): same defense in
+//     depth as above — a consumer is never dropped without being flagged
+//     cancelled first (unsubscribe, disposeAll), and handleConsumerLoss's
+//     give-up cannot drop while a recreation is in flight because that
+//     recreation bumped the epoch its own fence reads. The `cancelled` operand
+//     beside it is the one that answers today, and its mutants are killed.
+//   - consumer-manager.js the drain-waiters length guard (`&& length > 0` ->
+//     true / >=): splice(0) on an empty array is a no-op; the guard only saves
+//     the allocation, exactly as its comment says.
+//   - safe-logger.js the Symbol.for key string -> '': still a shared symbol,
+//     still the same key for every wrap in the process — the name is for
+//     humans reading a heap snapshot.
+//   - safe-logger.js `logger?.[WRAPPED]` -> `logger[WRAPPED]`: the facade is
+//     the only caller and always passes `options.logger || Logger`, never a
+//     nullish value.
 //   - index.js publishWithCache's `#cache.options?.stdTTL`: node-cache
 //     instances always expose options — the chain cannot miss.
 
@@ -238,6 +259,21 @@ const logCall = (path) => {
 
   if (isLoggerCall(call)) {
     return 'Removing a log call is phrasing-level; promised log lines are pinned by tests.'
+  }
+
+  return undefined
+}
+
+// The label handed to detached() (utils/detached.js) is the prefix of the log
+// line it writes when the promise rejects — phrasing, same policy as a logger
+// call's own arguments.
+const detachedLabel = (path) => {
+  if (!path.isStringLiteral() && !path.isTemplateLiteral()) return undefined
+
+  const call = path.findParent((parent) => parent.isCallExpression())
+
+  if (call && call.node.callee.type === 'Identifier' && call.node.callee.name === 'detached') {
+    return 'A detached() label is log phrasing, not contract.'
   }
 
   return undefined
@@ -315,7 +351,7 @@ const repairedWindowCounter = (path) => {
   return undefined
 }
 
-const RULES = [logString, logCall, successLogHook, bufferEncoding, breakerName, repairedWindowCounter]
+const RULES = [logString, logCall, detachedLabel, successLogHook, bufferEncoding, breakerName, repairedWindowCounter]
 
 export const strykerPlugins = [
   declareValuePlugin(PluginKind.Ignore, 'mutation-policy', {

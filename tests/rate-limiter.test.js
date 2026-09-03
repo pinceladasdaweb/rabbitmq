@@ -402,7 +402,7 @@ describe('RateLimiter', () => {
       limiter.dispose()
     })
 
-    test('runs every windowMs / 10, capped at one minute', () => {
+    test('runs every windowMs / 10, clamped between 100ms and one minute', () => {
       const fast = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 1000 })
       const slow = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 6000000 })
 
@@ -411,8 +411,14 @@ describe('RateLimiter', () => {
       assert.equal(intervalOf(fast), 100)
       assert.equal(intervalOf(slow), 60000, 'a huge window must not starve the sweep')
 
+      // The floor: a 100ms burst cap used to sweep every key every 10ms.
+      const tiny = createLimiter({ strategy: 'token-bucket', maxRequests: 2, windowMs: 100 })
+
+      assert.equal(intervalOf(tiny), 100, 'a tiny window must not turn the sweep into a busy loop')
+
       fast.limiter.dispose()
       slow.limiter.dispose()
+      tiny.limiter.dispose()
     })
 
     test('evicts a token bucket idle for more than two windows, and not before', async (t) => {

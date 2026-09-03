@@ -155,13 +155,15 @@ class WorkerPool {
     this.terminated = true
     this.#rejectAllWaiters(new Error('Worker pool has been terminated'))
 
-    for (const worker of [...this.workers]) {
+    // Threads are independent: one at a time, a worker mid-task delayed the
+    // teardown of every worker behind it.
+    await Promise.all([...this.workers].map(async (worker) => {
       try {
         await worker.terminate()
       } catch (error) {
         this.logger?.warn(`Failed to terminate worker: ${error.message}`)
       }
-    }
+    }))
 
     this.workers.clear()
     this.idleWorkers = []

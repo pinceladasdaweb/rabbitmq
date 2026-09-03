@@ -3,8 +3,10 @@ import RabbitMQ from '../src/index.js'
 import { fileURLToPath } from 'node:url'
 import { test, describe } from 'node:test'
 import { installDialer } from './fake-amqp.js'
+import _NodeCache from '@cacheable/node-cache'
 import { createDialer, recordingLogger, silentLogger, sleep, waitFor, withLiveEventLoop } from './helpers.js'
 
+const NodeCache = _NodeCache.default || _NodeCache
 const ECHO_WORKER = fileURLToPath(new URL('./fixtures/echo-worker.mjs', import.meta.url))
 
 // The facade is mostly thin delegation, but "thin" is exactly where a wrong
@@ -1551,5 +1553,205 @@ describe('RabbitMQ event emission is per listener', () => {
 
     assert.equal(calls, 1, 'two disconnections, one delivery')
     assert.equal(rabbit.listenerCount('disconnected'), 0, 'and the wrapper removed itself')
+  })
+})
+
+describe('RabbitMQ connect waitForConnection against a spent budget', () => {
+  test('maxReconnectAttempts 0 rejects the waiter instead of hanging it forever', async (t) => {
+    // 'reconnectFailed' fires synchronously INSIDE the connection's own
+    // connect() when the budget is already spent — before the facade has
+    // registered its waiters. The promise then hung forever, and since
+    // #connectPromise is only released in its finally, so did every connect()
+    // after it. The timeout only makes a regression fail in two seconds; the
+    // assertion is on WHICH rejection arrives.
+    const dialer = createDialer([new Error('broker down')])
+    const rabbit = createRabbit(t, dialer, { maxReconnectAttempts: 0 })
+
+    t.after(() => rabbit.disconnect())
+
+    await assert.rejects(
+      () => rabbit.connect({ waitForConnection: true, timeout: 2000 }),
+      /all reconnection attempts failed/
+    )
+
+    // The funnel must be usable again, not poisoned by a dead promise.
+    await assert.rejects(
+      () => rabbit.connect({ waitForConnection: true, timeout: 2000 }),
+      /all reconnection attempts failed/
+    )
+  })
+
+  test('a throwing reconnectFailed listener cannot starve the waiter either', async (t) => {
+    // The internal onReconnectFailed is registered AFTER the application's
+    // listener; with a loop-abandoning emit it never ran.
+    const logger = recordingLogger()
+    const dialer = createDialer([new Error('broker down')])
+    const rabbit = createRabbit(t, dialer, { logger, maxReconnectAttempts: 1 })
+
+    t.after(() => rabbit.disconnect())
+
+    rabbit.on('reconnectFailed', () => { throw new Error('listener exploded') })
+
+    await assert.rejects(
+      () => rabbit.connect({ waitForConnection: true, timeout: 3000 }),
+      /all reconnection attempts failed/
+    )
+    assert.ok(logger.records.error.some(line => line.includes("'reconnectFailed' listener threw")))
+  })
+})
+
+describe('RabbitMQ emits every event listener by listener', () => {
+  test('a throwing rateLimited listener does not replace the publish error', async (t) => {
+    // 'rateLimited' is emitted synchronously inside checkRateLimit during a
+    // publish's preflight: uncontained, the listener's exception replaced the
+    // coded RATE_LIMIT_EXCEEDED and callers branching on the code misrouted a
+    // routine throttle as a generic failure.
+    const logger = recordingLogger()
+    const { rabbit } = await connected(t, {
+      logger,
+      rateLimiter: { strategy: 'fixed-window', maxRequests: 1, windowMs: 60000 }
+    })
+
+    rabbit.on('rateLimited', () => { throw new Error('metrics down') })
+
+    await rabbit.publish('route', { n: 1 })
+
+    await assert.rejects(() => rabbit.publish('route', { n: 2 }), (error) => {
+      assert.equal(error.code, 'RATE_LIMIT_EXCEEDED', `must fail for the limiter's reason, got: ${error.message}`)
+
+      return true
+    })
+    assert.ok(logger.records.error.some(line => line.includes("'rateLimited' listener threw")))
+  })
+
+  test('a throwing messageFailed listener does not starve the next one', async (t) => {
+    // The consumer events reach the facade through context.emit, which is now
+    // the same per-listener emit as every lifecycle event: metrics choking on a
+    // payload must not silence alerting for the life of the process.
+    const { rabbit, connection } = await connected(t)
+    const seen = []
+
+    rabbit.on('messageFailed', () => { throw new Error('metrics exploded') })
+    rabbit.on('messageFailed', ({ queue }) => seen.push(queue))
+
+    await rabbit.subscribe('orders', async () => { throw new Error('handler failed') })
+    await deliverTo(lastConsumer(connection), { n: 1 })
+
+    assert.deepEqual(seen, ['orders'], 'alerting still hears the failure')
+  })
+
+  test('a throwing connected listener does not starve the next one, which still gets the endpoint', async (t) => {
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+    const seen = []
+
+    t.after(() => rabbit.disconnect())
+
+    rabbit.on('connected', () => { throw new Error('listener exploded') })
+    rabbit.on('connected', (endpoint) => seen.push(endpoint))
+
+    await rabbit.connect()
+
+    assert.deepEqual(seen, ['node-a:5672'], 'the endpoint used to be dropped by the forwarder')
+  })
+
+  test('an async listener that rejects is contained like a throw', async (t) => {
+    // Node's emit would leave the rejection unhandled — fatal under the default
+    // --unhandled-rejections=throw, in the middle of a reconnection.
+    const logger = recordingLogger()
+    const { rabbit, connection } = await connected(t, { logger })
+
+    rabbit.on('disconnected', async () => { throw new Error('flush failed') })
+
+    const reconnected = new Promise(resolve => rabbit.once('reconnected', resolve))
+
+    connection.emit('close')
+    await reconnected
+
+    await waitFor(
+      () => logger.records.error.some(line => line.includes("'disconnected' listener threw") && line.includes('flush failed')),
+      3000,
+      'the rejection was reported as a listener failure'
+    )
+  })
+
+  test("emitting 'error' with no listener still throws, as EventEmitter promises", async (t) => {
+    const { rabbit } = await connected(t)
+
+    assert.throws(() => rabbit.emit('error', new Error('boom')), /boom/)
+  })
+})
+
+describe('RabbitMQ coded errors and validated options', () => {
+  test('publishing or taking a channel while disconnected fails with code NOT_CONNECTED', async (t) => {
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer)
+
+    await assert.rejects(() => rabbit.publish('route', { n: 1 }), { code: 'NOT_CONNECTED' })
+    await assert.rejects(() => rabbit.getChannel(), { code: 'NOT_CONNECTED' })
+  })
+
+  test('a NaN cache option fails at construction instead of silently defaulting', (t) => {
+    const dialer = createDialer()
+
+    installDialer(t, dialer)
+
+    const base = { username: 'admin', password: 'admin', endpoints: ['node-a:5672'], logger: silentLogger, useCache: true }
+
+    // Number(process.env.UNSET) is NaN — the realistic way junk arrives.
+    assert.throws(() => new RabbitMQ({ ...base, cacheTTL: Number(undefined) }), /cacheTTL must be a non-negative number/)
+    assert.throws(() => new RabbitMQ({ ...base, cacheCheckPeriod: -1 }), /cacheCheckPeriod must be a non-negative number/)
+    assert.doesNotThrow(() => new RabbitMQ({ ...base, cacheTTL: 0, cacheCheckPeriod: 0 }), 'both zeros are real requests to node-cache')
+  })
+})
+
+describe('RabbitMQ survives application code that throws from inside it', () => {
+  test('a logger that throws cannot turn a successful connect into a failed one', async (t) => {
+    // Found while covering disconnect(): the "connected" info line sat inside
+    // the dial's try/catch, so a throwing logger made a SUCCESSFUL connection
+    // look like a failed endpoint — the live AMQP connection was nulled without
+    // a close, and the reconnect scheduler then threw on its own first log
+    // line. A logging transport whose stream has closed is an ordinary
+    // production event; it must cost log lines, not the connection.
+    // The last-resort report goes to console.error; mocked so it lands in an
+    // assertion instead of the runner's stdout.
+    const consoleError = t.mock.method(console, 'error', () => {})
+    const logger = { info () { throw new Error('log transport closed') }, warn () {}, error () {}, debug () {} }
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, { logger })
+
+    t.after(() => rabbit.disconnect())
+
+    const connection = await rabbit.connect()
+
+    assert.ok(connection, 'the connection was established and returned')
+    assert.equal(rabbit.getClusterStatus().connectionState, 'connected')
+    assert.equal(dialer.connections.length, 1, 'exactly one dial — no endpoint rotation, no reconnection')
+    assert.equal(dialer.connections[0].closed, false, 'and it is still open')
+
+    await rabbit.publish('route', { n: 1 })
+
+    assert.ok(consoleError.mock.callCount() > 0, 'the broken logger is reported where a broken logger still can be')
+    assert.match(String(consoleError.mock.calls[0].arguments[0]), /application logger threw on info\(\)/)
+  })
+
+  test('a cache whose close() throws does not break disconnect()', async (t) => {
+    // With every emit and the logger contained, the one thing left inside
+    // disconnect()'s try that can still throw is third-party code the facade
+    // calls directly: the cache. The outer catch must still tear the
+    // connection down, and disconnect() must still resolve.
+    t.mock.method(NodeCache.prototype, 'close', () => { throw new Error('cache close failed') })
+
+    const logger = recordingLogger()
+    const dialer = createDialer()
+    const rabbit = createRabbit(t, dialer, { logger, useCache: true })
+
+    await rabbit.connect()
+
+    await assert.doesNotReject(() => rabbit.disconnect())
+
+    assert.equal(dialer.connections[0].closed, true, 'the connection was closed on the retry path')
+    assert.equal(rabbit.getClusterStatus().connectionState, 'disconnected')
+    assert.ok(logger.records.warn.some(line => line.includes('Error during disconnection: cache close failed')))
   })
 })

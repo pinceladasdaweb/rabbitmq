@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import systemClock from '../utils/clock.js'
+import { notConnectedError } from '../utils/errors.js'
 import describeError from '../utils/describe-error.js'
 
 // RabbitMQ's direct reply-to pseudo-queue: consuming from it (noAck) turns the
@@ -96,7 +97,7 @@ class Rpc {
     const channelPool = this.getChannelPool()
 
     if (!channelPool) {
-      throw new Error('Not connected to RabbitMQ. Connection establishing/recovery in progress.')
+      throw notConnectedError()
     }
 
     const epoch = this.connectionEpoch
@@ -311,15 +312,20 @@ class Rpc {
       // (e.g. the result was not serializable); if even the envelope cannot
       // be published, the requester's timeout takes over and the request is
       // acked as processed.
+      //
+      // describeError throughout, not error.message: #publishReply runs the
+      // application's serializer, which can throw anything (null, a Symbol) —
+      // and a TypeError reading .message off it would escape THIS catch and
+      // dead-letter the request after all.
       try {
         await this.#publishReply(replyTo, correlationId, result)
       } catch (error) {
-        this.logger.error(`Failed to publish RPC reply on queue ${queueName}: ${error.message}`)
+        this.logger.error(`Failed to publish RPC reply on queue ${queueName}: ${describeError(error)}`)
 
         try {
-          await this.#publishReply(replyTo, correlationId, { message: `Failed to publish RPC reply: ${error.message}` }, { 'x-rpc-error': true })
+          await this.#publishReply(replyTo, correlationId, { message: `Failed to publish RPC reply: ${describeError(error)}` }, { 'x-rpc-error': true })
         } catch (envelopeError) {
-          this.logger.error(`Failed to publish RPC error envelope on queue ${queueName}: ${envelopeError.message}`)
+          this.logger.error(`Failed to publish RPC error envelope on queue ${queueName}: ${describeError(envelopeError)}`)
         }
       }
     }, subscribeOptions)

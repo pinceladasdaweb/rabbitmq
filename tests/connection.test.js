@@ -941,3 +941,33 @@ describe('RabbitMQConnection reconnection budget', () => {
     assert.equal(dialer.dials, 1, 'not a single reconnection dial was made')
   })
 })
+
+describe('RabbitMQConnection reconnection budget validation', () => {
+  const construct = (options) => new RabbitMQConnection({
+    username: 'admin',
+    password: 'admin',
+    endpoints: ['node-a:5672'],
+    ...options
+  }, silentLogger)
+
+  test('a NaN budget fails at construction instead of retrying forever', () => {
+    // `|| Infinity` normalised NaN away; a bare `??` let it through as
+    // "attempt 1/NaN" with no end.
+    assert.throws(() => construct({ maxReconnectAttempts: Number(undefined) }), /maxReconnectAttempts must be a non-negative number/)
+    assert.throws(() => construct({ maxReconnectAttempts: -1 }), /non-negative/)
+  })
+
+  test('an explicit Infinity is accepted as the unbounded budget it is', () => {
+    assert.doesNotThrow(() => construct({ maxReconnectAttempts: Infinity }))
+  })
+})
+
+describe('RabbitMQConnection emit override', () => {
+  test("emitting 'error' with no listener still throws, as EventEmitter promises", (t) => {
+    // The contained emit is for the library's own lifecycle events; Node's
+    // 'error' contract (crash when nobody listens) is left exactly as it was.
+    const connection = createConnection(t, createDialer())
+
+    assert.throws(() => connection.emit('error', new Error('boom')), /boom/)
+  })
+})

@@ -863,6 +863,35 @@ describe('Rpc respond()', () => {
     assert.equal(reply.options.headers['x-compressed'], true, 'reply above the threshold must be compressed')
     assert.deepEqual(await harness.codec.decode(reply.content, true), bigResult)
   })
+  test('a serializer that throws a non-Error still acks the request and ships the envelope', async () => {
+    // #publishReply runs the application's serializer, which can throw
+    // anything. Reading `.message` off a null inside the catch threw a
+    // TypeError that ESCAPED it — and dead-lettered a request whose handler had
+    // already committed its side effects, the exact outcome the catch exists
+    // to prevent. The handler-throw branch above it already used describeError;
+    // the two branches disagreed.
+    const harness = createHarness()
+
+    harness.codec.serializer = (value) => {
+      // Only the result reply is poisoned; the request and the envelope encode.
+      if (value && value.done) throw null // eslint-disable-line no-throw-literal
+
+      return JSON.stringify(value)
+    }
+
+    await harness.rpc.respond('rpc-queue', async () => ({ done: true }))
+
+    await deliverRequest(harness, { value: 1 }, { replyTo: 'amq.rabbitmq.reply-to.abc', correlationId: 'corr-null' })
+
+    await waitFor(() => harness.poolChannel.published.length === 1, 2000, 'the error envelope was published')
+
+    const envelope = harness.poolChannel.published[0]
+
+    assert.equal(envelope.options.headers['x-rpc-error'], true)
+    assert.match((await harness.codec.decode(envelope.content, false)).message, /Failed to publish RPC reply/)
+    assert.equal(harness.consumerChannel.acked.length, 1, 'processed request must be acked, not dead-lettered')
+    assert.equal(harness.consumerChannel.nacked.length, 0)
+  })
 })
 
 describe('Rpc survivor round', () => {

@@ -1,4 +1,5 @@
 import systemClock from '../utils/clock.js'
+import detached from '../utils/detached.js'
 
 const MAX_REPLACE_ATTEMPTS = 5
 
@@ -27,17 +28,25 @@ class ChannelPool {
     await this.close()
     this.closed = false
 
-    try {
-      for (let i = 0; i < this.size; i++) {
-        await this.#createPoolChannel(i)
-      }
-    } catch (error) {
-      // Without this the channels created so far stay open on a pool nobody
+    // All slots at once: each open is a broker round trip, and this runs on
+    // every reconnect with #channelPool still null — publishing refused and
+    // consumers not yet recreated. Serially, a pool of 10 stretched that outage
+    // by 10 round trips; slots are index-keyed, so order is immaterial.
+    //
+    // allSettled, not all: the failure path must wait for EVERY open to land.
+    // Closing on the first rejection, while other opens were still in flight,
+    // left the late ones unclaimed (the pool was already closed) and unclosed —
+    // a channel leak per failed initialize.
+    const outcomes = await Promise.allSettled(Array.from({ length: this.size }, (_, index) => this.#createPoolChannel(index)))
+    const failure = outcomes.find(outcome => outcome.status === 'rejected')
+
+    if (failure) {
+      // Without this the channels that did open stay live on a pool nobody
       // owns — and since `closed` is still false, their close listeners keep
       // dialing replacements: a zombie pool eating the connection's channels.
       await this.close()
 
-      throw error
+      throw failure.reason
     }
   }
 
@@ -67,12 +76,17 @@ class ChannelPool {
       if (this.closed || this.channels[index] !== channel) return
 
       this.channels[index] = null
-      this.#replacePoolChannel(index)
+      // Nothing awaits a close handler — see utils/detached.js.
+      detached(this.#replacePoolChannel(index), this.logger, `Pool channel ${index} replacement failed unexpectedly`)
     })
 
     return channel
   }
 
+  // Hand-rolled on purpose, like ConsumerManager.handleConsumerLoss: the loop
+  // must re-read `closed` between attempts AND after a successful open (a pool
+  // closed mid-attempt has nothing to hand the channel to), and a generic retry
+  // helper buries exactly those two fences.
   async #replacePoolChannel (index) {
     for (let attempt = 1; attempt <= MAX_REPLACE_ATTEMPTS && !this.closed; attempt++) {
       try {
@@ -174,13 +188,11 @@ class ChannelPool {
   async close () {
     this.closed = true
 
-    for (const channel of this.channels) {
-      await this.#closeChannel(channel)
-    }
-
-    for (const [, channel] of this.dedicatedChannels.entries()) {
-      await this.#closeChannel(channel)
-    }
+    // #closeChannel never rejects, so every close can be in flight at once: a
+    // graceful shutdown then costs the slowest close-ok rather than the sum of
+    // size + one-per-consumer round trips, which under a fixed SIGTERM grace
+    // period is time the process could not spend draining.
+    await Promise.all([...this.channels, ...this.dedicatedChannels.values()].map(channel => this.#closeChannel(channel)))
 
     this.channels = []
     this.index = 0

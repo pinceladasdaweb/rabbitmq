@@ -333,7 +333,7 @@ The `RabbitMQ` constructor accepts an options object with the following paramete
 - **cacheTTL** `{number}`: Time to live for cached messages in seconds. `0` means entries never expire.
   - Default: `60`
   - Example: `120`
-- **cacheCheckPeriod** `{number}`: Cache cleanup interval in seconds.
+- **cacheCheckPeriod** `{number}`: Cache cleanup interval in seconds. `0` disables the periodic sweep.
   - Default: `120`
   - Example: `240`
 
@@ -1261,15 +1261,21 @@ The `RabbitMQ` instance is an `EventEmitter`. All emitted events:
 | `messageProcessed` | `{ queue, messageId, consumerTag, durationMs }` | A consumed message was handled successfully (every subscribe variant) |
 | `messageFailed` | `{ queue, messageId, consumerTag, durationMs, error, requeued }` | A consumed message failed — handler crash, decode failure or an expired `depends-on` dependency |
 
-**A listener that throws never breaks the client.** Every event above is emitted
-defensively: the listener's exception is logged as such (`A 'reconnected'
-listener threw: …`) and the operation it was reporting on carries on. A crashing
-`disconnected` listener cannot stop reconnection, a crashing `consumerCancelled`
-listener cannot abort consumer recovery, a crashing `messageProcessed` listener
-cannot turn a successful delivery into a nack, and a crashing `reconnected`
-listener is not reported as `reconnectError` — the state really was restored.
-Note this covers **synchronous** throws; an `async` listener's rejection belongs
-to the listener, so `await` inside one needs its own `try/catch`.
+**A listener that throws never breaks the client — nor the other listeners.**
+The instance's own `emit` delivers every event listener by listener: an
+exception (or an `async` listener's rejection) is logged as such
+(`A 'reconnected' listener threw: …`), the remaining listeners still run, and
+the operation being reported on carries on. A crashing `disconnected` listener
+cannot stop reconnection, a crashing `reconnectFailed` listener cannot leave
+`connect({ waitForConnection: true })` hanging, a crashing `rateLimited`
+listener cannot replace a publish's `RATE_LIMIT_EXCEEDED` with its own error,
+and a crashing `reconnected` listener is not reported as `reconnectError` — the
+state really was restored. The one exception is Node's own: emitting `'error'`
+with no listener still throws, as `EventEmitter` promises.
+
+The same holds for the **logger** you inject: a logging call that throws (a
+transport whose stream has closed) costs that log line and nothing else — it
+is reported once on `console.error` and the operation carries on.
 
 Notes on the per-message events:
 
@@ -1327,7 +1333,7 @@ See [Reconnection Options](#reconnection-options).
 
 | Condition | What the library does | How it surfaces |
 |-----------|----------------------|-----------------|
-| Publish while disconnected | Fails fast — the connection probe runs before rate-limit tokens are consumed and outside the circuit breaker, so an outage neither drains quotas nor trips the breaker (reconnection already owns that failure). | The publish rejects with `Not connected to RabbitMQ` |
+| Publish while disconnected | Fails fast — the connection probe runs before rate-limit tokens are consumed and outside the circuit breaker, so an outage neither drains quotas nor trips the breaker (reconnection already owns that failure). | The publish rejects with `code: 'NOT_CONNECTED'` |
 | Broker refuses / does not confirm | Retries up to `maxRetries` (default 3) with exponential backoff. `publishBatch` retries **only the unconfirmed messages** of the batch. | The publish rejects after the budget is spent |
 | Repeated failures | The circuit breaker opens after `failureThreshold` consecutive failures and publishes fail fast until a probe succeeds. It resets to CLOSED on a successful reconnection — old failures say nothing about the new connection. | `circuitBreakerStateChanged` |
 | Unroutable routing key | Silently dropped by AMQP — unless you pass `mandatory: true`, which makes the publish reject with `code: 'UNROUTABLE'`. | See [Unroutable publishes](#unroutable-publishes-mandatory) |

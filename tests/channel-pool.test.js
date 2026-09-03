@@ -549,3 +549,38 @@ describe('ChannelPool resource ownership', () => {
     await pool.close()
   })
 })
+
+describe('ChannelPool initialize concurrency', () => {
+  test('opens every slot at once instead of one round trip per channel', async () => {
+    // initialize runs on every reconnect with the facade's pool still null —
+    // publishing refused, consumers not yet recreated — so a serial build of
+    // ten channels stretched every outage by ten round trips.
+    const connection = createFakeConnection()
+    const gate = Promise.withResolvers()
+    let inFlight = 0
+
+    const realCreate = connection.createConfirmChannel.bind(connection)
+
+    connection.createConfirmChannel = async () => {
+      inFlight++
+
+      await gate.promise
+
+      return realCreate()
+    }
+
+    const pool = new ChannelPool(connection, { logger: silentLogger, size: 4, clock: new ManualClock() })
+    const initializing = pool.initialize()
+
+    // Serial code never requests the second open until the first resolves, so
+    // this times out instead of hanging the suite.
+    await waitForCondition(() => inFlight === 4, 1000, 'all four opens requested before any resolved')
+
+    gate.resolve()
+    await initializing
+
+    assert.equal(pool.channels.filter(Boolean).length, 4)
+
+    await pool.close()
+  })
+})

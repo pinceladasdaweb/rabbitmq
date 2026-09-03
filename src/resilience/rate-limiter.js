@@ -45,7 +45,11 @@ class RateLimiter extends EventEmitter {
       queueLimit: options.queueLimit || 1000
     }, this.clock)
 
-    this.cleanupInterval = this.clock.setInterval(() => this.#cleanup(), Math.min(this.windowMs / 10, 60000))
+    // A tenth of the window, clamped both ways. The ceiling keeps a huge window
+    // from starving the sweep; the floor keeps a tiny one (a 100ms burst cap)
+    // from running a full scan of every key ten times a millisecond — the
+    // sweep only bounds memory, since check() and remaining() evict lazily.
+    this.cleanupInterval = this.clock.setInterval(() => this.#cleanup(), Math.min(Math.max(this.windowMs / 10, 100), 60000))
 
     // Unref'd so a limiter nobody disposed cannot keep the process alive. Note
     // this is not covered by a unit test: every test disposes its limiter, so
