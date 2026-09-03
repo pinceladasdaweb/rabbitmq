@@ -1,7 +1,12 @@
 import WorkerPool from './worker-pool.js'
 import systemClock from '../utils/clock.js'
+import detached from '../utils/detached.js'
 import describeError from '../utils/describe-error.js'
+import { notConnectedError } from '../utils/errors.js'
 import SequentialProcessor from './sequential-processor.js'
+
+// Constant per process, not per delivery: defineProperty only reads it.
+const ACK_SETTLED_DESCRIPTOR = { value: false, enumerable: false, configurable: true, writable: true }
 
 class ConsumerManager {
   constructor (context) {
@@ -37,7 +42,7 @@ class ConsumerManager {
     const channelPool = this.getChannelPool()
 
     if (!channelPool) {
-      throw new Error('Not connected to RabbitMQ. Connection establishing/recovery in progress.')
+      throw notConnectedError()
     }
 
     return channelPool.getDedicatedChannel(consumerId)
@@ -45,7 +50,7 @@ class ConsumerManager {
 
   attachAckControls (msg, channel) {
     Object.defineProperty(msg, '__channel', { value: channel, enumerable: false, configurable: true })
-    Object.defineProperty(msg, '__ackSettled', { value: false, enumerable: false, configurable: true, writable: true })
+    Object.defineProperty(msg, '__ackSettled', ACK_SETTLED_DESCRIPTOR)
   }
 
   settleAck (msg, channel, action, requeue = false) {
@@ -207,6 +212,15 @@ class ConsumerManager {
   // unsubscribe path, which left threads running (and the process unable to
   // exit) whenever recovery gave up on a consumer instead.
   async #dropConsumer (consumerId, consumerInfo) {
+    // Every exit path drains before anything is torn down — see #drainInFlight.
+    // This used to be unsubscribe's job alone, so recovery giving up closed the
+    // channel under handlers still running: their late acks died with it and
+    // the broker redelivered work that had actually completed. First, so the
+    // worker pool is still alive for a handler mid-run to finish on.
+    if (!await this.#drainInFlight(consumerInfo)) {
+      this.logger.warn(`Consumer for queue ${consumerInfo.queueName} still has ${consumerInfo.inFlight} handler(s) in flight after ${this.drainTimeout}ms; closing its channel anyway`)
+    }
+
     // consumersByTag is the single source of truth for every tag this
     // consumer ever answered to — a per-consumer reverse index drifted, and
     // consumer counts are small enough that the scan is free.
@@ -230,32 +244,20 @@ class ConsumerManager {
     // it. This used to live in unsubscribe(), which meant the other two ways a
     // consumer goes away — recovery giving up after three attempts, and a
     // subscribe that failed during setup — each leaked one channel toward
-    // channel_max, after which the broker refuses every new one. Last, so a
-    // caller that needs to drain in-flight handlers first (unsubscribe) still
-    // has the channel their late acks depend on.
+    // channel_max, after which the broker refuses every new one.
     await this.getChannelPool()?.releaseDedicatedChannel(consumerId)
   }
 
   // Every consumer (re)creation goes through here. The epoch lets concurrent
   // recovery paths (recreateAll after a reconnect vs handleBrokerCancel's
   // retry loop) detect that someone else already recreated the consumer,
-  // instead of issuing a duplicate channel.consume.
-  async runSetup (consumerInfo) {
+  // instead of issuing a duplicate channel.consume. The increment is
+  // synchronous and happens BEFORE the setup starts — callers that fence on
+  // the epoch record it right after this call, as their own.
+  runSetup (consumerInfo) {
     consumerInfo.epoch++
 
     return consumerInfo.setup()
-  }
-
-  async startConsumer (consumerId) {
-    const consumerInfo = this.activeConsumers.get(consumerId)
-
-    try {
-      return await this.runSetup(consumerInfo)
-    } catch (error) {
-      await this.#dropConsumer(consumerId, consumerInfo)
-
-      throw error
-    }
   }
 
   findConsumerIdByTag (consumerTag) {
@@ -312,13 +314,12 @@ class ConsumerManager {
     })
   }
 
-  // A crashing event listener is the listener's bug: it must never leave a
-  // delivery unsettled, misreport an outcome that already happened, or abort a
-  // recovery midway. EVERY emit this class makes goes through here — the
-  // per-message pair AND the lifecycle trio (consumerCancelled /
-  // consumerRecovered / consumerLost), whose emits used to be raw. Those three
-  // sit on detached async paths, so a throwing listener did not merely skip a
-  // notification: it became an unhandled rejection that took the process down.
+  // Last-resort containment for the event bridge. In production context.emit is
+  // the facade's own emit, which already contains per listener (emitSafely), so
+  // this catch never fires there; it exists for a context whose emit is a bare
+  // function (the unit-test harness), where a throwing listener would otherwise
+  // leave a delivery unsettled, misreport a settled outcome, or abort a
+  // recovery midway. Every emit this class makes goes through here.
   #emitOutcome (event, payload) {
     try {
       this.emit(event, payload)
@@ -328,15 +329,9 @@ class ConsumerManager {
   }
 
   // Recovery is triggered from places that cannot await it: a channel 'close'
-  // handler and amqplib's null-message delivery. Nothing is there to catch a
-  // rejection, so anything the recovery path fails to handle internally
-  // (a worker pool that refuses to terminate, a clock seam that throws) would
-  // surface as an unhandled rejection and take the process down over a
-  // consumer that was already lost.
+  // handler and amqplib's null-message delivery. See utils/detached.js.
   #recoverDetached (recovery) {
-    recovery.catch((error) => {
-      this.logger.error(`Consumer recovery failed unexpectedly: ${describeError(error)}`)
-    })
+    detached(recovery, this.logger, 'Consumer recovery failed unexpectedly')
   }
 
   // Broker-initiated cancellation (e.g. queue deleted): notify and try to
@@ -363,41 +358,56 @@ class ConsumerManager {
     // placement is load-bearing — a generic retry helper would bury exactly
     // the parts that have already carried bugs.
     const maxAttempts = 3
-    let knownEpoch = consumerInfo.epoch
     // Ownership fence: this loop only recovers on the pool that lost the
     // consumer. A different (or missing) pool means a reconnection cycle is
     // running and recreateAll owns every registered consumer — recovering
     // here as well would consume the same queue twice, and the epoch check
     // alone cannot see a recreation that has not happened YET (the window
     // between the new pool being installed and recreateAll reaching this
-    // consumer).
+    // consumer). The consumer object never changes identity, only its
+    // presence in the map and its flags do, so "still ours" is one test.
     const ownedPool = this.getChannelPool()
+    const stillOurs = () => this.activeConsumers.get(consumerId) === consumerInfo &&
+      !consumerInfo.cancelled &&
+      this.getChannelPool() === ownedPool
+
+    let knownEpoch = consumerInfo.epoch
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await this.clock.sleep(this.recoveryInterval * attempt)
 
-      const currentInfo = this.activeConsumers.get(consumerId)
-
-      if (!currentInfo || currentInfo.cancelled) return
-      if (this.getChannelPool() !== ownedPool) return
+      if (!stillOurs()) return
 
       // Someone else (e.g. recreateAll after a reconnection) already
       // recreated this consumer while we were backing off — recovering
       // again would create a duplicate consumer on the queue.
-      if (currentInfo.epoch !== knownEpoch) return
+      if (consumerInfo.epoch !== knownEpoch) return
+
+      // runSetup stamps the epoch synchronously, before the setup runs, so
+      // this attempt's own bump is recorded as ours right here — read it back
+      // any later and the fence above would mistake it for someone else's
+      // recreation and abandon the recovery after a single failure.
+      const setup = this.runSetup(consumerInfo)
+
+      knownEpoch = consumerInfo.epoch
 
       try {
-        await this.runSetup(currentInfo)
+        await setup
 
-        this.logger.info(`Consumer for queue ${currentInfo.queueName} recovered after broker cancellation`)
-        this.#emitOutcome('consumerRecovered', { queueName: currentInfo.queueName, consumerTag: currentInfo.consumerTag })
+        this.logger.info(`Consumer for queue ${consumerInfo.queueName} recovered after broker cancellation`)
+        this.#emitOutcome('consumerRecovered', { queueName: consumerInfo.queueName, consumerTag: consumerInfo.consumerTag })
 
         return
       } catch (error) {
-        knownEpoch = currentInfo.epoch
-        this.logger.warn(`Failed to recover consumer for queue ${currentInfo.queueName} (attempt ${attempt}/${maxAttempts}): ${error.message}`)
+        this.logger.warn(`Failed to recover consumer for queue ${consumerInfo.queueName} (attempt ${attempt}/${maxAttempts}): ${error.message}`)
       }
     }
+
+    // Fenced before giving up as well: the LAST attempt can fail because the
+    // connection dropped under it, and from that instant recreateAll owns this
+    // consumer. Dropping it here removed a consumer the reconnection was about
+    // to restore — the queue went silent for good behind a healthy reconnect.
+    if (!stillOurs()) return
 
     await this.#dropConsumer(consumerId, consumerInfo)
     this.logger.error(`Consumer for queue ${consumerInfo.queueName} could not be recovered and was removed`)
@@ -461,17 +471,21 @@ class ConsumerManager {
       // tracks: every delivery then threw on the missing consumerInfo and was
       // never settled, so the queue quietly filled with unacked messages that
       // only a connection drop could release.
-      if (!consumerInfo || consumerInfo.cancelled) {
+      const cancelledEarly = () => new Error(`Consumer for queue ${queueName} was cancelled before its channel was ready`)
+
+      if (!consumerInfo) {
         // Already dropped: #dropConsumer released the previous channel before
         // this await resolved, so the one we just reopened is ours to close or
-        // it leaks. Cancelled but still present means an unsubscribe is mid
-        // flight — it still needs this channel to cancel and drain on, and
-        // releases it itself.
-        if (!consumerInfo) {
-          await this.getChannelPool()?.releaseDedicatedChannel(consumerId)
-        }
+        // it leaks toward channel_max.
+        await this.getChannelPool()?.releaseDedicatedChannel(consumerId)
 
-        throw new Error(`Consumer for queue ${queueName} was cancelled before its channel was ready`)
+        throw cancelledEarly()
+      }
+
+      if (consumerInfo.cancelled) {
+        // An unsubscribe is mid flight: it still needs this channel to cancel
+        // and drain on, and releases it itself in #dropConsumer.
+        throw cancelledEarly()
       }
 
       const processMessage = hooks.createProcessor({ channel, consumerInfo, noAck, shouldRequeue, events })
@@ -521,13 +535,31 @@ class ConsumerManager {
         } finally {
           consumerInfo.inFlight--
 
-          if (consumerInfo.inFlight === 0) {
+          // The length check is the hot-path guard: at prefetch 1 inFlight
+          // returns to 0 on every delivery, and splice allocates an array each
+          // time even when nobody is waiting.
+          if (consumerInfo.inFlight === 0 && consumerInfo.drainWaiters.length > 0) {
             for (const resolve of consumerInfo.drainWaiters.splice(0)) resolve()
           }
         }
       }
 
       const consumer = await channel.consume(queueName, wrappedCallback, { ...consumeOptions, noAck })
+
+      // Fenced once more: prefetch and consume are two further round trips, and
+      // an unsubscribe that completed #dropConsumer during them has already
+      // swept this consumer's tags and released its channel. Tracking the new
+      // tag would register it for a consumer that no longer exists —
+      // findQueueNameByTag and unsubscribe then throw on undefined for that
+      // tag, while the broker keeps delivering to a callback whose owner is
+      // gone. The consume just issued is cancelled so it does not.
+      if (this.activeConsumers.get(consumerId) !== consumerInfo || consumerInfo.cancelled) {
+        try {
+          await channel.cancel(consumer.consumerTag)
+        } catch {}
+
+        throw new Error(`Consumer for queue ${queueName} was cancelled while its consume was in flight`)
+      }
 
       consumerInfo.channel = channel
       this.#trackConsumerTag(consumerId, consumerInfo, consumer.consumerTag)
@@ -536,13 +568,18 @@ class ConsumerManager {
       return consumer
     })
 
+    const consumerInfo = this.activeConsumers.get(consumerId)
+
     try {
-      const consumer = await this.startConsumer(consumerId)
+      const consumer = await this.runSetup(consumerInfo)
 
       this.logger.info(hooks.successLog(prefetchCount))
 
       return consumer
     } catch (error) {
+      // A subscribe that never got going owns nothing: the registration is
+      // undone and the channel it may have opened goes back.
+      await this.#dropConsumer(consumerId, consumerInfo)
       this.logger.error(`Failed to subscribe to queue ${queueName}: ${error.message}`)
 
       throw error
@@ -674,13 +711,8 @@ class ConsumerManager {
       this.logger.warn(`Failed to cancel consumer ${consumerTag}: ${error.message}`)
     }
 
-    const drained = await this.#drainInFlight(consumerInfo)
-
-    if (!drained) {
-      this.logger.warn(`Consumer ${consumerTag} still has ${consumerInfo.inFlight} handler(s) in flight after ${this.drainTimeout}ms; closing its channel anyway`)
-    }
-
-    // Drops the consumer AND releases its dedicated channel, in that order.
+    // Drains in-flight handlers, drops the consumer and releases its dedicated
+    // channel, in that order.
     await this.#dropConsumer(consumerId, consumerInfo)
 
     this.logger.info(`Unsubscribed consumer ${consumerTag} from queue ${consumerInfo.queueName}`)
@@ -845,9 +877,9 @@ class ConsumerManager {
   }
 
   async disposeAll () {
-    for (const [, workerPool] of this.workerPools.entries()) {
-      await workerPool.terminate()
-    }
+    // Pools are independent: terminating them one after another made shutdown
+    // pay the sum of every pool's slowest worker instead of the single slowest.
+    await Promise.allSettled([...this.workerPools.values()].map(workerPool => workerPool.terminate()))
 
     this.workerPools.clear()
 

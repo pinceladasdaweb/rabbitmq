@@ -2690,3 +2690,212 @@ describe('ConsumerManager channel ownership during a cancelled setup', () => {
     )
   })
 })
+
+describe('ConsumerManager recovery give-up ownership', () => {
+  test('a last attempt that fails because the pool changed leaves the consumer to recreateAll', async () => {
+    // The fences ran before every attempt but not before the final drop: a
+    // connection dropping under the LAST attempt made handleConsumerLoss remove
+    // a consumer the reconnection's recreateAll was about to restore — the
+    // queue went silent for good behind a healthy reconnect.
+    let livePool = null
+    const harness = createManager({ getChannelPool: () => livePool })
+
+    livePool = harness.channelPool
+
+    await harness.manager.subscribe('orders', async () => {})
+
+    let attempts = 0
+
+    harness.channel.consume = async () => {
+      // The connection turns over under the third and final attempt.
+      if (++attempts === 3) livePool = { getDedicatedChannel: async () => harness.channel, releaseDedicatedChannel: async () => {} }
+
+      throw new Error('NOT_FOUND - no queue "orders"')
+    }
+
+    await harness.channel.consumers[0].callback(null)
+
+    // Long enough for all three attempts (20+40+60ms) and the give-up decision.
+    await sleep(250)
+
+    assert.equal(attempts, 3, 'the budget was spent')
+    assert.equal(harness.manager.activeConsumers.size, 1, 'the consumer stays registered for recreateAll to restore')
+    assert.ok(!harness.events.some(e => e.event === 'consumerLost'), 'and is not reported lost')
+  })
+
+  test('giving up on a lost consumer waits for in-flight handlers before closing their channel', async () => {
+    // The drain used to belong to unsubscribe alone: recovery giving up closed
+    // the channel under handlers still running, their acks died with it, and
+    // the broker redelivered work that had actually completed.
+    const harness = createManager({ consumerRecoveryInterval: 10 })
+    const handlerGate = Promise.withResolvers()
+    const entered = Promise.withResolvers()
+
+    await harness.manager.subscribe('orders', async () => {
+      entered.resolve()
+
+      await handlerGate.promise
+    })
+
+    const consumerId = harness.manager.findConsumerIdByTag(harness.channel.consumers[0].consumerTag)
+    const delivery = deliver(harness, { n: 1 })
+
+    await entered.promise
+
+    harness.channel.consumeError = new Error('NOT_FOUND - no queue "orders"')
+
+    await harness.channel.consumers[0].callback(null)
+
+    await waitFor(
+      () => harness.manager.activeConsumers.get(consumerId)?.drainWaiters.length === 1,
+      3000,
+      'the drop parks on the running handler'
+    )
+
+    assert.deepEqual(harness.channelPool.released, [], 'the channel must outlive the handler running on it')
+
+    handlerGate.resolve()
+    await delivery
+
+    await waitFor(() => harness.channelPool.released.length === 1, 3000, 'released once the handler finished')
+
+    assert.equal(harness.channel.acked.length, 1, 'and its ack landed on a live channel')
+    assert.ok(harness.events.some(e => e.event === 'consumerLost'))
+  })
+})
+
+describe('ConsumerManager cancellation while consume is in flight', () => {
+  test('an unsubscribe that completes during the consume leaves no stale tag behind', async () => {
+    // The first fence runs before prefetch/consume — two more round trips. An
+    // unsubscribe finishing #dropConsumer inside them had already swept the
+    // tags and released the channel; tracking the new tag then registered it
+    // for a consumer that no longer existed (findQueueNameByTag threw on
+    // undefined) while the broker kept delivering to an orphaned callback.
+    const harness = createManager()
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    const gate = Promise.withResolvers()
+    const consumeEntered = Promise.withResolvers()
+    const realConsume = harness.channel.consume.bind(harness.channel)
+
+    harness.channel.consume = async (...args) => {
+      consumeEntered.resolve()
+
+      await gate.promise
+
+      return realConsume(...args)
+    }
+
+    const recreation = harness.manager.recreateAll()
+
+    // The recreation must be PAST the pre-consume fence and parked inside the
+    // broker round trip before unsubscribe flags the consumer — unsubscribe
+    // sets `cancelled` synchronously, so calling it any earlier trips the first
+    // fence instead and never reaches the race this test is about.
+    await consumeEntered.promise
+
+    await harness.manager.unsubscribe(consumer.consumerTag)
+
+    gate.resolve()
+    await recreation
+
+    const newTag = harness.channel.consumers.at(-1).consumerTag
+
+    assert.equal(harness.manager.findConsumerIdByTag(newTag), null, 'no tag registered for a consumer that is gone')
+    assert.ok(harness.channel.cancelled.includes(newTag), 'the consume issued for it was cancelled at the broker')
+    assert.equal(harness.manager.consumersByTag.size, 0)
+  })
+
+  test('subscribing while disconnected fails with code NOT_CONNECTED', async () => {
+    const { manager } = createManager({ getChannelPool: () => null })
+
+    await assert.rejects(() => manager.subscribe('queue', async () => {}), { code: 'NOT_CONNECTED' })
+  })
+})
+
+describe('ConsumerManager recovery fences during the backoff', () => {
+  test('an unsubscribe during the backoff stops the recovery cold', async () => {
+    // The consumer is still registered while unsubscribe is parked on the
+    // broker's cancel, so presence alone cannot tell; the `cancelled` flag is
+    // what the fence must read. Recreating here would issue a consume for a
+    // consumer being torn down.
+    const harness = createManager({ consumerRecoveryInterval: 30 })
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+    const cancelRelease = Promise.withResolvers()
+
+    harness.channel.cancel = async () => { await cancelRelease.promise }
+
+    // Recovery starts backing off (first attempt at 30ms).
+    await harness.channel.consumers[0].callback(null)
+
+    const unsubscribing = harness.manager.unsubscribe(consumer.consumerTag)
+
+    // Well past every attempt (30+60+90ms), with the consumer still present.
+    await sleep(250)
+
+    assert.equal(harness.channel.consumers.length, 1, 'no consume was issued for a consumer being torn down')
+    assert.ok(!harness.events.some(e => e.event === 'consumerRecovered'))
+
+    cancelRelease.resolve()
+    await unsubscribing
+  })
+})
+
+describe('ConsumerManager post-consume fence, cancelled but still present', () => {
+  test('an unsubscribe parked on the broker cancel still gets the in-flight consume cancelled', async () => {
+    // Between the two fences the consumer can be flagged without being dropped
+    // yet (unsubscribe is awaiting the OLD tag's cancel). The consume that just
+    // landed for it must be cancelled at the broker too — nobody else will,
+    // and the tag sweep later only removes what was tracked.
+    const logger = recordingLogger()
+    const harness = createManager({ logger })
+    const consumer = await harness.manager.subscribe('orders', async () => {})
+
+    const consumeGate = Promise.withResolvers()
+    const consumeEntered = Promise.withResolvers()
+    const cancelReached = Promise.withResolvers()
+    const cancelRelease = Promise.withResolvers()
+    const realConsume = harness.channel.consume.bind(harness.channel)
+    const realCancel = harness.channel.cancel.bind(harness.channel)
+
+    harness.channel.consume = async (...args) => {
+      consumeEntered.resolve()
+
+      await consumeGate.promise
+
+      return realConsume(...args)
+    }
+    harness.channel.cancel = async (tag) => {
+      await realCancel(tag)
+
+      if (tag === consumer.consumerTag) {
+        cancelReached.resolve()
+
+        await cancelRelease.promise
+      }
+    }
+
+    const recreation = harness.manager.recreateAll()
+
+    await consumeEntered.promise
+
+    const unsubscribing = harness.manager.unsubscribe(consumer.consumerTag)
+
+    await cancelReached.promise
+
+    consumeGate.resolve()
+    await recreation
+
+    const newTag = harness.channel.consumers.at(-1).consumerTag
+
+    assert.ok(harness.channel.cancelled.includes(newTag), 'the just-issued consume was cancelled at the broker')
+    assert.equal(harness.manager.findConsumerIdByTag(newTag), null, 'and never tracked')
+    assert.ok(
+      logger.records.error.some(line => line.includes('orders') && line.includes('cancelled while its consume was in flight')),
+      'the operator is told which consumer and why'
+    )
+
+    cancelRelease.resolve()
+    await unsubscribing
+  })
+})
