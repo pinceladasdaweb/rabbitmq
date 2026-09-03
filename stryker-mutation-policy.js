@@ -177,6 +177,13 @@ import { declareValuePlugin, PluginKind } from '@stryker-mutator/api/plugin'
 //     this loop itself, so the `!cancelled` operand beside it already answers;
 //     the identity check is defense in depth against a drop that forgot the
 //     flag, which no current caller can produce.
+//   - consumer-manager.js the post-consume fence's identity operand
+//     (`activeConsumers.get(id) !== consumerInfo` -> false): same defense in
+//     depth as above — a consumer is never dropped without being flagged
+//     cancelled first (unsubscribe, disposeAll), and handleConsumerLoss's
+//     give-up cannot drop while a recreation is in flight because that
+//     recreation bumped the epoch its own fence reads. The `cancelled` operand
+//     beside it is the one that answers today, and its mutants are killed.
 //   - consumer-manager.js the drain-waiters length guard (`&& length > 0` ->
 //     true / >=): splice(0) on an empty array is a no-op; the guard only saves
 //     the allocation, exactly as its comment says.

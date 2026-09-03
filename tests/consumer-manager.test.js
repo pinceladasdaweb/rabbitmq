@@ -2838,6 +2838,12 @@ describe('ConsumerManager recovery fences during the backoff', () => {
 
     cancelRelease.resolve()
     await unsubscribing
+
+    // The setup closure's own fence would have refused the consume anyway; what
+    // the LOOP's fence prevents is the give-up path running for a consumer that
+    // unsubscribe owns — dropping it a second time and announcing it lost.
+    assert.ok(!harness.events.some(e => e.event === 'consumerLost'), 'an unsubscribe is not a loss')
+    assert.equal(harness.channelPool.released.length, 1, 'released exactly once, by unsubscribe')
   })
 })
 
