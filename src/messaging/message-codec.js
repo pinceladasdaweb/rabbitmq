@@ -1,5 +1,6 @@
 import zlib from 'node:zlib'
 import util from 'node:util'
+import { nonNegativeNumber } from '../utils/options.js'
 
 const gzip = util.promisify(zlib.gzip)
 const gunzip = util.promisify(zlib.gunzip)
@@ -9,10 +10,10 @@ class MessageCodec {
     this.serializer = options.serializer || JSON.stringify
     this.deserializer = options.deserializer || JSON.parse
     this.useCompression = options.useCompression || false
-    // ?? and not ||: setCompressionThreshold explicitly accepts 0 ("compress
-    // everything"), so the constructor rewriting that same 0 to 1000 made the
-    // two entry points disagree about the identical request.
-    this.compressionThreshold = options.compressionThreshold ?? 1000
+    // Same rule as setCompressionThreshold: 0 ("compress everything") is a real
+    // request, junk fails at construction. `|| 1000` rewrote the 0 and a bare
+    // `??` let NaN through to compress every message. See utils/options.js.
+    this.compressionThreshold = nonNegativeNumber(options.compressionThreshold, 'compressionThreshold', 1000)
     this.logger = options.logger
   }
 
@@ -62,11 +63,10 @@ class MessageCodec {
     }
   }
 
-  async decompressIfNeeded (buffer, isCompressed) {
-    if (!isCompressed) {
-      return buffer
-    }
-
+  // Only ever asked for content that IS compressed: decode() takes the
+  // uncompressed fast path itself, so a flag here would be a branch no caller
+  // can reach.
+  async #decompress (buffer) {
     try {
       return await gunzip(buffer)
     } catch (error) {
@@ -83,9 +83,11 @@ class MessageCodec {
   }
 
   async decode (content, isCompressed) {
-    const buffer = await this.decompressIfNeeded(content, isCompressed)
+    // The uncompressed path is the hot one (compression off, or the payload
+    // under threshold): no promise and no microtask hop for a no-op inflate.
+    if (!isCompressed) return this.fromBuffer(content)
 
-    return this.fromBuffer(buffer)
+    return this.fromBuffer(await this.#decompress(content))
   }
 }
 

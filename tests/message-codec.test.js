@@ -162,3 +162,15 @@ describe('MessageCodec threshold configuration', () => {
     assert.equal(new MessageCodec({ logger: silentLogger, compressionThreshold: undefined }).compressionThreshold, 1000)
   })
 })
+
+describe('MessageCodec threshold validation', () => {
+  test('a NaN threshold fails at construction instead of compressing everything', () => {
+    // Number(process.env.UNSET) is NaN, and `length <= NaN` is always false: a
+    // bare ?? let a misconfigured threshold gzip every message in silence.
+    assert.throws(
+      () => new MessageCodec({ logger: silentLogger, useCompression: true, compressionThreshold: Number(undefined) }),
+      /compressionThreshold must be a non-negative number/
+    )
+    assert.throws(() => new MessageCodec({ logger: silentLogger, compressionThreshold: -1 }), /non-negative/)
+  })
+})
