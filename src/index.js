@@ -6,6 +6,9 @@ import _NodeCache from '@cacheable/node-cache'
 import Topology from './messaging/topology.js'
 import emitSafely from './utils/emit-safely.js'
 import Publisher from './messaging/publisher.js'
+import { notConnectedError } from './utils/errors.js'
+import safeLogger from './utils/safe-logger.js'
+import { nonNegativeNumber } from './utils/options.js'
 import describeError from './utils/describe-error.js'
 import RateLimiter from './resilience/rate-limiter.js'
 import ChannelPool from './connection/channel-pool.js'
@@ -40,7 +43,9 @@ class RabbitMQ extends EventEmitter {
   constructor (options = {}) {
     super()
 
-    this.#logger = options.logger || Logger
+    // Wrapped once, here: every component receives THIS logger, so a logging
+    // failure can never unwind the state machine (see utils/safe-logger.js).
+    this.#logger = safeLogger(options.logger || Logger)
     this.#exchange = options.exchange || {}
     this.#channelPool = null
     this.#channelPoolSize = options.channelPoolSize || 10
@@ -68,15 +73,16 @@ class RabbitMQ extends EventEmitter {
     this.#circuitBreaker.on('stateChanged', (state) => {
       // Contained: the breaker transitions state DURING a publish, so a
       // throwing listener would surface as that publish failing.
-      this.#safeEmit('circuitBreakerStateChanged', state)
+      this.emit('circuitBreakerStateChanged', state)
     })
 
     if (this.#useCache) {
       this.#cache = new NodeCache({
-        // ?? and not ||: cacheTTL 0 means "never expire" to node-cache, a
-        // legitimate request that || silently rewrote to 60 seconds.
-        stdTTL: options.cacheTTL ?? 60,
-        checkperiod: options.cacheCheckPeriod || 120,
+        // Both zeros are real requests to node-cache: stdTTL 0 is "never
+        // expire", checkperiod 0 is "no periodic sweep". `||` rewrote each into
+        // its default; see utils/options.js for why a bare `??` is not enough.
+        stdTTL: nonNegativeNumber(options.cacheTTL, 'cacheTTL', 60),
+        checkperiod: nonNegativeNumber(options.cacheCheckPeriod, 'cacheCheckPeriod', 120),
         ...options.cacheOptions
       })
     }
@@ -103,7 +109,7 @@ class RabbitMQ extends EventEmitter {
       maxReconnectAttempts: options.maxReconnectAttempts
     }, this.#logger)
 
-    this.#connection.on('connected', () => this.emit('connected'))
+    this.#connection.on('connected', (endpoint) => this.emit('connected', endpoint))
     this.#connection.on('reconnected', this.#handleReconnection.bind(this))
     this.#connection.on('disconnected', this.#handleDisconnection.bind(this))
     this.#connection.on('reconnectFailed', () => this.emit('reconnectFailed'))
@@ -135,6 +141,18 @@ class RabbitMQ extends EventEmitter {
     this.#consumers = new ConsumerManager(context)
     this.#topology = new Topology(context)
     this.#rpc = new Rpc(context, { publisher: this.#publisher, consumers: this.#consumers })
+  }
+
+  // The one emit for every event this instance raises. Containment lives HERE
+  // rather than at each call site because three review rounds of converting
+  // emits one by one each left some raw — see emitSafely for the two failure
+  // modes it closes. 'error' keeps Node's semantics (throw when nobody
+  // listens): nothing in this library emits it, and an application that does
+  // gets the crash EventEmitter promises.
+  emit (event, ...args) {
+    if (event === 'error') return super.emit(event, ...args)
+
+    return emitSafely(this, event, args, this.#logger)
   }
 
   #setupRateLimiterEvents () {
@@ -208,12 +226,18 @@ class RabbitMQ extends EventEmitter {
         // clear a newer one, or the next caller would start a second restore
         // alongside it and duplicate every consumer.
         //
-        // NOT covered by a test: reaching it needs a third #restoreState()
-        // caller while a restore is in flight, and today there is none —
-        // #handleReconnection needs a disconnection first (which drops the slot
-        // anyway) and #doConnect is gated by the pool the in-flight restore
-        // already assigned. Kept because the check costs three lines while the
-        // failure it prevents is silent duplicate processing.
+        // Reachable, not hypothetical: #setupChannelPool assigns #channelPool
+        // only AFTER initialize() completes, so while restore B is still
+        // opening its channels the pool gate in #doConnect is open. A stale
+        // restore A (built on the connection that just died) rejecting late in
+        // that window would, without this check, null B's slot; a manual
+        // connect() landing next sees a connection, no pool, and starts
+        // restore C alongside B — two recreateAll runs, every message consumed
+        // twice. Not pinned by a unit test: the interleaving needs three
+        // independently timed broker events and the fake cannot hold a
+        // rejection open across another restore's initialize() without a
+        // seam that exists only for this test. Three lines against silent
+        // duplicate processing.
         if (this.#restorePromise === restore) {
           this.#restorePromise = null
         }
@@ -260,24 +284,12 @@ class RabbitMQ extends EventEmitter {
     this.#circuitBreaker.reset()
   }
 
-  // Lifecycle notifications sit inside recovery paths where a listener's crash
-  // must not be mistaken for a failure of the step it follows, and where
-  // nothing is waiting to catch it: this handler is invoked by the
-  // connection's emit, so an escaping throw would unwind the state machine
-  // that called us.
-  // Per listener, so a throwing application handler cannot starve the internal
-  // ones registered after it — connect({ waitForConnection }) parks on exactly
-  // these events (see emitSafely).
-  #safeEmit (event, ...args) {
-    emitSafely(this, event, args, this.#logger)
-  }
-
   async #handleReconnection () {
     try {
       await this.#restoreState()
     } catch (error) {
       this.#logger.error(`Failed to restore state after reconnection: ${error.message}`)
-      this.#safeEmit('reconnectError', error)
+      this.emit('reconnectError', error)
 
       return
     }
@@ -287,7 +299,7 @@ class RabbitMQ extends EventEmitter {
     // 'reconnectError' — rejecting an in-flight connect({ waitForConnection })
     // with "failed to restore state" on a client that had just recovered
     // perfectly. State was restored; only the notification failed.
-    this.#safeEmit('reconnected')
+    this.emit('reconnected')
   }
 
   #handleDisconnection () {
@@ -314,7 +326,7 @@ class RabbitMQ extends EventEmitter {
     // Contained: this runs synchronously inside the connection's own
     // 'disconnected' emit, which has just set #isReconnecting and is about to
     // arm the retry timer. A throwing app listener must not reach it.
-    this.#safeEmit('disconnected')
+    this.emit('disconnected')
   }
 
   async #setupChannelPool () {
@@ -382,6 +394,17 @@ class RabbitMQ extends EventEmitter {
 
     if (!options.waitForConnection) {
       return null
+    }
+
+    // Checked BEFORE parking: 'reconnectFailed' is emitted synchronously inside
+    // the connection's own connect() when the budget is already spent — always
+    // with maxReconnectAttempts 0, and on the final attempt otherwise — so by
+    // the time the listeners below are registered the event has already fired
+    // and nothing else ever will. The waiter used to hang forever there, and
+    // since #connectPromise is only released in its finally, so did every
+    // connect() after it.
+    if (this.#connection.getConnectionState() === 'failed') {
+      throw new Error('Unable to connect: all reconnection attempts failed')
     }
 
     // All endpoints failed and reconnection keeps running in the background:
@@ -453,7 +476,7 @@ class RabbitMQ extends EventEmitter {
     // Contained, and it matters most here: this emit sits BEFORE the teardown,
     // so a throwing listener used to abort the whole shutdown — no RPC
     // settled, no consumer disposed, and the connection left open.
-    this.#safeEmit('disconnecting')
+    this.emit('disconnecting')
 
     try {
       this.#rpc.handleConnectionLoss('client disconnected')
@@ -480,7 +503,7 @@ class RabbitMQ extends EventEmitter {
       // Contained like every other lifecycle emit: uncontained, a throwing
       // listener landed in the catch below, which logged a clean shutdown as
       // 'Error during disconnection' and dialed the teardown a second time.
-      this.#safeEmit('disconnected')
+      this.emit('disconnected')
     } catch (error) {
       // No message-substring filtering here: it used to swallow genuine
       // broker errors whose text happened to contain 'Channel closed'.
@@ -497,7 +520,7 @@ class RabbitMQ extends EventEmitter {
 
   async getChannel () {
     if (!this.#channelPool) {
-      throw new Error('Not connected to RabbitMQ. Connection establishing/recovery in progress.')
+      throw notConnectedError()
     }
 
     return this.#channelPool.getChannel()
