@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 1.9.0 (2026-09-03)
+
+* fix: honour a requested zero and refuse junk in numeric options by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/d50b5b1ec7565b174e1ac5ab45be5c90a3c0a793)
+* fix: a coded NOT_CONNECTED error, and RPC reply failures that are not Errors by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/79642eabbddbe007d4c430f218d13c0c2bb93a91)
+* fix: a detached promise logs its rejection instead of killing the process by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/f938a0d43e9f2a1753119272a246d638b0cced5b)
+* fix: recovery fences before giving up, a fence after consume, a drain on every exit by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/7ac2eaec981c30f2fb730716c805d86604f4ee59)
+* fix: contain listeners and the logger at the emitter boundary, not per call site by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/74887533209721c1e4d4e26f0c84431dd8d39d91)
+* perf: floor the rate limiter sweep interval at 100ms by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/087e53d362d902daf0ecf8d250b2c942eaa2aa16)
+* docs: pin NOT_CONNECTED, the contained logger and the zero-valued cache options by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/61c6c966007e816e4ef35465032413cc5adb6db0)
+* test: teach the mutation gate the detached() labels and this round's equivalents by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/334d072d304861b070802003904854a19761bafb)
+* test: observe the double drop the backoff fence prevents; ledger the fence identity operands by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/69c54233dac29d88f977ee491bd53f5708ddd49d)
+
+
 ## 1.8.0 (2026-08-22)
 
 * build(deps): move to breakwater 1.1.1 and rollup 4.62.5 by Pedro Rogério [View](https://github.com/pinceladasdaweb/rabbitmq/commit/3564c346aed299824d1d4b449aa30a95881494f9)
